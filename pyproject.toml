@@ -1,0 +1,103 @@
+[project]
+name = "speftr"
+version = "0.1.0"
+description = "A simple Parameter-Efficient Fine-Tuning recipe."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.7.1",
+    "transformers>=4.54.0",
+    "tokenizers>=0.21.1",
+    "accelerate>=1.9.0",
+    "peft>=0.17.1",
+    "kernels>=0.10.2",
+    "unsloth>=2025.9.9",
+    "scikit-learn>=1.7.2",
+]
+
+[dependency-groups]
+dev = [
+    "pyflakes>=3.4.0",
+    "pyright>=1.1.406",
+    "ruff>=0.12.4",
+]
+[project.optional-dependencies]
+rl = [
+    "trl>=0.23.1",
+    "vllm>=0.11.0", 
+    "flashinfer-python>=0.3.1.post1",
+    "flashinfer-cubin>=0.4.1",
+]
+gym = [
+    "reasoning-gym>=0.1.0",
+    "speftr[rl]",
+]
+
+
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128" }
+]
+
+[tool.ruff]
+line-length = 79
+target-version = "py313"
+
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "E402",   # import-not-at-top-of-file is necessary in some cases (e.g. pkg)
+  "ERA001", # allow commented-out code
+  "COM812", # traling commas
+  "TRY003", # allow long messages in exceptions
+  "SLF001", # allow private member access
+  "RET504", # allow unnecessary assignment before return;
+            #   this makes more sense in certain cases like
+            #   applying a series of filters to a list,
+            #   easier to add more filters later
+  "T201",   # allow print statements
+  "S104",   # hardcoded-bind-all-interfaces i.e. 0.0.0.0 ok
+  "S105",   # allow hardcoded strings
+  "S311",   # not a cryptographic purpose ignore this warning
+  "S701",   # no need to escape prompts in jinja2 templates
+  "RUF001", # allow unicode strings w/o silly warning
+  "N803",   # allow non lowercased parameters like "apiKey"
+  "N812",   # import as F - lowecase => uppercase import is OK
+  "PERF402", # disable silly performance warning
+  ]
+
+[tool.ruff.lint.flake8-annotations]
+# allow star args to be any type (incl **kwargs: Any)
+allow-star-arg-any = true
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+
+[tool.ruff.lint.pylint]
+max-args = 5  # allow up to n arguments in functions
+
+[tool.ruff.lint.pydocstyle] # Enforce Google-style docstrings.
+convention = "google"
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+# format code inside docstring
+docstring-code-format = true
