@@ -1,17 +1,33 @@
-"""Evaluate WildGuardMix classification models fine-tuned with guard_og.py."""
+r"""Evaluate a ``guard_train`` classifier on the WildGuardMix test set.
+
+Demonstrates loading saved LoRA adapters for batched inference with
+Unsloth (``FastLanguageModel.from_pretrained`` on the adapter directory
+loads the base model named in ``adapter_config.json``), rebuilding the
+training prompt, mapping free-text generations to labels and scoring them
+with scikit-learn. The model is always loaded in 4-bit.
+
+Usage:
+    uv run python -m examples.guard.guard_eval
+    uv run python -m examples.guard.guard_eval --model_path ./models/x \
+        --max_samples 200
+
+Prints invalid-answer count, accuracy, macro precision/recall/F1, average
+precision and a per-class report. See ``examples/guard/README.md``.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+# unsloth must be imported before datasets/transformers so its patches
+# apply.
 import unsloth
 from datasets import Dataset, load_dataset
-from huggingface_hub import login
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -25,31 +41,41 @@ from unsloth.chat_templates import get_chat_template
 
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedModel, PreTrainedTokenizerBase
+    from collections.abc import Set as AbstractSet
+
+    from transformers import GenerationMixin, PreTrainedTokenizerBase
 
 print(unsloth.__version__)
 
-if "HF_TOKEN" in os.environ:
-    login(token=os.environ["HF_TOKEN"])
+# Unsloth wraps torch.__getattr__, so torch's own filter for these
+# deprecation warnings (keyed on module "torch") does not match.
+warnings.filterwarnings(
+    "ignore",
+    message=".*is deprecated, please use.*",
+    category=UserWarning,
+    module="unsloth.import_fixes",
+)
 
 PROMPT_COL = "prompt"
 LABEL_COL = "prompt_harm_label"
+# Fallbacks for models without a saved instruction_prefix; both must match
+# guard_train.py.
 INSTRUCTION = "Classify this prompt's as harmful or unharmful:"
 CHAT_TEMPLATE = "gemma-3"
 MAX_INVALID_EXAMPLES_TO_SHOW = 5
 BINARY_CLASSIFICATION_LABELS = 2
 
 
-def _parse_max_seq_length(value: str) -> int | None:
-    """Parse max_seq_length allowing the keyword 'none'."""
-    if value.lower() == "none":
-        return None
-    return int(value)
-
-
 @dataclass
 class GenerationConfig:
-    """Configuration for model generation during evaluation."""
+    """Configuration for model generation during evaluation.
+
+    Attributes:
+        instruction: Text prepended to each prompt in the user turn; empty
+            means the prompt is sent alone.
+        max_new_tokens: Maximum tokens generated per example.
+        temperature: Generation temperature (decoding is greedy).
+    """
 
     instruction: str = INSTRUCTION
     max_new_tokens: int = 5
@@ -58,14 +84,32 @@ class GenerationConfig:
 
 @dataclass
 class EvaluationConfig:
-    """Configuration for evaluation process."""
+    """Configuration for evaluation process.
+
+    Attributes:
+        batch_size: Number of examples generated per batch.
+        gen_config: Generation settings; ``None`` uses
+            ``GenerationConfig()`` defaults.
+    """
 
     batch_size: int = 64
     gen_config: GenerationConfig | None = None
 
 
 def load_instruction_from_config(model_path: str, fallback: str) -> str:
-    """Load instruction from tokenizer config, with fallback to default."""
+    """Load instruction from tokenizer config, with fallback to default.
+
+    Reads ``instruction_prefix`` from ``tokenizer_config.json`` in
+    ``model_path``, as saved by guard_train.py.
+
+    Args:
+        model_path: Directory of the fine-tuned model.
+        fallback: Instruction used when the file is missing, unreadable
+            or lacks ``instruction_prefix``.
+
+    Returns:
+        The saved instruction, or ``fallback``.
+    """
     tokenizer_config_path = Path(model_path) / "tokenizer_config.json"
 
     if not tokenizer_config_path.exists():
@@ -84,16 +128,21 @@ def load_instruction_from_config(model_path: str, fallback: str) -> str:
         print(f"Using fallback instruction: '{fallback}'")
         return fallback
 
-    instruction = config.get("instruction_prefix", fallback)
+    instruction = str(config.get("instruction_prefix", fallback))
     print(f"✓ Loaded instruction from config: '{instruction}'")
     return instruction
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Returns:
+        Namespace with the model path, sampling limit, generation and batch
+        settings.
+    """
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a guard_og.py fine-tuned model on the "
+            "Evaluate a guard_train.py fine-tuned model on the "
             "WildGuardMix test set"
         )
     )
@@ -138,16 +187,24 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--max_seq_length",
-        type=_parse_max_seq_length,
+        type=int,
         default=2048,
-        help="Maximum sequence length or 'none' for unlimited",
+        help="Maximum sequence length in tokens (default: 2048)",
     )
 
     return parser.parse_args()
 
 
 def _load_eval_dataset(max_samples: int) -> Dataset:
-    """Load and optionally subsample the WildGuardMix evaluation split."""
+    """Load and optionally subsample the WildGuardMix evaluation split.
+
+    Args:
+        max_samples: Keep only the first ``max_samples`` labelled rows;
+            ``<= 0`` keeps the full split.
+
+    Returns:
+        The wildguardtest split without rows lacking a prompt harm label.
+    """
     dataset = load_dataset(
         "allenai/wildguardmix", "wildguardtest", split="test"
     )
@@ -160,13 +217,26 @@ def _load_eval_dataset(max_samples: int) -> Dataset:
 
 
 def _generate_predictions(
-    model: PreTrainedModel,
+    model: GenerationMixin,
     tokenizer: PreTrainedTokenizerBase,
     eval_dataset: Dataset,
     valid_labels: set[str],
     eval_config: EvaluationConfig,
 ) -> tuple[list[str], list[str], list[str], int]:
-    """Generate predictions for all examples in dataset using batching."""
+    """Generate predictions for all examples in dataset using batching.
+
+    Args:
+        model: Causal LM used for greedy generation.
+        tokenizer: Tokenizer with the guard chat template applied.
+        eval_dataset: Examples with prompt and harm label columns.
+        valid_labels: Labels a generated answer is matched against.
+        eval_config: Batch size and generation settings.
+
+    Returns:
+        True labels, predicted labels (``"INVALID_PREDICTION"`` when no
+        valid label matches), raw generated texts, and the number of
+        invalid predictions.
+    """
     gen_config = eval_config.gen_config or GenerationConfig()
     batch_size = eval_config.batch_size
 
@@ -240,8 +310,8 @@ def _generate_predictions(
             ).strip()
             y_pred_raw.append(pred_text)
 
-            matched_label, is_valid = extract_label(pred_text, valid_labels)
-            if not is_valid:
+            matched_label, _ = extract_label(pred_text, valid_labels)
+            if matched_label is None:
                 invalid_predictions += 1
                 matched_label = "INVALID_PREDICTION"
 
@@ -254,16 +324,27 @@ def _generate_predictions(
 
 def extract_label(
     pred_text: str,
-    valid_labels: set[str],
+    valid_labels: AbstractSet[str],
 ) -> tuple[str | None, bool]:
-    """Extract valid label from prediction text."""
+    """Extract valid label from prediction text.
+
+    Args:
+        pred_text: Raw generated text.
+        valid_labels: Labels the model may produce.
+
+    Returns:
+        ``(label, True)`` for an exact (case-insensitive) match or, failing
+        that, the longest label contained in the text; ``(None, False)``
+        otherwise.
+    """
     pred_text_lower = pred_text.strip().lower()
 
     for valid_label in valid_labels:
         if pred_text_lower == valid_label.lower():
             return valid_label, True
 
-    for valid_label in valid_labels:
+    # Longest first: "unharmful" contains "harmful".
+    for valid_label in sorted(valid_labels, key=len, reverse=True):
         if valid_label.lower() in pred_text_lower:
             return valid_label, True
 
@@ -274,7 +355,23 @@ def _compute_metrics(
     y_true: list[str],
     y_pred: list[str],
 ) -> dict[str, float]:
-    """Compute binary classification metrics."""
+    """Compute binary classification metrics.
+
+    Averages use only the labels present in ``y_true``, so invalid
+    predictions count as errors. ``avg_precision`` treats ``"harmful"``
+    (or the first sorted label) as the positive class.
+
+    Args:
+        y_true: Gold labels.
+        y_pred: Predicted labels, aligned with ``y_true``.
+
+    Returns:
+        Accuracy, macro precision/recall/F1 and average precision, plus the
+        text ``classification_report``.
+
+    Raises:
+        ValueError: If ``y_true`` does not contain exactly two labels.
+    """
     unique_labels = sorted(set(y_true))
 
     if len(unique_labels) != BINARY_CLASSIFICATION_LABELS:
@@ -288,24 +385,35 @@ def _compute_metrics(
         "harmful" if "harmful" in unique_labels else unique_labels[0]
     )
 
+    # Averages cover the dataset's labels only: an invalid prediction counts
+    # as an error, not as an extra class.
+    per_label = {"labels": unique_labels, "zero_division": 0}
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
-        "precision_macro": precision_score(y_true, y_pred, average="macro"),
-        "recall_macro": recall_score(y_true, y_pred, average="macro"),
-        "f1_macro": f1_score(y_true, y_pred, average="macro"),
+        "precision_macro": precision_score(
+            y_true, y_pred, average="macro", **per_label
+        ),
+        "recall_macro": recall_score(
+            y_true, y_pred, average="macro", **per_label
+        ),
+        "f1_macro": f1_score(y_true, y_pred, average="macro", **per_label),
         "avg_precision": average_precision_score(
             [1 if label == positive_label else 0 for label in y_true],
             [1 if pred == positive_label else 0 for pred in y_pred],
         ),
     }
 
-    report = classification_report(y_true, y_pred, zero_division="warn")
+    report = classification_report(y_true, y_pred, **per_label)
     metrics["classification_report"] = report
     return metrics
 
 
 def main() -> None:
-    """Main evaluation function."""
+    """Evaluate a guard_train.py model on WildGuardMix and print metrics.
+
+    Returns:
+        None. Metrics are printed to stdout.
+    """
     args = parse_args()
 
     print(f"Loading model from {args.model_path}...")
@@ -315,6 +423,9 @@ def main() -> None:
         dtype=None,
         load_in_4bit=True,
     )
+    # Generation is bounded by max_new_tokens; a max_length saved with the
+    # checkpoint would otherwise conflict with it.
+    model.generation_config.max_length = None
 
     tokenizer = get_chat_template(
         tokenizer,

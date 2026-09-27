@@ -1,29 +1,61 @@
-"""Interactive console tester for guard_og.py fine-tuned models."""
+"""Classify prompts typed at the console with a ``guard_train`` model.
+
+Demonstrates single-prompt inference with saved LoRA adapters: load them
+with Unsloth, apply the training chat template and instruction, and
+generate the label greedily. Loads in 16-bit unless ``--load_in_4bit``.
+
+Usage:
+    uv run python -m examples.guard.guard_test
+    uv run python -m examples.guard.guard_test --model_path ./models/x
+
+Type a prompt, read ``Model label: harmful`` or ``unharmful``; ``exit``,
+``quit``, Ctrl+C or Ctrl+D stops. See ``examples/guard/README.md``.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import warnings
 from pathlib import Path
 
+# unsloth must be imported before transformers so its patches apply.
 import unsloth
-from huggingface_hub import login
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 
 
 print(unsloth.__version__)
 
-if "HF_TOKEN" in os.environ:
-    login(token=os.environ["HF_TOKEN"])
+# Unsloth wraps torch.__getattr__, so torch's own filter for these
+# deprecation warnings (keyed on module "torch") does not match.
+warnings.filterwarnings(
+    "ignore",
+    message=".*is deprecated, please use.*",
+    category=UserWarning,
+    module="unsloth.import_fixes",
+)
 
+# Fallbacks for models without a saved instruction_prefix; both must match
+# guard_train.py.
 INSTRUCTION = "Classify this prompt's as harmful or unharmful:"
 CHAT_TEMPLATE = "gemma-3"
 
 
 def load_instruction_from_config(model_path: str, fallback: str) -> str:
-    """Load instruction from tokenizer config or fall back to a default."""
+    """Load instruction from tokenizer config or fall back to a default.
+
+    Reads ``instruction_prefix`` from ``tokenizer_config.json`` in
+    ``model_path``, as saved by guard_train.py.
+
+    Args:
+        model_path: Directory of the fine-tuned model.
+        fallback: Instruction used when the file is missing, unreadable
+            or lacks ``instruction_prefix``.
+
+    Returns:
+        The saved instruction, or ``fallback``.
+    """
     tokenizer_config_path = Path(model_path) / "tokenizer_config.json"
 
     if tokenizer_config_path.exists():
@@ -34,7 +66,7 @@ def load_instruction_from_config(model_path: str, fallback: str) -> str:
             print(f"Warning: Could not load instruction from config: {exc}")
             print(f"Using fallback instruction: '{fallback}'")
             return fallback
-        instruction = config.get("instruction_prefix", fallback)
+        instruction = str(config.get("instruction_prefix", fallback))
         print(f"✓ Loaded instruction from config: '{instruction}'")
         return instruction
 
@@ -46,7 +78,11 @@ def load_instruction_from_config(model_path: str, fallback: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Returns:
+        Namespace with the model path, generation and loading options.
+    """
     parser = argparse.ArgumentParser(
         description="Interactively classify prompts with a fine-tuned model"
     )
@@ -85,13 +121,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Main interactive loop."""
+    """Load the model and classify prompts read from stdin until exit.
+
+    Returns:
+        None. Predictions are printed to stdout.
+    """
     args = parse_args()
 
     print(f"Loading model from {args.model_path}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_path,
-        max_seq_length=None,
+        max_seq_length=2048,
         dtype=None,
         load_in_4bit=args.load_in_4bit,
     )
@@ -103,6 +143,9 @@ def main() -> None:
 
     instruction = load_instruction_from_config(args.model_path, INSTRUCTION)
     FastLanguageModel.for_inference(model)
+    # Generation is bounded by max_new_tokens; a max_length saved with the
+    # checkpoint would otherwise conflict with it.
+    model.generation_config.max_length = None
 
     prompt_message = (
         "\nInteractive safety classification. Enter prompts to classify."

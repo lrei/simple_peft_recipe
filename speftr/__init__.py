@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 Luis Rei
+# SPDX-License-Identifier: BSD-2-Clause
 """speftr: Parameter-efficient training utilities with LoRA adapters.
 
 This package provides reusable class-based interfaces for training language
@@ -11,7 +13,7 @@ from __future__ import annotations
 
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING
 
 # Lazy imports to avoid importing unsloth when only using PERL
 from .perl import PERL, PERLConfig
@@ -21,19 +23,6 @@ try:  # pragma: no cover - metadata lookup is environment-dependent
     __version__ = version("speftr")
 except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.1.0"
-
-
-class _PesftModule(Protocol):
-    """Protocol describing the PESFT module's public API."""
-
-    PESFT: type[object]
-    PESFTConfig: type[object]
-
-    @staticmethod
-    def display_parameters(*args: object, **kwargs: object) -> object: ...
-
-    @staticmethod
-    def save_parameters_to_json(*args: object, **kwargs: object) -> object: ...
 
 
 if TYPE_CHECKING:  # pragma: no cover - type checking helper
@@ -46,23 +35,24 @@ if TYPE_CHECKING:  # pragma: no cover - type checking helper
 
 
 def __getattr__(name: str) -> object:
-    """Lazy import for PESFT to avoid unsloth for PERL users."""
+    """Lazily import PESFT symbols so PERL users never import unsloth.
+
+    Args:
+        name: Attribute requested from the ``speftr`` package.
+
+    Returns:
+        The requested object from ``speftr.pesft``.
+
+    Raises:
+        AttributeError: If ``name`` is not a lazily exported symbol.
+    """
     if name in (
         "PESFT",
         "PESFTConfig",
         "display_parameters",
         "save_parameters_to_json",
     ):
-        module = cast("_PesftModule", import_module("speftr.pesft"))
-
-        if name == "PESFT":
-            return module.PESFT
-        if name == "PESFTConfig":
-            return module.PESFTConfig
-        if name == "display_parameters":
-            return module.display_parameters
-        if name == "save_parameters_to_json":
-            return module.save_parameters_to_json
+        return getattr(import_module("speftr.pesft"), name)
     msg = f"module {__name__!r} has no attribute {name!r}"
     raise AttributeError(msg)
 

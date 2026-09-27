@@ -1,49 +1,282 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "speftr"
 version = "0.1.0"
 description = "A simple Parameter-Efficient Fine-Tuning recipe."
 readme = "README.md"
-requires-python = ">=3.13"
+license = "BSD-2-Clause"
+requires-python = ">=3.13,<3.15"
 dependencies = [
-    "torch>=2.7.1",
-    "transformers>=4.54.0",
-    "tokenizers>=0.21.1",
-    "accelerate>=1.9.0",
-    "peft>=0.17.1",
-    "kernels>=0.10.2",
-    "unsloth>=2025.9.9",
-    "scikit-learn>=1.7.2",
+    "torch>=2.11.0",
+    # Declared only so [tool.uv.sources] can pin it to the torch index.
+    "torchvision",
+    "transformers>=5.13.1",
+    "tokenizers>=0.22.2",
+    "accelerate>=1.15.0",
+    "peft>=0.21.0",
+    "kernels>=0.12.3",
+    "unsloth>=2026.9.11",
+    "trl>=1.13.0",
+    "datasets>=4.8.0",
+    "scikit-learn>=1.9.1",
+    "bitsandbytes>=0.50.2",
+]
+
+[project.optional-dependencies]
+rl = [
+    "vllm>=0.26.0",
+]
+gym = [
+    "reasoning-gym>=0.1.25",
+    "speftr[rl]",
 ]
 
 [dependency-groups]
 dev = [
-    "pyflakes>=3.4.0",
-    "pyright>=1.1.406",
-    "ruff>=0.12.4",
-]
-[project.optional-dependencies]
-rl = [
-    "trl>=0.23.1",
-    "vllm>=0.11.0", 
-    "flashinfer-python>=0.3.1.post1",
-    "flashinfer-cubin>=0.4.1",
-]
-gym = [
-    "reasoning-gym>=0.1.0",
-    "speftr[rl]",
+    "bandit[toml]>=1.9.4",
+    "complexipy>=8.0.1",
+    "hypothesis>=6.168.1",
+    "interrogate>=1.7.0",
+    "mutmut>=3.8.0",
+    "mypy>=2.3.1",
+    "pip-audit>=2.10.1",
+    "poethepoet>=0.48.0",
+    "pre-commit>=4.6.2",
+    "pre-commit-hooks>=6.0.0",
+    "pydoclint>=0.9.1",
+    "pymarkdownlnt>=0.9.40",
+    "pyright>=1.1.414",
+    "pyscn>=1.32.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-testmon>=2.2.0",
+    "pytest-xdist>=3.8.0",
+    "radon>=6.0.1",
+    "ruff>=0.16.9",
+    "vulture>=2.16",
 ]
 
-
+[tool.uv]
+# CUDA-only (torch, vLLM, flashinfer).
+environments = ["sys_platform == 'linux'"]
+# Replaces unsloth's stale transformers/trl/datasets caps. transformers
+# 5.14+ writes per-layer Gemma 4 configs that vLLM 0.26 cannot read.
+override-dependencies = [
+  "transformers==5.13.1",
+  "trl>=1.13.0,<=1.13.0",
+  "datasets>=4.8.0,<5",
+]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cu128" }
+# torchvision must come from the torch index or its compiled ops don't match.
+# CUDA 13 because vLLM's PyPI wheels link libcudart.so.13.
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
+
+[tool.hatch.build.targets.wheel]
+packages = ["speftr"]
+
+# ---------------------------------------------------------------------------
+# Tasks: `uv run poe <task>` (`uv run poe` lists them).
+# ---------------------------------------------------------------------------
+[tool.poe.env]
+PACKAGE = "speftr"
+LINT_PATHS = "speftr examples tests scripts"
+
+[tool.poe.tasks]
+format = { cmd = "ruff format ${LINT_PATHS}", help = "Format code" }
+_ruff-check = "ruff check --fix ${LINT_PATHS}"
+lint = { sequence = ["format", "_ruff-check"], help = "Format, then lint with autofix" }
+_mypy = "mypy ${PACKAGE} examples"
+_pyright = "pyright"
+typecheck = { sequence = ["_mypy", "_pyright"], help = "mypy + pyright" }
+pydoclint = { cmd = "pydoclint --quiet ${PACKAGE} examples", help = "Docstring/signature consistency" }
+pydoc-coverage = { cmd = "interrogate -v --omit-covered-files ${PACKAGE} examples", help = "Docstring coverage (must be complete)" }
+complexity = { cmd = "radon cc ${PACKAGE} -s -n C", help = "Cyclomatic complexity (grade C or worse)" }
+maintainability = { cmd = "radon mi ${PACKAGE} -s -n C", help = "Maintainability index (grade C or worse)" }
+cognitive = { cmd = "complexipy ${PACKAGE} --failed", help = "Cognitive complexity" }
+deadcode = { cmd = "vulture ${PACKAGE} --min-confidence 80", help = "Dead code" }
+duplicates = { cmd = "pyscn check --select clones ${PACKAGE} examples", help = "Duplicate code" }
+circular = { cmd = "pyscn check --select deps ${PACKAGE}", help = "Circular imports" }
+security = { cmd = "bandit -c pyproject.toml -r ${PACKAGE}", help = "Security lint" }
+audit = { cmd = "pip-audit --local --skip-editable", help = "Known vulnerabilities in installed deps" }
+markdownlint = { cmd = "pymarkdown scan --recurse --respect-gitignore .", help = "Lint Markdown" }
+test = { cmd = "pytest -n auto --dist=loadscope --testmon", help = "Unit tests (no GPU), incremental" }
+test-all = { cmd = "pytest", help = "Unit tests (no GPU), full run" }
+test-cuda = { cmd = "pytest --run-cuda -n 0", help = "Unit + GPU smoke tests (needs CUDA, network)" }
+coverage = { cmd = "pytest --cov=${PACKAGE} --cov-report=term-missing", help = "Unit tests with coverage" }
+testmut = { cmd = "mutmut run --max-children=1", help = "Mutation testing" }
+quality-iter = { sequence = ["lint", "pydoclint", "pydoc-coverage", "typecheck", "test", "duplicates", "circular", "cognitive", "markdownlint"], help = "Fast iterative checks" }
+quality-extra = { sequence = ["deadcode", "complexity", "maintainability", "security"], help = "Whole-codebase checks (run `poe audit` separately)" }
+quality-doc = { sequence = ["pydoclint", "pydoc-coverage", "markdownlint"], help = "Documentation checks" }
+quality = { sequence = ["quality-iter", "quality-extra", "coverage"], help = "Full quality pipeline" }
+
+[tool.mypy]
+python_version = "3.13"
+
+# --- Core philosophy ---
+# Catch real bugs, not enforce purity
+strict = false
+
+# --- High-value checks (KEEP) ---
+check_untyped_defs = true
+strict_optional = true
+no_implicit_optional = true
+
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+# --- Readability > strictness ---
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# --- Avoid noise ---
+disallow_any_generics = false
+disallow_subclassing_any = false
+disallow_untyped_calls = false
+disable_error_code = ["import-untyped", "unreachable"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# --- Better UX ---
+pretty = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+check_untyped_defs = false
+
+[tool.pyright]
+include = ["speftr", "examples"]
+exclude = [".venv", "build", "dist", "**/__pycache__", "**/unsloth_compiled_cache"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+reportMissingTypeStubs = "none"
+reportUnusedImport = "none"
+reportUnusedVariable = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+reportUnknownVariableType = "none"
+reportUnknownMemberType = "none"
+reportAttributeAccessIssue = "none"
+reportGeneralTypeIssues = "warning"
+reportOptionalMemberAccess = "error"
+reportOptionalSubscript = "error"
+reportOptionalCall = "error"
+reportUnnecessaryCast = "warning"
+reportUnnecessaryIsInstance = "none"
+reportUntypedFunctionDecorator = "none"
+useLibraryCodeForTypes = false
+reportPrivateImportUsage = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# No default ``-m``: pytest-testmon disables incremental selection whenever
+# ``markexpr`` is set. ``cuda`` tests are deselected in tests/conftest.py
+# unless ``--run-cuda`` is passed.
+addopts = "-v --tb=short"
+filterwarnings = [
+  # Emitted by torch's own torch/utils/mkldnn.py on import.
+  "ignore:`torch.jit.script_method` is :DeprecationWarning",
+  # Unsloth wraps torch.__getattr__, so torch's own filter for these
+  # (keyed on module "torch") does not match.
+  "ignore:.*is deprecated, please use:UserWarning:unsloth.import_fixes",
+  # torch's inductor registers this op itself.
+  "ignore:inductor.._alloc_from_pool:UserWarning",
 ]
+markers = [
+  "cuda: needs a CUDA GPU and network model/dataset downloads (deselected by default; run with --run-cuda)",
+]
+
+[tool.coverage.run]
+source = ["speftr"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "raise NotImplementedError",
+  "if TYPE_CHECKING:",
+]
+show_missing = true
+
+[tool.mutmut]
+source_paths = ["speftr/"]
+pytest_add_cli_args = ["-p", "no:testmon", "-n", "0", "-o", "addopts="]
+pytest_add_cli_args_test_selection = ["tests/", "-m", "not cuda"]
+do_not_mutate_patterns = [
+  # print/logging calls are progress output, not behaviour.
+  'print\(',
+  'logger\.\w+',
+  'logging\.\w+',
+  # exception types/messages
+  'raise \w+',
+]
+
+[tool.interrogate]
+fail-under = 100
+style = "google"
+ignore-overloaded-functions = true
+ignore-init-method = false
+ignore-init-module = false
+ignore-private = false
+ignore-magic = false
+ignore-semiprivate = false
+ignore-property-decorators = false
+ignore-module = false
+omit-covered-files = false
+verbose = 1
+exclude = ["tests", "build", "docs", "scripts"]
+
+[tool.pydoclint]
+style = "google"
+exclude = "\\.git|tests/"
+check-class-attributes = true
+check-style-mismatch = true
+require-return-section-when-returning-nothing = true
+skip-checking-short-docstrings = false
+# Keep type hints on signatures only; Args list names and descriptions.
+arg-type-hints-in-docstring = false
+allow-init-docstring = true
+check-return-types = false
+check-yield-types = false
+
+[tool.complexipy]
+paths = ["speftr"]
+max-complexity-allowed = 15
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+
+[tool.pymarkdown]
+# GitHub-flavoured tables; lets md013 skip them (tables = false below).
+extensions.markdown-tables.enabled = true
+# YAML front matter in docs/adrs/.
+extensions.front-matter.enabled = true
+# Front-matter titles do not count as H1 (ADRs repeat the title as H1).
+plugins.md025.front_matter_title = "_"
+plugins.md013.line_length = 79
+plugins.md013.code_blocks = false
+plugins.md013.tables = false
+# Bare URLs are valid GFM autolinks.
+plugins.md034.enabled = false
+# Same as the markdownlint config this mirrors: table padding is free-form.
+plugins.md060.enabled = false
 
 [tool.ruff]
 line-length = 79
@@ -79,6 +312,28 @@ allow-star-arg-any = true
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
+known-first-party = ["speftr", "examples"]
+
+[tool.ruff.lint.flake8-copyright]
+# speftr modules are copied individually, so each carries its SPDX header.
+notice-rgx = "SPDX-FileCopyrightText: \\d{4}"
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**/*.py" = ["CPY001"] # teaching code; covered by LICENSE
+"scripts/**/*.py" = [
+  "CPY001",  # repo tooling; covered by LICENSE
+  "INP001",  # standalone scripts, not a package
+]
+"tests/**/*.py" = [
+  "ANN",     # type annotations in test helpers/fixtures
+  "CPY001",  # covered by LICENSE
+  "ARG",     # pytest fixtures
+  "D",       # docstrings on every test
+  "FBT003",  # boolean positional in calls
+  "PLC0415", # late imports of heavy deps inside GPU tests
+  "PLR2004", # magic numbers in asserts
+  "S101",    # pytest asserts
+]
 
 [tool.ruff.lint.pylint]
 max-args = 5  # allow up to n arguments in functions

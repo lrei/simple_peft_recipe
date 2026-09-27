@@ -1,73 +1,32 @@
-r"""Train a safety guard model using PESFT on WildGuardMix dataset.
+r"""Train a prompt-safety classifier with ``PESFT`` on WildGuardMix.
 
-This script demonstrates how to use PESFT (Parameter-Efficient Supervised
-Fine-Tuning) to train a small language model for content safety classification.
-The model learns to classify prompts as "harmful" or "unharmful".
+Demonstrates supervised fine-tuning of a small chat model as a binary
+classifier: the user turn holds an instruction plus the prompt to judge,
+the model turn is the label ``harmful`` or ``unharmful``. Shows how to
+configure ``PESFTConfig`` for a chat template with response-only loss
+(``_build_config``), write the batched formatting function that
+``PESFT.train`` needs (``format_example`` in ``main``) and save the
+adapters with the instruction used, so ``guard_eval`` and ``guard_test``
+can rebuild the same prompt.
 
-PESFT provides a high-level interface for supervised fine-tuning with:
-- Automatic LoRA adapter management for parameter-efficient training
-- Built-in support for chat templates and instruction formatting
-- Integration with TRL's SFTTrainer for robust training
-- Flexible dataset formatting and preprocessing
-
-The training workflow:
-    1. Load a base model with LoRA adapters using PESFT.load_model()
-    2. Prepare train/eval datasets with instruction-response pairs
-    3. Define a formatting function to convert examples to chat format
-    4. Call PESFT.train() to fine-tune with supervised learning
-    5. Evaluate the trained model and save LoRA adapters
-
-This example uses the WildGuardMix dataset which contains:
-- Prompts labeled as "harmful" or "unharmful"
-- Binary classification task for content moderation
-- Approximately 90k training examples and 5k test examples
-
-The trained model can be used for:
-- Content moderation and safety filtering
-- Prompt classification before generation
-- Building guardrails for LLM applications
+WildGuardMix (``allenai/wildguardmix``) is gated: accept its terms on the
+Hub, then ``hf auth login`` or export ``HF_TOKEN``.
 
 Usage:
-    # Basic training with default settings (Gemma-3-270M on WildGuardMix)
     uv run python -m examples.guard.guard_train
-
-    # Train with custom hyperparameters
-    uv run python -m examples.guard.guard_train \\
-        --lora_r 8 \\
-        --learning_rate 5e-5 \\
-        --num_epochs 5
-
-    # Use a different model
-    uv run python -m examples.guard.guard_train \\
-        --model_name_or_path unsloth/Qwen2.5-1.5B \\
-        --per_device_batch_size 16
-
-    # See all available options
+    uv run python -m examples.guard.guard_train --num_epochs 1 --lora_r 16
     uv run python -m examples.guard.guard_train --help
 
-Example input/output:
-    Input prompt: "How to build a bomb?"
-    Model output: "harmful"
-
-    Input prompt: "How to build confidence?"
-    Model output: "unharmful"
-
-With more train data, using this script with r=4 on gemma3-270m-it we
-got the following benchmark results on WildGuardMix test set:
-    - Accuracy: 0.7028
-    - Precision (macro): 0.7617
-    - Recall (macro): 0.6716
-    - F1 (macro): 0.6604
-    - Average Precision: 0.6081
-
-For more information on PESFT, see the speftr module documentation.
+The chat template and turn markers are Gemma 3's (``_build_config``); to
+train another model family change them there and ``CHAT_TEMPLATE`` in the
+other guard scripts. Data, results and adaptation steps:
+``examples/guard/README.md``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -75,54 +34,28 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+
+# unsloth must be imported before datasets/transformers/trl so its patches
+# apply to everything imported after it.
 import unsloth
 from datasets import load_dataset
-from huggingface_hub import login
 
 from speftr import PESFT, PESFTConfig
 
 
+# Prepended to every prompt; saved with the adapters so the eval and test
+# scripts send exactly the text the model was trained on.
 INSTRUCTION = "Classify this prompt's as harmful or unharmful:"
 
 
-def _parse_max_seq_length(value: str) -> int | None:
-    """Parse max_seq_length argument, allowing 'none' for unlimited length.
-
-    Args:
-        value: String value from command line ("none" or integer).
-
-    Returns:
-        None if value is "none", otherwise the integer value.
-
-    Example:
-        >>> _parse_max_seq_length("2048")
-        2048
-        >>> _parse_max_seq_length("none")
-        None
-    """
-    if value.lower() == "none":
-        return None
-    return int(value)
-
-
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments for PESFT training configuration.
+    """Parse the command-line options this example exposes.
 
-    This function defines all available command-line options for configuring:
-    - Model selection and loading (model path, quantization)
-    - LoRA hyperparameters (rank, alpha)
-    - Training settings (learning rate, batch size, epochs)
-    - Gradient optimization (accumulation, checkpointing, clipping)
-    - Sequence handling (max length, packing)
-    - Output directory for saving checkpoints
+    Only a subset of ``PESFTConfig`` is exposed; the chat template and
+    markers are fixed in ``_build_config``.
 
     Returns:
-        Parsed arguments as an argparse.Namespace object with all
-        configuration values.
-
-    Example:
-        >>> args = parse_args()
-        >>> print(args.model_name_or_path)  # "unsloth/gemma-3-270m-it"
+        Namespace with model, LoRA, optimisation and output settings.
     """
     parser = argparse.ArgumentParser(
         description="Train a safety classification model with PESFT"
@@ -187,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["unsloth", "true", "false"],
         default="unsloth",
-        help="Use gradient checkpointing",
+        help="Gradient checkpointing mode (default: unsloth)",
     )
 
     parser.add_argument(
@@ -199,9 +132,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--max_seq_length",
-        type=_parse_max_seq_length,
+        type=int,
         default=2048,
-        help="Maximum sequence length or 'none' for unlimited",
+        help="Maximum sequence length in tokens (default: 2048)",
     )
 
     parser.add_argument(
@@ -237,44 +170,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def _build_config(args: argparse.Namespace) -> PESFTConfig:
-    """Construct PESFTConfig from parsed command-line arguments.
+    """Map the CLI options onto a ``PESFTConfig`` for the guard task.
 
-    This function maps command-line arguments to a PESFTConfig object,
-    setting up all the necessary configuration for supervised fine-tuning
-    with LoRA adapters. Some values use PESFT defaults while others come
-    from command-line arguments.
+    Fields not set here keep the ``PESFTConfig`` defaults (LoRA on all
+    attention and MLP projections, constant LR, per-epoch eval and save,
+    best checkpoint by ``eval_loss`` reloaded at the end).
 
     Args:
-        args: Parsed command-line arguments from parse_args().
+        args: Options from ``parse_args``.
 
     Returns:
-        Fully configured PESFTConfig object ready for PESFT initialization.
-
-    Note:
-        - chat_template is set to "gemma-3" for Gemma-3 models
-        - train_on_responses=True means loss is computed only on model outputs
-        - instruction_part/response_part identify user vs model turns
-        - lora_layers="all" applies LoRA to all linear layers
+        The training configuration.
     """
     config = PESFTConfig()
 
-    # Model configuration
     config.model_name_or_path = args.model_name_or_path
     config.max_seq_length = args.max_seq_length
     config.load_in_4bit = args.load_in_4bit
 
-    # Chat template configuration (Gemma-3 specific)
+    # Loss only on the label: tokens after response_part up to the next
+    # instruction_part are trained. Both markers must match the Gemma 3
+    # template's rendered text exactly, or nothing (or everything) is
+    # trained.
     config.chat_template = "gemma-3"
-    config.train_on_responses = True  # Only compute loss on model outputs
-    config.instruction_part = "<start_of_turn>user\n"  # User message marker
-    config.response_part = "<start_of_turn>model\n"  # Model response marker
+    config.train_on_responses = True
+    config.instruction_part = "<start_of_turn>user\n"
+    config.response_part = "<start_of_turn>model\n"
 
-    # LoRA configuration
     config.lora_r = args.lora_r
     config.lora_alpha = args.lora_alpha
-    config.lora_layers = "all"  # Apply LoRA to all compatible layers
 
-    # Training hyperparameters
     config.learning_rate = args.learning_rate
     config.warmup_ratio = args.warmup_ratio
     config.weight_decay = args.weight_decay
@@ -285,42 +210,24 @@ def _build_config(args: argparse.Namespace) -> PESFTConfig:
     config.max_grad_norm = args.max_grad_norm
     config.num_train_epochs = args.num_epochs
 
-    # Output and optimization
     config.output_dir = args.output_dir
-    config.report_to = "none"  # Disable wandb/tensorboard
-    config.packing = args.packing  # Enable/disable sequence packing
+    config.report_to = "none"
+    config.packing = args.packing
 
     return config
 
 
 def _load_datasets() -> tuple[Any, Any]:
-    """Load and filter the WildGuardMix dataset for safety classification.
+    """Load the WildGuardMix train and test splits.
 
-    This function:
-    1. Loads train and test splits from HuggingFace datasets
-    2. Filters out examples with missing or empty labels
-    3. Returns cleaned datasets ready for training
-
-    The WildGuardMix dataset contains prompts labeled as:
-    - "harmful": Content that could cause harm
-    - "unharmful": Safe, benign content
+    Rows without a ``prompt_harm_label`` are dropped. The columns used
+    downstream are ``prompt`` (text to classify) and ``prompt_harm_label``
+    (``"harmful"`` or ``"unharmful"``); the others are ignored by
+    ``format_example``.
 
     Returns:
-        Tuple of (train_dataset, eval_dataset) as HuggingFace Dataset objects.
-        Each example contains:
-            - "prompt": The text prompt to classify
-            - "prompt_harm_label": Label ("harmful" or "unharmful")
-
-    Example:
-        >>> train_ds, eval_ds = _load_datasets()
-        >>> print(train_ds[0])
-        {
-            "prompt": "How to build a bomb?",
-            "prompt_harm_label": "harmful",
-            ...
-        }
+        ``(train_dataset, eval_dataset)``: wildguardtrain and wildguardtest.
     """
-    # Load train and test splits from HuggingFace Hub
     train_dataset = load_dataset(
         "allenai/wildguardmix", "wildguardtrain", split="train"
     )
@@ -328,165 +235,66 @@ def _load_datasets() -> tuple[Any, Any]:
         "allenai/wildguardmix", "wildguardtest", split="test"
     )
 
-    # Filter out examples with missing or empty labels
-    # This ensures all training examples have valid classifications
     train_dataset = train_dataset.filter(
-        lambda x: x["prompt_harm_label"] is not None
-        and x["prompt_harm_label"] != ""
+        lambda x: (
+            x["prompt_harm_label"] is not None and x["prompt_harm_label"] != ""
+        )
     )
     eval_dataset = eval_dataset.filter(
-        lambda x: x["prompt_harm_label"] is not None
-        and x["prompt_harm_label"] != ""
+        lambda x: (
+            x["prompt_harm_label"] is not None and x["prompt_harm_label"] != ""
+        )
     )
 
     return train_dataset, eval_dataset
 
 
 def main() -> None:
-    """Execute the complete PESFT training workflow for safety classification.
+    """Train the guard adapters and save them with the instruction used.
 
-    This function demonstrates the full pipeline for supervised fine-tuning
-    with PESFT (Parameter-Efficient Supervised Fine-Tuning):
+    Runs ``PESFT(config)`` then ``load_model()``, ``train()`` and
+    ``save_model()``, then adds ``instruction_prefix`` to the saved
+    ``tokenizer_config.json``.
 
-    1. **Configuration**: Parse CLI args and build PESFTConfig
-    2. **Authentication**: Login to HuggingFace Hub for dataset/model access
-    3. **PESFT Initialization**: Create PESFT trainer instance
-    4. **Model Loading**: Load base model with LoRA adapters
-    5. **Dataset Loading**: Load and filter WildGuardMix dataset
-    6. **Format Function**: Define how to convert examples to chat format
-    7. **Training**: Run supervised fine-tuning with PESFT.train()
-    8. **Saving**: Save LoRA adapters and update tokenizer config
-
-    The workflow uses standard supervised learning with cross-entropy loss.
-    PESFT handles all the complexity of LoRA training, chat template
-    formatting, and response masking (only computing loss on model outputs).
-
-    Raises:
-        ValueError: If dataset loading fails or examples are invalid.
-        RuntimeError: If model loading or training fails.
-
-    Example workflow:
-        >>> # 1. Parse arguments and build config
-        >>> args = parse_args()
-        >>> config = PESFTConfig(...)
-
-        >>> # 2. Initialize PESFT trainer and load model
-        >>> pesft = PESFT(config)
-        >>> model, tokenizer = pesft.load_model()
-
-        >>> # 3. Load datasets
-        >>> train_ds, eval_ds = load_datasets()
-
-        >>> # 4. Define format function
-        >>> def format_fn(examples): ...
-
-        >>> # 5. Train with supervised learning
-        >>> pesft.train(train_ds, eval_ds, format_fn)
-
-        >>> # 6. Save LoRA adapters
-        >>> pesft.save_model()
+    Returns:
+        None. Adapters, tokenizer, ``speftr.json``, ``training_args.json``
+        and per-epoch checkpoints are written to ``--output_dir``.
     """
-    # =========================================================================
-    # STEP 1: Parse configuration from command line
-    # =========================================================================
     args = parse_args()
-
-    # =========================================================================
-    # STEP 2: Authenticate with HuggingFace Hub
-    # =========================================================================
-    # Required for accessing datasets and models
-    # Uses HF_TOKEN environment variable if available, otherwise interactive
-    if "HF_TOKEN" in os.environ:
-        login(token=os.environ["HF_TOKEN"])
-    else:
-        login()  # Interactive login
-
-    # Print Unsloth version for debugging and reproducibility
     print(unsloth.__version__)
 
-    # =========================================================================
-    # STEP 3: Build PESFTConfig from arguments
-    # =========================================================================
-    # PESFTConfig combines:
-    # - Model settings (path, quantization, sequence length)
-    # - LoRA settings (rank, alpha, layers) for parameter-efficient training
-    # - Training settings (learning rate, batch size, epochs)
-    # - Chat template settings (for formatting instruction-response pairs)
     config = _build_config(args)
-
-    # =========================================================================
-    # STEP 4: Initialize PESFT trainer
-    # =========================================================================
-    # PESFT handles all the complexity of:
-    # - Loading models with LoRA adapters
-    # - Setting up TRL's SFTTrainer
-    # - Applying chat templates
-    # - Masking loss computation to only model responses
     trainer = PESFT(config)
-
-    # =========================================================================
-    # STEP 5: Load base model with LoRA adapters
-    # =========================================================================
-    # PESFT.load_model() returns the model with LoRA adapters already attached
-    # The tokenizer is configured with the correct chat template
+    # The returned tokenizer already has the gemma-3 chat template applied.
     _model, tokenizer = trainer.load_model()
 
-    # =========================================================================
-    # STEP 6: Define formatting function for dataset
-    # =========================================================================
-    # The formatting function converts raw dataset examples into chat-formatted
-    # strings that the model can learn from. It must:
-    # - Take a batched dict of examples (lists of values)
-    # - Return a list of formatted strings (one per example)
-    # - Use tokenizer.apply_chat_template() for proper formatting
     def format_example(examples: Mapping[str, Any]) -> list[str]:
-        r"""Format batched WildGuardMix examples into chat format strings.
+        r"""Render a batch of WildGuardMix rows as Gemma 3 conversations.
 
-        This function converts raw examples with prompts and labels into
-        chat-formatted strings using the model's chat template. Each example
-        becomes a user-model conversation:
-
-        User: "Classify this prompt as harmful or unharmful:\n\n[prompt]"
-        Model: "harmful" or "unharmful"
+        ``PESFT.train`` calls this with batched columns (column name to
+        list of values). Each row becomes a user turn (``INSTRUCTION``, a
+        blank line, the prompt) and a model turn holding the label.
 
         Args:
-            examples: Batched dictionary containing:
-                - "prompt": List of text prompts to classify
-                - "prompt_harm_label": List of labels ("harmful"/"unharmful")
+            examples: Batch with ``prompt`` and ``prompt_harm_label``
+                lists.
 
         Returns:
-            List of chat-formatted strings, one per example. Each string
-            includes the full conversation with proper chat markers.
-
-        Example:
-            >>> examples = {
-            ...     "prompt": ["How to build a bomb?"],
-            ...     "prompt_harm_label": ["harmful"],
-            ... }
-            >>> formatted = format_example(examples)
-            >>> # Returns chat-formatted text like:
-            >>> # "<start_of_turn>user\nClassify...\n<start_of_turn>model\n
-            >>> #  harmful<end_of_turn>"
+            One rendered conversation per row, e.g.
+            ``<start_of_turn>user\n...<end_of_turn>\n``
+            ``<start_of_turn>model\nharmful<end_of_turn>\n``.
         """
         texts = []
-        # Process each example in the batch
         for prompt, harm_label in zip(
             examples["prompt"], examples["prompt_harm_label"], strict=False
         ):
-            # Step 1: Construct user message with instruction + prompt
             user_content = f"{INSTRUCTION}\n\n{prompt.strip()}"
-
-            # Step 2: Get model's target response (the label)
             model_content = harm_label.strip()
-
-            # Step 3: Create chat conversation as list of messages
+            # Gemma templates call the assistant role "model".
             messages = [
                 {"role": "user", "content": user_content},
                 {"role": "model", "content": model_content},
             ]
-
-            # Step 4: Apply chat template to format as string
-            # add_generation_prompt=False because we include the response
             text = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -494,52 +302,25 @@ def main() -> None:
             )
             texts.append(text)
 
-        return texts  # Return list of formatted strings
+        return texts
 
-    # =========================================================================
-    # STEP 7: Load and filter WildGuardMix dataset
-    # =========================================================================
     train_dataset, eval_dataset = _load_datasets()
-
     print(f"Train dataset size: {len(train_dataset)}")
     print(f"Eval dataset size: {len(eval_dataset)}")
 
-    # =========================================================================
-    # STEP 8: Run supervised fine-tuning with PESFT
-    # =========================================================================
-    # PESFT.train() handles the entire training loop:
-    # - Formats examples using the provided format_example function
-    # - Applies response masking (loss only on model outputs)
-    # - Trains with standard cross-entropy loss
-    # - Logs metrics and saves checkpoints
     trainer.train(train_dataset, eval_dataset, format_example)
-
-    # =========================================================================
-    # STEP 9: Save LoRA adapters
-    # =========================================================================
-    # save_model() saves only the LoRA adapter weights
-    # These can be loaded later with PEFT or merged into the base model
     trainer.save_model()
 
-    # =========================================================================
-    # STEP 10: Save instruction template in tokenizer config
-    # =========================================================================
-    # Store the instruction prefix in tokenizer config for inference
-    # This allows the trained model to be used correctly at inference time
+    # guard_eval and guard_test read instruction_prefix back, so inference
+    # prompts match the training prompts even if INSTRUCTION is edited.
     print("Saving instruction template in tokenizer configuration...")
     tokenizer_config_path = Path(config.output_dir) / "tokenizer_config.json"
-
-    # Load existing tokenizer config if it exists
     if tokenizer_config_path.exists():
         with tokenizer_config_path.open() as handle:
             tokenizer_config = json.load(handle)
     else:
         tokenizer_config = {}
-
-    # Add instruction prefix to config
     tokenizer_config["instruction_prefix"] = INSTRUCTION
-
-    # Save updated config
     with tokenizer_config_path.open("w") as handle:
         json.dump(tokenizer_config, handle, indent=2)
 

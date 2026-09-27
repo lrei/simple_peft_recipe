@@ -1,0 +1,56 @@
+[
+ {
+  "row": 0,
+  "answer": "SELECT COUNT(*) FROM head WHERE age > 56",
+  "question": "How many heads of the departments are older than 56 ?",
+  "context": "CREATE TABLE head (age INTEGER)"
+ },
+ {
+  "row": 1,
+  "answer": "SELECT name, born_state, age FROM head ORDER BY age",
+  "question": "List the name, born state and age of the heads of departments ordered by age.",
+  "context": "CREATE TABLE head (name VARCHAR, born_state VARCHAR, age VARCHAR)"
+ },
+ {
+  "row": 3,
+  "answer": "SELECT MAX(budget_in_billions), MIN(budget_in_billions) FROM department",
+  "question": "What are the maximum and minimum budget of the departments?",
+  "context": "CREATE TABLE department (budget_in_billions INTEGER)"
+ },
+ {
+  "row": 6,
+  "answer": "SELECT DISTINCT T1.creation FROM department AS T1 JOIN management AS T2 ON T1.department_id = T2.department_id JOIN head AS T3 ON T2.head_id = T3.head_id WHERE T3.born_state = 'Alabama'",
+  "question": "What are the distinct creation years of the departments managed by a secretary born in state 'Alabama'?",
+  "context": "CREATE TABLE department (creation VARCHAR, department_id VARCHAR); CREATE TABLE management (department_id VARCHAR, head_id VARCHAR); CREATE TABLE head (head_id VARCHAR, born_state VARCHAR)"
+ },
+ {
+  "row": 9,
+  "answer": "SELECT T1.name, T1.num_employees FROM department AS T1 JOIN management AS T2 ON T1.department_id = T2.department_id WHERE T2.temporary_acting = 'Yes'",
+  "question": "Show the name and number of employees for the departments managed by heads whose temporary acting value is 'Yes'?",
+  "context": "CREATE TABLE management (department_id VARCHAR, temporary_acting VARCHAR); CREATE TABLE department (name VARCHAR, num_employees VARCHAR, department_id VARCHAR)"
+ },
+ {
+  "row": 750,
+  "answer": "SELECT DISTINCT T1.player_name FROM Player AS T1 JOIN Player_Attributes AS T2 ON T1.player_api_id = T2.player_api_id ORDER BY overall_rating DESC LIMIT 3",
+  "question": "Who are the top 3 players in terms of overall rating?",
+  "context": "CREATE TABLE Player (player_name VARCHAR, player_api_id VARCHAR); CREATE TABLE Player_Attributes (player_api_id VARCHAR)"
+ },
+ {
+  "row": 1750,
+  "answer": "SELECT T1.first_name, T1.last_name, T1.customer_id FROM customer AS T1 JOIN payment AS T2 ON T1.customer_id = T2.customer_id GROUP BY T1.customer_id ORDER BY SUM(amount) LIMIT 1",
+  "question": "Which customer, who has made at least one payment, has spent the least money? List his or her first name, last name, and the id.",
+  "context": "CREATE TABLE payment (customer_id VARCHAR); CREATE TABLE customer (first_name VARCHAR, last_name VARCHAR, customer_id VARCHAR)"
+ },
+ {
+  "row": 1950,
+  "answer": "SELECT emp_fname FROM employee WHERE emp_jobcode = 'PROF' EXCEPT SELECT T1.emp_fname FROM employee AS T1 JOIN CLASS AS T2 ON T1.emp_num = T2.prof_num",
+  "question": "What are the first names of the professors who do not teach a class.",
+  "context": "CREATE TABLE employee (emp_fname VARCHAR, emp_jobcode VARCHAR); CREATE TABLE CLASS (prof_num VARCHAR); CREATE TABLE employee (emp_fname VARCHAR, emp_num VARCHAR)"
+ },
+ {
+  "row": 10000,
+  "answer": "SELECT purpose FROM table_name_71 WHERE band = \"am\" AND callsign = \"6wh\"",
+  "question": "Band of am, and a Callsign of 6wh has what purpose?",
+  "context": "CREATE TABLE table_name_71 (purpose VARCHAR, band VARCHAR, callsign VARCHAR)"
+ }
+]

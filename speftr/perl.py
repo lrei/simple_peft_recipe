@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 Luis Rei
+# SPDX-License-Identifier: BSD-2-Clause
 """PERL: Parameter-Efficient Reinforcement Learning with LoRA.
 
 This module provides a reusable class-based interface for training language
@@ -25,7 +27,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -35,8 +37,95 @@ if TYPE_CHECKING:
 
     from datasets import Dataset
     from peft import PeftModel
-    from transformers import PreTrainedTokenizerBase
+    from transformers import (
+        BitsAndBytesConfig,
+        PreTrainedModel,
+        PreTrainedTokenizer,
+        PreTrainedTokenizerBase,
+        PreTrainedTokenizerFast,
+    )
     from trl import GRPOConfig, GRPOTrainer
+
+    # PreTrainedTokenizerBase does not declare convert_tokens_to_ids; the
+    # concrete slow/fast tokenizer classes do.
+    type _ConcreteTokenizer = PreTrainedTokenizer | PreTrainedTokenizerFast
+
+
+def _checkpoint_model_class(model_name_or_path: str) -> type[Any]:
+    """Return the model class a checkpoint declares in its config.
+
+    vLLM instantiates the architecture named in the checkpoint, and TRL syncs
+    weights to it by parameter name, so the trained model must use the same
+    class. ``AutoModelForCausalLM`` would pick a text-only class for some
+    multimodal checkpoints (e.g. Qwen 3.5).
+
+    Args:
+        model_name_or_path: Hub id or local checkpoint path.
+
+    Returns:
+        The declared transformers class, or ``AutoModelForCausalLM`` when the
+        config names none that transformers provides.
+    """
+    import transformers  # noqa: PLC0415
+
+    # User-supplied id, often a local path: no Hub revision to pin (B615).
+    config = transformers.AutoConfig.from_pretrained(  # nosec B615
+        model_name_or_path
+    )
+    architectures = config.architectures or []
+    model_class: type[Any] = transformers.AutoModelForCausalLM
+    if architectures and hasattr(transformers, architectures[0]):
+        model_class = getattr(transformers, architectures[0])
+    return model_class
+
+
+def _quantization_config(
+    load_in_4bit: bool,  # noqa: FBT001
+) -> BitsAndBytesConfig | None:
+    """Return the bitsandbytes QLoRA config, or ``None`` for bf16 loading.
+
+    Args:
+        load_in_4bit: Whether to quantize the base weights to 4 bits.
+
+    Returns:
+        An NF4 double-quantized config computing in bf16, or ``None``.
+    """
+    if not load_in_4bit:
+        return None
+    from transformers import BitsAndBytesConfig  # noqa: PLC0415
+
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+
+def _language_model_targets(
+    model: PreTrainedModel, module_names: list[str]
+) -> list[str] | str:
+    """Restrict LoRA targets to the text decoder of multimodal checkpoints.
+
+    Multimodal checkpoints (e.g. Gemma 4, loaded through
+    ``AutoModelForCausalLM``) also use names like ``q_proj`` in their vision
+    and audio towers, where LoRA is unwanted and peft may not support the
+    layer types. Those models keep their decoder under ``language_model``.
+
+    Args:
+        model: Loaded base model.
+        module_names: Leaf module names to adapt (``q_proj``, ...).
+
+    Returns:
+        ``module_names`` unchanged for text-only models, otherwise a peft
+        regex matching those names inside ``language_model`` only.
+    """
+    has_language_model = any(
+        ".language_model." in f".{name}." for name, _ in model.named_modules()
+    )
+    if not has_language_model:
+        return module_names
+    return rf".*\.language_model\..*\.({'|'.join(module_names)})"
 
 
 @dataclass
@@ -48,48 +137,54 @@ class PERLConfig:
     which recommends: rank 1, learning rate 10x higher than full fine-tuning,
     effective batch sizes < 32, and 1 epoch of training.
 
+    Fields are grouped as model and vLLM loading (``model_name_or_path``
+    to ``vllm_enable_sleep_mode``), LoRA (``lora_r`` to
+    ``target_modules``), GRPO training (``output_dir`` to ``report_to``),
+    generation (``temperature`` to ``include_stop_str_in_output``), resume
+    and other settings.
+
     Attributes:
-        Model Configuration:
-            model_name_or_path: HuggingFace model name or local path
-            max_seq_length: Maximum sequence length (None = no limit)
-            load_in_4bit: Use 4-bit quantization
-            fast_inference: Enable vLLM fast inference
-            gpu_memory_utilization: GPU memory usage (0.0-1.0)
-
-        LoRA Configuration (RL-optimized):
-            lora_r: LoRA rank (default: 1, per "LoRA without Regret")
-            lora_alpha: LoRA scaling factor (default: 32)
-            target_modules: List of module names to apply LoRA
-            use_gradient_checkpointing: Gradient checkpointing mode
-
-        GRPO Training Configuration:
-            output_dir: Directory for saving checkpoints
-            num_train_epochs: Number of training epochs (default: 1)
-            max_steps: Maximum training steps (-1 = use epochs)
-            per_device_train_batch_size: Training batch size per device
-            per_device_eval_batch_size: Evaluation batch size per device
-            gradient_accumulation_steps: Gradient accumulation (default: 1)
-            learning_rate: Learning rate (default: 1e-5, 10x full FT)
-            weight_decay: Weight decay coefficient
-            scheduler: Learning rate scheduler (default: cosine)
-            warmup_ratio: Fraction of training steps for warmup
-            logging_steps: Log metrics every N steps
-            save_strategy: When to save checkpoints ("epoch" or "steps")
-            save_steps: Save checkpoint every N steps (if strategy="steps")
-            optim: Optimizer name
-            report_to: Experiment tracking backend
-
-        Generation Configuration:
-            temperature: Sampling temperature
-            num_generations: Number of generations per prompt (default: 8)
-            max_prompt_length: Maximum prompt length in tokens
-            max_completion_length: Maximum completion length
-            vllm_min_p: Min-p sampling parameter
-            vllm_top_p: Top-p nucleus sampling
-            vllm_top_k: Top-k sampling (-1 = disabled)
-
-        Other Configuration:
-            random_state: Random seed for reproducibility
+        model_name_or_path: HuggingFace model name or local path
+        max_seq_length: Maximum sequence length (None = no limit)
+        load_in_4bit: Load the base model in 4-bit (bitsandbytes NF4,
+            QLoRA). Requires ``use_vllm=False``: TRL syncs merged weights
+            into vLLM, which corrupts a 4-bit vLLM copy.
+        use_vllm: Use vLLM for generation during GRPO
+        vllm_mode: vLLM mode ("colocate" or "server")
+        vllm_gpu_memory_utilization: GPU memory fraction for vLLM (0.0-1.0)
+        vllm_enable_sleep_mode: Sleep vLLM during optimization steps
+        lora_r: LoRA rank (default: 1, per "LoRA without Regret")
+        lora_alpha: LoRA scaling factor (default: 32)
+        use_gradient_checkpointing: Gradient checkpointing mode
+        target_modules: List of module names to apply LoRA
+        output_dir: Directory for saving checkpoints
+        num_train_epochs: Number of training epochs
+        max_steps: Maximum training steps (-1 = use epochs)
+        per_device_train_batch_size: Training batch size per device
+        per_device_eval_batch_size: Evaluation batch size per device
+        gradient_accumulation_steps: Gradient accumulation (default: 1)
+        learning_rate: Learning rate (default: 1e-5, 10x full FT)
+        weight_decay: Weight decay coefficient
+        scheduler: Learning rate scheduler (default: cosine)
+        warmup_ratio: Fraction of training steps for warmup
+        logging_steps: Log metrics every N steps
+        save_strategy: When to save checkpoints ("epoch" or "steps")
+        save_steps: Save checkpoint every N steps (if strategy="steps")
+        optim: Optimizer name
+        report_to: Experiment tracking backend
+        temperature: Sampling temperature
+        num_generations: Number of generations per prompt (default: 8)
+        max_prompt_length: Prompt token budget; only used to derive
+            ``max_completion_length`` (``max_seq_length`` minus this) when
+            that is unset. Prompts are not truncated.
+        max_completion_length: Maximum completion length
+        min_p: Min-p sampling parameter
+        top_p: Top-p nucleus sampling
+        top_k: Top-k sampling (-1 or None = disabled)
+        stop_sequences: Stop strings for generation (None = tokenizer EOS)
+        include_stop_str_in_output: Keep the stop string in completions
+        resume_from_checkpoint: Checkpoint path to resume training from
+        random_state: Random seed for reproducibility
     """
 
     # Model configuration
@@ -98,7 +193,7 @@ class PERLConfig:
     load_in_4bit: bool = False
     use_vllm: bool = True  # Use vLLM for generation (faster)
     vllm_mode: str = "colocate"  # "colocate" or "server"
-    vllm_gpu_memory_utilization: float = 0.2  # Low memory for vLLM
+    vllm_gpu_memory_utilization: float = 0.5
     vllm_enable_sleep_mode: bool = True  # Sleep vLLM during optimization
 
     # LoRA configuration (RL-optimized per "LoRA without Regret")
@@ -121,7 +216,8 @@ class PERLConfig:
     output_dir: str = "./models/perl-reasoning"
     num_train_epochs: int = 2  # Default: 2 epochs
     max_steps: int = -1  # -1 = use num_train_epochs
-    per_device_train_batch_size: int = 1  # 1 prompt at a time
+    # Counted in completions: 8 = one prompt x ``num_generations``.
+    per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 8  # Evaluation batch size
     gradient_accumulation_steps: int = 1  # Default single prompt per update
     learning_rate: float = 1e-5
@@ -151,6 +247,19 @@ class PERLConfig:
 
     # Other configuration
     random_state: int = 3407
+
+    def __post_init__(self) -> None:
+        """Reject option combinations that cannot train correctly.
+
+        Returns:
+            None. Validation only.
+
+        Raises:
+            ValueError: If ``load_in_4bit`` and ``use_vllm`` are both set.
+        """
+        if self.load_in_4bit and self.use_vllm:
+            msg = "load_in_4bit requires use_vllm=False"
+            raise ValueError(msg)
 
     @classmethod
     def from_args(cls, args: argparse.Namespace | None = None) -> PERLConfig:
@@ -232,11 +341,9 @@ class PERL:
     fine-tuning language models with LoRA adapters. It handles model
     loading, LoRA setup, GRPO training, and model saving.
 
-    Attributes:
-        config: Training configuration
-        model: Language model with LoRA adapters
-        tokenizer: Tokenizer
-        trainer: TRL GRPOTrainer instance (after train() is called)
+    Instances expose ``config`` (training configuration), ``model``
+    (language model with LoRA adapters), ``tokenizer`` and ``trainer``
+    (TRL GRPOTrainer instance, set once train() is called).
 
     Example:
         >>> config = PERLConfig(
@@ -290,6 +397,9 @@ class PERL:
             model: Pre-trained model with LoRA adapters
             tokenizer: Tokenizer from the pre-training stage
 
+        Returns:
+            None. The model and tokenizer are stored on the instance.
+
         Example:
             >>> sft_trainer = PESFT(sft_config)
             >>> sft_trainer.train(...)
@@ -314,7 +424,6 @@ class PERL:
         # Import required modules
         from peft import LoraConfig, get_peft_model, PeftModel  # noqa: PLC0415, F401, I001
         from transformers import (  # noqa: PLC0415, F401
-            AutoModelForCausalLM,
             AutoTokenizer,
             PreTrainedTokenizerBase,
         )
@@ -322,28 +431,35 @@ class PERL:
         print(f"\nLoading model: {self.config.model_name_or_path}")
         print("Using TRL-only mode (no Unsloth dependencies)")
 
-        # Load merged model from disk
+        # Load merged model from disk. The model id is user-supplied (often
+        # a local path), so pinning a Hub revision does not apply (B615).
         print("  Loading merged model with transformers...")
+        model_class = _checkpoint_model_class(self.config.model_name_or_path)
+        load_kwargs = {
+            "dtype": torch.bfloat16,
+            "device_map": "auto",
+            "quantization_config": _quantization_config(
+                self.config.load_in_4bit
+            ),
+        }
         # Try flash_attention_2, fall back to sdpa if not available
         try:
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_class.from_pretrained(
                 self.config.model_name_or_path,
-                dtype=torch.bfloat16,
-                device_map="auto",
                 attn_implementation="flash_attention_2",
+                **load_kwargs,
             )
             print("  Using Flash Attention 2")
         except (ImportError, ValueError):
             print("  Flash Attention 2 not available, using SDPA")
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_class.from_pretrained(
                 self.config.model_name_or_path,
-                dtype=torch.bfloat16,
-                device_map="auto",
                 attn_implementation="sdpa",
+                **load_kwargs,
             )
 
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(  # nosec B615
             self.config.model_name_or_path
         )
 
@@ -353,7 +469,9 @@ class PERL:
             r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=0.0,
-            target_modules=self.config.target_modules,
+            target_modules=_language_model_targets(
+                model, self.config.target_modules
+            ),
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -407,20 +525,22 @@ class PERL:
         return max_prompt_length, max_completion_length
 
     def _print_grpo_config(self) -> None:
-        """Log the GRPO hyperparameters relevant to sampling throughput."""
+        """Log the GRPO hyperparameters relevant to sampling throughput.
+
+        Returns:
+            None. Output is printed to stdout.
+        """
         grad_accum = self.config.gradient_accumulation_steps
         print("\nGRPO Configuration:")
         print(f"  num_generations: {self.config.num_generations}")
         print(f"  gradient_accumulation_steps: {grad_accum}")
 
     def _create_grpo_config(
-        self, max_prompt_length: int | None, max_completion_length: int | None
+        self, max_completion_length: int | None
     ) -> GRPOConfig:
         """Build a GRPOConfig with optional vLLM-specific arguments.
 
         Args:
-            max_prompt_length: Maximum number of tokens to sample from the
-                prompt portion of each example.
             max_completion_length: Maximum number of new tokens to generate
                 per prompt.
 
@@ -432,14 +552,15 @@ class PERL:
 
         grad_accum = self.config.gradient_accumulation_steps
 
-        grpo_kwargs = {
+        grpo_kwargs: dict[str, Any] = {
             "temperature": self.config.temperature,
             "min_p": self.config.min_p,
             "top_p": self.config.top_p,
             "top_k": self.config.top_k,
             "learning_rate": self.config.learning_rate,
             "weight_decay": self.config.weight_decay,
-            "warmup_ratio": self.config.warmup_ratio,
+            # A float in [0, 1) is read as a fraction of total steps.
+            "warmup_steps": self.config.warmup_ratio,
             "lr_scheduler_type": self.config.scheduler,
             "optim": self.config.optim,
             "logging_steps": self.config.logging_steps,
@@ -451,7 +572,6 @@ class PERL:
             ),
             "gradient_accumulation_steps": grad_accum,
             "num_generations": self.config.num_generations,
-            "max_prompt_length": max_prompt_length,
             "max_completion_length": max_completion_length,
             "num_train_epochs": self.config.num_train_epochs,
             "max_steps": self.config.max_steps,
@@ -464,56 +584,97 @@ class PERL:
         }
 
         if self.config.use_vllm:
-            print("\nvLLM Generation Enabled:")
-            print(f"  mode: {self.config.vllm_mode}")
-            print(f"  min_p: {self.config.min_p}")
-            print(f"  top_p: {self.config.top_p}")
-            print(f"  top_k: {self.config.top_k}")
-            print(
-                f"  gpu_memory_utilization: "
-                f"{self.config.vllm_gpu_memory_utilization}"
-            )
-            print(f"  sleep_mode: {self.config.vllm_enable_sleep_mode}")
-            print(f"  max_completion_length: {max_completion_length}")
-
-            grpo_kwargs["vllm_mode"] = self.config.vllm_mode
-            grpo_kwargs["vllm_gpu_memory_utilization"] = (
-                self.config.vllm_gpu_memory_utilization
-            )
-            grpo_kwargs["vllm_enable_sleep_mode"] = (
-                self.config.vllm_enable_sleep_mode
-            )
-
-            # CRITICAL: Set max_tokens for vLLM to respect
-            # max_completion_length
-            generation_kwargs: dict[str, Any] = {}
-            if max_completion_length is not None:
-                generation_kwargs["max_tokens"] = max_completion_length
-            if self.config.stop_sequences is not None:
-                generation_kwargs["stop"] = self.config.stop_sequences
-                print(f"  stop_sequences: {self.config.stop_sequences}")
-                if self.tokenizer is not None:
-                    stop_token_ids: list[int] = []
-                    for sequence in self.config.stop_sequences:
-                        token_id = self.tokenizer.convert_tokens_to_ids(
-                            sequence
-                        )
-                        if isinstance(token_id, int) and token_id >= 0:
-                            stop_token_ids.append(token_id)
-                    if stop_token_ids:
-                        generation_kwargs["stop_token_ids"] = stop_token_ids
-                        print(f"  stop_token_ids: {stop_token_ids}")
-            # These kwargs are passed straight to vLLM so it mirrors HF's
-            # sampling contract. Keeping them centralized avoids mismatches
-            # between offline evaluation and online RL.
-            generation_kwargs["include_stop_str_in_output"] = (
-                self.config.include_stop_str_in_output
-            )
-            if generation_kwargs:
-                grpo_kwargs["generation_kwargs"] = generation_kwargs
-                print(f"  generation_kwargs: {generation_kwargs}")
+            grpo_kwargs.update(self._vllm_grpo_kwargs(max_completion_length))
 
         return GRPOConfig(**grpo_kwargs)
+
+    def _vllm_grpo_kwargs(
+        self, max_completion_length: int | None
+    ) -> dict[str, Any]:
+        """Build the vLLM-specific ``GRPOConfig`` arguments and log them.
+
+        Args:
+            max_completion_length: Maximum number of new tokens to generate
+                per prompt, forwarded to vLLM as ``max_tokens``.
+
+        Returns:
+            Keyword arguments to merge into the ``GRPOConfig`` call.
+        """
+        print("\nvLLM Generation Enabled:")
+        print(f"  mode: {self.config.vllm_mode}")
+        print(f"  min_p: {self.config.min_p}")
+        print(f"  top_p: {self.config.top_p}")
+        print(f"  top_k: {self.config.top_k}")
+        print(
+            f"  gpu_memory_utilization: "
+            f"{self.config.vllm_gpu_memory_utilization}"
+        )
+        print(f"  sleep_mode: {self.config.vllm_enable_sleep_mode}")
+        print(f"  max_completion_length: {max_completion_length}")
+
+        return {
+            "vllm_mode": self.config.vllm_mode,
+            "vllm_gpu_memory_utilization": (
+                self.config.vllm_gpu_memory_utilization
+            ),
+            "vllm_enable_sleep_mode": self.config.vllm_enable_sleep_mode,
+            "generation_kwargs": self._vllm_generation_kwargs(
+                max_completion_length
+            ),
+        }
+
+    def _vllm_generation_kwargs(
+        self, max_completion_length: int | None
+    ) -> dict[str, Any]:
+        """Build the sampling kwargs passed straight to vLLM and log them.
+
+        Args:
+            max_completion_length: Maximum number of new tokens to generate
+                per prompt.
+
+        Returns:
+            vLLM ``generation_kwargs`` for ``GRPOConfig``.
+        """
+        # CRITICAL: Set max_tokens for vLLM to respect
+        # max_completion_length
+        generation_kwargs: dict[str, Any] = {}
+        if max_completion_length is not None:
+            generation_kwargs["max_tokens"] = max_completion_length
+        if self.config.stop_sequences is not None:
+            generation_kwargs["stop"] = self.config.stop_sequences
+            print(f"  stop_sequences: {self.config.stop_sequences}")
+            stop_token_ids = self._stop_token_ids(self.config.stop_sequences)
+            if stop_token_ids:
+                generation_kwargs["stop_token_ids"] = stop_token_ids
+                print(f"  stop_token_ids: {stop_token_ids}")
+        # These kwargs are passed straight to vLLM so it mirrors HF's
+        # sampling contract. Keeping them centralized avoids mismatches
+        # between offline evaluation and online RL.
+        generation_kwargs["include_stop_str_in_output"] = (
+            self.config.include_stop_str_in_output
+        )
+        print(f"  generation_kwargs: {generation_kwargs}")
+        return generation_kwargs
+
+    def _stop_token_ids(self, stop_sequences: list[str]) -> list[int]:
+        """Map stop strings that are single tokens to their token ids.
+
+        Args:
+            stop_sequences: Stop strings configured for generation.
+
+        Returns:
+            Ids of the stop strings the tokenizer knows as single tokens;
+            empty when no tokenizer is loaded.
+        """
+        if self.tokenizer is None:
+            return []
+        tokenizer = cast("_ConcreteTokenizer", self.tokenizer)
+        stop_token_ids: list[int] = []
+        for sequence in stop_sequences:
+            token_id = tokenizer.convert_tokens_to_ids(sequence)
+            if isinstance(token_id, int) and token_id >= 0:
+                stop_token_ids.append(token_id)
+        return stop_token_ids
 
     def train(
         self,
@@ -545,17 +706,13 @@ class PERL:
             print(f"Eval dataset size: {len(eval_dataset)}")
 
         # Calculate max lengths if not specified
-        max_prompt_length, max_completion_length = (
-            self._calculate_max_lengths()
-        )
+        _, max_completion_length = self._calculate_max_lengths()
 
         # Print GRPO configuration
         self._print_grpo_config()
 
         # Create GRPO training arguments
-        training_args = self._create_grpo_config(
-            max_prompt_length, max_completion_length
-        )
+        training_args = self._create_grpo_config(max_completion_length)
 
         # Initialize GRPO trainer
         trainer_kwargs: dict[str, Any] = {
@@ -599,30 +756,39 @@ class PERL:
     def save_model(self, save_method: str = "lora") -> None:
         """Persist the policy (adapters or merged weights) to disk.
 
+        ``"merged_16bit"`` folds the adapters into the bf16 base weights with
+        ``merge_and_unload``, which replaces ``self.model`` with the plain
+        merged model, so call it last.
+
         Args:
-            save_method: Strategy identifier such as ``"lora"`` or
-                ``"merged_16bit"``.
+            save_method: ``"lora"`` (adapters only) or ``"merged_16bit"``.
+
+        Returns:
+            None. Files are written to ``config.output_dir``.
 
         Raises:
-            ValueError: If the model/tokenizer have not been initialised.
+            ValueError: If the model/tokenizer have not been initialised, or
+                ``save_method`` is not supported.
         """
         if self.model is None or self.tokenizer is None:
             msg = "Model and tokenizer must be loaded before saving"
             raise ValueError(msg)
 
+        output_dir = self.config.output_dir
         if save_method == "lora":
-            print(f"\nSaving LoRA adapters to {self.config.output_dir}...")
-            self.model.save_pretrained(self.config.output_dir)
-            self.tokenizer.save_pretrained(self.config.output_dir)
+            print(f"\nSaving LoRA adapters to {output_dir}...")
+            self.model.save_pretrained(output_dir)
+        elif save_method == "merged_16bit":
+            print(f"\nSaving merged 16-bit model to {output_dir}...")
+            merged = self.model.merge_and_unload()
+            merged.save_pretrained(output_dir)
+            self.model = merged
         else:
-            print(
-                f"\nSaving merged model ({save_method}) "
-                f"to {self.config.output_dir}..."
+            msg = (
+                f"Unsupported save_method {save_method!r}; "
+                "use 'lora' or 'merged_16bit'"
             )
-            self.model.save_pretrained_merged(
-                self.config.output_dir,
-                self.tokenizer,
-                save_method=save_method,
-            )
+            raise ValueError(msg)
+        self.tokenizer.save_pretrained(output_dir)
 
         print("✓ Model saved successfully")

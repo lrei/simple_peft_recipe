@@ -1,0 +1,44 @@
+[
+  {
+    "prompt": [
+      {
+        "content": "What is better than ugly?",
+        "role": "user"
+      }
+    ],
+    "completion": [
+      {
+        "content": "Beautiful.",
+        "role": "assistant"
+      }
+    ]
+  },
+  {
+    "prompt": [
+      {
+        "content": "What is better than implicit?",
+        "role": "user"
+      }
+    ],
+    "completion": [
+      {
+        "content": "Explicit.",
+        "role": "assistant"
+      }
+    ]
+  },
+  {
+    "prompt": [
+      {
+        "content": "What is better than complex?",
+        "role": "user"
+      }
+    ],
+    "completion": [
+      {
+        "content": "Simple.",
+        "role": "assistant"
+      }
+    ]
+  }
+]

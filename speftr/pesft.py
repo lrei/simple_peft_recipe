@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2025-2026 Luis Rei
+# SPDX-License-Identifier: BSD-2-Clause
 """PESFT: Parameter-Efficient Supervised Fine-Tuning with LoRA.
 
 This module provides a reusable class-based interface for training language
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -33,8 +36,8 @@ import torch
 if TYPE_CHECKING:
     from datasets import Dataset
     from peft import PeftModel
-    from transformers import PreTrainedTokenizerBase, TrainingArguments
-    from trl import SFTTrainer
+    from transformers import PreTrainedTokenizerBase
+    from trl import SFTConfig, SFTTrainer
 
 
 @dataclass
@@ -43,87 +46,91 @@ class PESFTConfig:
 
     This dataclass contains all hyperparameters needed for LoRA fine-tuning
     with TRL's SFTTrainer. Defaults are based on the working configuration
-    from guard_og.py.
+    of the guard example (``examples/guard/guard_train.py``).
+
+    Fields are grouped as model (``model_name_or_path`` to
+    ``response_part``), LoRA (``lora_r`` to ``target_modules``), training
+    (``output_dir`` to ``packing``) and other settings.
+
+    When train_on_responses=True, the model only learns from the
+    assistant's responses, not from the user's instructions. This is
+    useful for:
+
+    - Reducing overfitting to specific instruction formats
+    - Focusing learning on response generation quality
+    - Following best practices for instruction-following models
+
+    The instruction_part and response_part define the chat template
+    markers that separate user instructions from model responses.
+    Different model families use different formats:
+
+    - Gemma models (2, 3, 3n): instruction_part
+      ``"<start_of_turn>user\n"``, response_part
+      ``"<start_of_turn>model\n"``
+    - Llama models (3, 3.1, 3.2, 3.3, 4): instruction_part
+      ``"<|start_header_id|>user<|end_header_id|>\n\n"``, response_part
+      ``"<|start_header_id|>assistant<|end_header_id|>\n\n"``
+    - Qwen models (2.5, 3): instruction_part ``"<|im_start|>user\n"``,
+      response_part ``"<|im_start|>assistant\n"``
+
+    Users must ensure these markers align with their model's chat
+    template format when enabling train_on_responses.
 
     Attributes:
-        Model Configuration:
-            model_name_or_path: HuggingFace model name or local path
-            max_seq_length: Maximum sequence length (None = no limit)
-            load_in_4bit: Use 4-bit quantization (QLoRA)
-            chat_template: Chat template name for formatting
-            train_on_responses: Only train on response tokens, not instructions
-            instruction_part: Chat template marker for instruction/user turn
-            response_part: Chat template marker for response/assistant turn
-
-        Train on Responses Only Configuration:
-            When train_on_responses=True, the model only learns from the
-            assistant's responses, not from the user's instructions. This is
-            useful for:
-            - Reducing overfitting to specific instruction formats
-            - Focusing learning on response generation quality
-            - Following best practices for instruction-following models
-
-            The instruction_part and response_part define the chat template
-            markers that separate user instructions from model responses.
-            Different model families use different formats:
-
-            Gemma models (2, 3, 3n):
-                instruction_part: "<start_of_turn>user\n"
-                response_part: "<start_of_turn>model\n"
-
-            Llama models (3, 3.1, 3.2, 3.3, 4):
-                instruction_part: (
-                    "<|start_header_id|>user<|end_header_id|>\n\n"
-                )
-                response_part: (
-                    "<|start_header_id|>assistant<|end_header_id|>\n\n"
-                )
-
-            Qwen models (2.5, 3):
-                instruction_part: "<|im_start|>user\n"
-                response_part: "<|im_start|>assistant\n"
-
-            Users must ensure these markers align with their model's chat
-            template format when enabling train_on_responses_only.
-
-        LoRA Configuration:
-            lora_r: LoRA rank (adapter dimension)
-            lora_alpha: LoRA scaling factor
-            target_modules: List of module names to apply LoRA
-
-        Training Configuration:
-            output_dir: Directory for saving checkpoints and final model
-            num_train_epochs: Number of training epochs
-            max_steps: Maximum training steps (-1 = use epochs)
-            per_device_train_batch_size: Training batch size per device
-            per_device_eval_batch_size: Evaluation batch size per device
-            gradient_accumulation_steps: Gradient accumulation steps
-            learning_rate: Initial learning rate
-            weight_decay: Weight decay coefficient
-            scheduler: Learning rate scheduler type
-            warmup_steps: Number of warmup steps
-            warmup_ratio: Fraction of training steps for warmup (0.0 = none)
-            logging_steps: Log metrics every N steps
-            eval_strategy: Evaluation strategy (epoch/steps/no)
-            eval_steps: Evaluate every N steps (when eval_strategy='steps')
-            save_strategy: Checkpoint saving strategy (epoch/steps/no)
-            save_steps: Save every N steps (when save_strategy='steps')
-            save_total_limit: Maximum number of checkpoints to keep
-            optim: Optimizer name
-            max_grad_norm: Gradient clipping norm
-            report_to: Experiment tracking backend
-
-        Other Configuration:
-            validate_save: Validate model files after saving
-            save_method: Strategy used when saving the trained model
-            random_state: Random seed for reproducibility
+        model_name_or_path: HuggingFace model name or local path
+        max_seq_length: Maximum sequence length in tokens
+        load_in_4bit: Use 4-bit quantization (QLoRA)
+        attn_implementation: Attention backend passed to the model loader.
+            ``"sdpa"`` is fastest on a 3090; Unsloth's own default (flex
+            attention) recompiles its block masks for every new sequence
+            length there.
+        chat_template: Unsloth chat template name, or None to keep the
+            tokenizer's own template (needed for models Unsloth has no
+            named template for)
+        train_on_responses: Only train on response tokens, not instructions
+        instruction_part: Chat template marker for instruction/user turn
+        response_part: Chat template marker for response/assistant turn
+        lora_r: LoRA rank (adapter dimension)
+        lora_alpha: LoRA scaling factor
+        lora_layers: Layer preset used to derive target_modules on the CLI
+        use_gradient_checkpointing: Gradient checkpointing mode
+            ("unsloth", "true" or "false")
+        target_modules: List of module names to apply LoRA
+        output_dir: Directory for saving checkpoints and final model
+        num_train_epochs: Number of training epochs
+        max_steps: Maximum training steps (-1 = use epochs)
+        per_device_train_batch_size: Training batch size per device
+        per_device_eval_batch_size: Evaluation batch size per device
+        gradient_accumulation_steps: Gradient accumulation steps
+        learning_rate: Initial learning rate
+        weight_decay: Weight decay coefficient
+        scheduler: Learning rate scheduler type
+        warmup_steps: Number of warmup steps
+        warmup_ratio: Fraction of training steps for warmup (0.0 = none)
+        logging_steps: Log metrics every N steps
+        eval_strategy: Evaluation strategy (epoch/steps/no)
+        eval_steps: Evaluate every N steps (when eval_strategy='steps')
+        save_strategy: Checkpoint saving strategy (epoch/steps/no)
+        save_steps: Save every N steps (when save_strategy='steps')
+        save_total_limit: Maximum number of checkpoints to keep
+        optim: Optimizer name
+        max_grad_norm: Gradient clipping norm
+        report_to: Experiment tracking backend
+        packing: Pack multiple short examples into one sequence
+        padding_free: Concatenate each batch into one unpadded sequence.
+            Off by default: without FlashAttention (e.g. a 3090 with SDPA)
+            it is several times slower than padded batches.
+        validate_save: Validate model files after saving
+        save_method: Strategy used when saving the trained model
+        random_state: Random seed for reproducibility
     """
 
     # Model configuration
     model_name_or_path: str = "unsloth/Qwen2.5-0.5B-Instruct"
-    max_seq_length: int | None = 2048
+    max_seq_length: int = 2048
     load_in_4bit: bool = False
-    chat_template: str = "qwen2.5"
+    attn_implementation: str = "sdpa"
+    chat_template: str | None = "qwen2.5"
     train_on_responses: bool = False
     instruction_part: str = "<|im_start|>user\n"
     response_part: str = "<|im_start|>assistant\n"
@@ -146,7 +153,7 @@ class PESFTConfig:
     )
 
     # Training configuration
-    output_dir: str = "/data2/peft/qwen25-lora-wildguard"
+    output_dir: str = "./models/speftr-sft"
     num_train_epochs: int = 3
     max_steps: int = -1
     per_device_train_batch_size: int = 32
@@ -167,6 +174,7 @@ class PESFTConfig:
     max_grad_norm: float = 1.0
     report_to: str = "none"
     packing: bool = False
+    padding_free: bool = False
 
     # Other configuration
     validate_save: bool = True
@@ -248,9 +256,9 @@ class PESFTConfig:
         )
         model_group.add_argument(
             "--max_seq_length",
-            type=_parse_max_seq_length,
-            default=4096,
-            help="Maximum sequence length or 'none' for unlimited",
+            type=int,
+            default=2048,
+            help="Maximum sequence length in tokens (default: 2048)",
         )
         model_group.add_argument(
             "--load_in_4bit",
@@ -309,8 +317,8 @@ class PESFTConfig:
         lora_group.add_argument(
             "--lora_r",
             type=int,
-            default=32,
-            help="LoRA rank (default: 32)",
+            default=8,
+            help="LoRA rank (default: 8)",
         )
         lora_group.add_argument(
             "--lora_alpha",
@@ -347,10 +355,10 @@ class PESFTConfig:
         train_group.add_argument(
             "--output_dir",
             type=str,
-            default="/data2/speftr/model",
+            default="./models/speftr-sft",
             help=(
                 "Output directory for saving model "
-                "(default: /data2/speftr/model)"
+                "(default: ./models/speftr-sft)"
             ),
         )
         train_group.add_argument(
@@ -552,20 +560,6 @@ def save_parameters_to_json(
     return output_path
 
 
-def _parse_max_seq_length(value: str) -> int | None:
-    """Parse ``--max_seq_length`` CLI input into an integer or ``None``.
-
-    Args:
-        value: Raw string supplied via the command line.
-
-    Returns:
-        Parsed integer length, or ``None`` if the user passed ``"none"``.
-    """
-    if value.lower() == "none":
-        return None
-    return int(value)
-
-
 class PESFT:
     """Parameter-Efficient Supervised Fine-Tuning trainer.
 
@@ -576,11 +570,10 @@ class PESFT:
     The design follows HuggingFace's pattern of separating configuration
     (PESFTConfig) from training logic (PESFT class).
 
-    Attributes:
-        config: Training configuration
-        model: Language model with LoRA adapters
-        tokenizer: Tokenizer with chat template applied
-        trainer: TRL SFTTrainer instance (after train() is called)
+    Instances expose ``config`` (training configuration), ``model``
+    (language model with LoRA adapters), ``tokenizer`` (with the chat
+    template applied), ``trainer`` (TRL SFTTrainer instance, set once
+    train() is called) and ``training_args``.
 
     Example:
         >>> config = PESFTConfig(
@@ -599,21 +592,36 @@ class PESFT:
         Args:
             config: Fully populated training configuration.
         """
+        from huggingface_hub import constants as hub_constants  # noqa: PLC0415
+
+        # Dataset preparation forks workers; a fork while huggingface_hub's
+        # telemetry thread holds its HTTP client lock deadlocks the child.
+        hub_constants.HF_HUB_DISABLE_TELEMETRY = True
+
         # Unsloth patches several Transformer internals during import. We do
         # it first so later imports (transformers, trl, peft) see the patched
         # implementations and automatically benefit from the speedups.
-        import unsloth  # noqa: PLC0415, I001
+        import unsloth  # noqa: PLC0415
+
+        # Unsloth wraps torch.__getattr__, so torch's own filter for these
+        # deprecation warnings (keyed on module "torch") does not match.
+        warnings.filterwarnings(
+            "ignore",
+            message=".*is deprecated, please use.*",
+            category=UserWarning,
+            module="unsloth.import_fixes",
+        )
         from peft import PeftModel  # noqa: PLC0415, F401
 
         # Now import other libraries after unsloth
-        from transformers import PreTrainedTokenizerBase, TrainingArguments  # noqa: PLC0415, F401
-        from trl import SFTTrainer  # noqa: PLC0415, F401
+        from transformers import PreTrainedTokenizerBase  # noqa: PLC0415, F401
+        from trl import SFTConfig, SFTTrainer  # noqa: PLC0415, F401
 
         self.config = config
         self.model: PeftModel | None = None
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.trainer: SFTTrainer | None = None
-        self.training_args: TrainingArguments | None = None
+        self.training_args: SFTConfig | None = None
 
         self._unsloth_version = unsloth.__version__
 
@@ -630,6 +638,9 @@ class PESFT:
         ``eval_steps`` whenever ``load_best_model_at_end`` is enabled. When
         that relationship is broken the "best" checkpoint can lag behind
         evaluation, so we emit an explicit warning for the user.
+
+        Returns:
+            None. The result of the check is printed to stdout.
         """
         if (
             self.config.eval_strategy != "steps"
@@ -688,18 +699,20 @@ class PESFT:
             max_seq_length=self.config.max_seq_length,
             dtype=None,
             load_in_4bit=self.config.load_in_4bit,
+            attn_implementation=self.config.attn_implementation,
         )
 
-        # Apply chat template
-        tokenizer = get_chat_template(
-            tokenizer,
-            chat_template=self.config.chat_template,
-        )
+        if self.config.chat_template:
+            tokenizer = get_chat_template(
+                tokenizer,
+                chat_template=self.config.chat_template,
+            )
 
         # Add LoRA adapters
         # Convert string gradient checkpointing option to appropriate value.
         # Unsloth supports its own checkpointing mode, in addition to the
         # canonical True/False flags exposed by transformers.
+        gradient_checkpointing: str | bool
         if self.config.use_gradient_checkpointing.lower() == "unsloth":
             gradient_checkpointing = "unsloth"
         elif self.config.use_gradient_checkpointing.lower() == "true":
@@ -724,16 +737,15 @@ class PESFT:
 
         return model, tokenizer
 
-    def _build_training_arguments(self) -> TrainingArguments:
-        """Construct ``transformers.TrainingArguments`` for SFT.
+    def _build_training_arguments(self) -> SFTConfig:
+        """Construct the ``trl.SFTConfig`` for this run.
 
         Returns:
-            TrainingArguments populated from ``self.config``. Precision flags
+            SFTConfig populated from ``self.config``. Precision flags
             (bf16/fp16) are inferred from the local hardware so users do not
             have to remember the correct combination.
         """
-        # Import unsloth first to ensure optimizations are applied
-        from transformers import TrainingArguments  # noqa: PLC0415
+        from trl import SFTConfig  # noqa: PLC0415
 
         # Determine precision based on GPU capability
         # This applies to activations regardless of weight quantization
@@ -745,8 +757,11 @@ class PESFT:
         )
         use_fp16 = not use_bf16 if torch.cuda.is_available() else False
 
-        return TrainingArguments(
+        return SFTConfig(
             output_dir=self.config.output_dir,
+            max_length=self.config.max_seq_length,
+            packing=self.config.packing,
+            padding_free=self.config.padding_free,
             num_train_epochs=self.config.num_train_epochs,
             max_steps=self.config.max_steps,
             per_device_train_batch_size=(
@@ -761,13 +776,16 @@ class PESFT:
             max_grad_norm=self.config.max_grad_norm,
             learning_rate=self.config.learning_rate,
             lr_scheduler_type=self.config.scheduler,
-            warmup_steps=self.config.warmup_steps,
-            warmup_ratio=self.config.warmup_ratio,
+            # ``warmup_steps`` takes either a step count or, as a float in
+            # [0, 1), a fraction of total steps.
+            warmup_steps=self.config.warmup_ratio or self.config.warmup_steps,
             logging_steps=self.config.logging_steps,
             eval_strategy=self.config.eval_strategy,
             eval_steps=self.config.eval_steps,
             save_strategy=self.config.save_strategy,
-            save_steps=self.config.save_steps,
+            # None is only read when save_strategy="steps", where HF
+            # validates it; otherwise it passes through untouched.
+            save_steps=self.config.save_steps,  # pyright: ignore[reportArgumentType]
             save_total_limit=self.config.save_total_limit,
             bf16=use_bf16,
             fp16=use_fp16,
@@ -775,7 +793,7 @@ class PESFT:
             fp16_full_eval=use_fp16,
             optim=self.config.optim,
             weight_decay=self.config.weight_decay,
-            group_by_length=True,
+            train_sampling_strategy="group_by_length",
             report_to=self.config.report_to,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
@@ -807,7 +825,9 @@ class PESFT:
             updated in-place.
         """
         if self.model is None or self.tokenizer is None:
-            self.load_model()
+            model, tokenizer = self.load_model()
+        else:
+            model, tokenizer = self.model, self.tokenizer
 
         # Validate step synchronization for eval/save strategies
         self._validate_step_synchronization()
@@ -838,18 +858,21 @@ class PESFT:
         from trl import SFTTrainer  # noqa: PLC0415, I001
         from unsloth.chat_templates import train_on_responses_only  # noqa: PLC0415
 
-        # Initialize trainer
-        # ``formatting_func`` keeps the dataset lightweight. TRL calls it
-        # lazily so prompts are formatted only when a batch is assembled.
+        # ``formatting_func`` keeps the dataset lightweight: rows are turned
+        # into chat-formatted text while the dataset is prepared, so the
+        # raw columns never need a text field of their own.
         trainer = SFTTrainer(
-            model=self.model,
-            tokenizer=self.tokenizer,
+            model=model,
             args=training_args,
-            packing=self.config.packing,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            max_seq_length=self.config.max_seq_length,
-            formatting_func=formatting_func,
+            # Multimodal checkpoints load a processor; text SFT must hand the
+            # trainer its tokenizer, which is what sequence lengths (for
+            # length-grouped batching) are derived from.
+            processing_class=getattr(tokenizer, "tokenizer", tokenizer),
+            # Unsloth's SFTTrainer also accepts batched formatting functions
+            # (columns in, list of texts out); TRL's annotation does not.
+            formatting_func=formatting_func,  # pyright: ignore[reportArgumentType]
         )
         self.trainer = trainer
 
@@ -910,6 +933,9 @@ class PESFT:
         Saving these files directly next to the adapters makes it trivial to
         reproduce a run or understand its hyperparameters long after the
         training job finished.
+
+        Returns:
+            None. Files are written to ``config.output_dir``.
         """
         output_path = Path(self.config.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -945,6 +971,9 @@ class PESFT:
                 merged variants such as ``"merged_16bit"``.
             output_dir: Target directory. Defaults to
                 ``self.config.output_dir`` when omitted.
+
+        Returns:
+            None. Files are written to the chosen output directory.
 
         Raises:
             ValueError: If the model/tokenizer have not been loaded yet.

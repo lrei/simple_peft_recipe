@@ -1,0 +1,68 @@
+# Hooks run the project's own tool versions through uv (see pyproject.toml);
+# they mirror `uv run poe lint` / `uv run poe typecheck`. The slower checks
+# (pyright, tests, security, audit) stay in `uv run poe quality`.
+#
+# Install with `uv run pre-commit install`; this installs both the pre-commit
+# and commit-msg hooks (see default_install_hook_types).
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: local
+    hooks:
+      # Order matches `poe lint` (format, then check).
+      - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format
+        language: system
+        files: ^(speftr|examples|tests|scripts)/
+        types: [python]
+      - id: ruff-check
+        name: ruff-check
+        entry: uv run ruff check --fix
+        language: system
+        files: ^(speftr|examples|tests|scripts)/
+        types: [python]
+      - id: mypy
+        name: mypy
+        entry: uv run mypy speftr
+        language: system
+        pass_filenames: false
+        files: ^speftr/
+      - id: pymarkdown
+        name: pymarkdown
+        entry: uv run pymarkdown scan
+        language: system
+        types: [markdown]
+      - id: check-yaml
+        name: check-yaml
+        entry: uv run check-yaml
+        language: system
+        types: [yaml]
+      - id: check-toml
+        name: check-toml
+        entry: uv run check-toml
+        language: system
+        types: [toml]
+      - id: end-of-file-fixer
+        name: end-of-file-fixer
+        entry: uv run end-of-file-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit]
+      - id: trailing-whitespace
+        name: trailing-whitespace
+        entry: uv run trailing-whitespace-fixer
+        language: system
+        types: [text]
+        stages: [pre-commit]
+      - id: check-added-large-files
+        name: check-added-large-files
+        entry: uv run check-added-large-files
+        args: ["--maxkb=1024"]
+        language: system
+        stages: [pre-commit]
+      - id: strip-commit-trailers
+        name: strip-commit-trailers
+        entry: uv run python scripts/git_hooks/strip_commit_trailers.py
+        language: system
+        stages: [commit-msg]
+        always_run: true

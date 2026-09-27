@@ -216,3 +216,12 @@ temp_tokenizer/
 
 # agents
 .claude
+.testmondata
+
+# Local decision and problem records
+docs/adrs/
+docs/ipr/
+docs/assumptions/
+
+# example outputs (default --output_dir of the examples)
+models/

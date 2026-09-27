@@ -1,20 +1,34 @@
-"""Count token statistics for guard example training/eval datasets."""
+"""Print token-length statistics for the guard training data.
+
+Renders every WildGuardMix row exactly as ``guard_train`` does (Gemma 3
+template, instruction plus prompt, label as the model turn) and prints
+min/max/mean/median lengths per split. Use it to choose
+``--max_seq_length``. For the LoRA rank a dataset needs, use
+``python -m speftr.lora_budget`` (see ``docs/guide.md``).
+
+Usage:
+    uv run python -m examples.guard.guard_count_tokens
+
+Downloads only the tokenizer, but still imports Unsloth, so it needs a
+GPU. See ``examples/guard/README.md``.
+"""
 
 import argparse
-import os
 import statistics
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import cast
 
+# unsloth must be imported before datasets/transformers so its patches
+# apply.
 import unsloth
 from datasets import Dataset, load_dataset
-from huggingface_hub import login
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from unsloth.chat_templates import get_chat_template
 
 
 print(unsloth.__version__)
 
+# Must match guard_train.py.
 INSTRUCTION = "Classify this prompt's as harmful or unharmful:"
 CHAT_TEMPLATE = "gemma-3"
 PROMPT_COL = "prompt"
@@ -22,7 +36,11 @@ LABEL_COL = "prompt_harm_label"
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
+    """Parse command line arguments.
+
+    Returns:
+        Namespace with ``model_name_or_path`` for the tokenizer.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Compute token statistics for the WildGuardMix splits used "
@@ -43,16 +61,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _login_to_hf() -> None:
-    """Authenticate with HuggingFace Hub using environment defaults."""
-    if "HF_TOKEN" in os.environ:
-        login(token=os.environ["HF_TOKEN"])
-        return
-    login()
-
-
 def _load_split(split: str) -> Dataset:
-    """Load and filter WildGuardMix split used by guard_og.py."""
+    """Load and filter WildGuardMix split used by guard_train.py.
+
+    Args:
+        split: ``"train"`` (wildguardtrain) or ``"test"`` (wildguardtest).
+
+    Returns:
+        The split with rows lacking a prompt harm label removed.
+
+    Raises:
+        ValueError: If ``split`` is neither ``"train"`` nor ``"test"``.
+    """
     if split == "train":
         config_name = "wildguardtrain"
         hf_split = "train"
@@ -78,7 +98,15 @@ def _load_split(split: str) -> Dataset:
 
 
 def _format_messages(prompt: str, label: str) -> list[dict[str, str]]:
-    """Create chat messages matching guard_og training format."""
+    """Create chat messages matching guard_train.py training format.
+
+    Args:
+        prompt: Prompt to classify; surrounding whitespace is stripped.
+        label: Harm label used as the model turn.
+
+    Returns:
+        A user message (instruction plus prompt) and a model message.
+    """
     user_message = f"{INSTRUCTION}\n\n{prompt.strip()}"
     return [
         {"role": "user", "content": user_message},
@@ -89,20 +117,27 @@ def _format_messages(prompt: str, label: str) -> list[dict[str, str]]:
 def _collect_token_stats(
     dataset: Dataset, tokenizer: PreTrainedTokenizerBase
 ) -> tuple[list[int], int]:
-    """Tokenize each example and return lengths plus total count."""
-    if not isinstance(dataset, Iterable):
-        error_msg = "dataset must be iterable"
-        raise TypeError(error_msg)
+    """Tokenize each example and return lengths plus total count.
 
+    Rows whose prompt or label is not a string are skipped, so the number
+    of lengths can be smaller than the returned row count.
+
+    Args:
+        dataset: WildGuardMix split to measure.
+        tokenizer: Tokenizer with the guard chat template applied.
+
+    Returns:
+        Token length per formatted conversation, and the dataset row count.
+    """
     lengths: list[int] = []
     for row in dataset:
         if not isinstance(row, Mapping):
             continue
         prompt_value = row.get(PROMPT_COL)
         label_value = row.get(LABEL_COL)
-        prompt_is_str = isinstance(prompt_value, str)
-        label_is_str = isinstance(label_value, str)
-        if not prompt_is_str or not label_is_str:
+        if not isinstance(prompt_value, str) or not isinstance(
+            label_value, str
+        ):
             continue
         messages = _format_messages(prompt_value, label_value)
         token_ids = tokenizer.apply_chat_template(
@@ -115,7 +150,15 @@ def _collect_token_stats(
 
 
 def _print_stats(name: str, lengths: list[int]) -> None:
-    """Print basic statistics for token lengths."""
+    """Print basic statistics for token lengths.
+
+    Args:
+        name: Split name used in the heading.
+        lengths: Token lengths; an empty list prints ``no data``.
+
+    Returns:
+        None. Statistics are printed to stdout.
+    """
     if not lengths:
         print(f"{name}: no data")
         return
@@ -137,10 +180,12 @@ def _print_stats(name: str, lengths: list[int]) -> None:
 
 
 def main() -> None:
-    """Entrypoint for computing token statistics."""
-    args = parse_args()
+    """Print token statistics for the guard train and eval splits.
 
-    _login_to_hf()
+    Returns:
+        None. Statistics are printed to stdout.
+    """
+    args = parse_args()
 
     print(f"Loading tokenizer from {args.model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -155,7 +200,7 @@ def main() -> None:
     train_lengths, train_count = _collect_token_stats(train_dataset, tokenizer)
     eval_lengths, eval_count = _collect_token_stats(eval_dataset, tokenizer)
 
-    print("\nToken statistics for guard_og.py datasets")
+    print("\nToken statistics for guard_train.py datasets")
     print("=" * 40)
 
     _print_stats("Train", train_lengths)
