@@ -1933,6 +1933,19 @@ wheels = [
 ]
 
 [[package]]
+name = "liger-kernel"
+version = "0.8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch", marker = "sys_platform == 'linux'" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/2f/30d51933d4f53da7c78cc972b7a24cf4292e19e249f5f0c3946e71684562/liger_kernel-0.8.3.tar.gz", hash = "sha256:a5b2a1e297da9e4e8a95b7f303d5b73d1a2fdd023b72d380164f12854551e168", size = 6756028, upload-time = "2026-09-16T18:57:26.309Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/9f/9d1d35fd945b9c84024a46caaf19200d1bfbe536f24f3f1ab6a38480f26c/liger_kernel-0.8.3-py3-none-any.whl", hash = "sha256:c22541c11ba0102b8989e3be3ace3fecc81737dc3f7a7e63e2c587c153eede90", size = 887607, upload-time = "2026-09-16T18:57:24.435Z" },
+]
+
+[[package]]
 name = "linkify-it-py"
 version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3405,6 +3418,18 @@ wheels = [
 ]
 
 [[package]]
+name = "py3langid"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/16/fc/51c88e5ef8346878ae6c09e1f7c86c6e6308c57794723bf423a72ddba4dd/py3langid-0.4.0.tar.gz", hash = "sha256:5924159039b5cc282c2edc10a7ea9363b2099834a0e99ed8d5bea3cc435d7871", size = 4604185, upload-time = "2026-09-02T09:10:53.983Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/2d/0eeff2727c970b1d553be70d15ba2d84e3830696c09a79d954c5ae3d5212/py3langid-0.4.0-py3-none-any.whl", hash = "sha256:c25bd038147951ba3a89efe9ec12cc7d2116cb6f311ff8af84ade398a8bc0616", size = 4600605, upload-time = "2026-09-02T09:10:49.54Z" },
+]
+
+[[package]]
 name = "pyarrow"
 version = "25.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -4513,9 +4538,15 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+gptoss = [
+    { name = "py3langid", marker = "sys_platform == 'linux'" },
+]
 gym = [
     { name = "reasoning-gym", marker = "sys_platform == 'linux'" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
+]
+liger = [
+    { name = "liger-kernel", marker = "sys_platform == 'linux'" },
 ]
 rl = [
     { name = "vllm", marker = "sys_platform == 'linux'" },
@@ -4552,7 +4583,9 @@ requires-dist = [
     { name = "bitsandbytes", specifier = ">=0.50.2" },
     { name = "datasets", specifier = ">=4.8.0" },
     { name = "kernels", specifier = ">=0.12.3" },
+    { name = "liger-kernel", marker = "extra == 'liger'", specifier = ">=0.8.3" },
     { name = "peft", specifier = ">=0.21.0" },
+    { name = "py3langid", marker = "extra == 'gptoss'", specifier = ">=0.4.0" },
     { name = "reasoning-gym", marker = "extra == 'gym'", specifier = ">=0.1.25" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
     { name = "speftr", extras = ["rl"], marker = "extra == 'gym'" },
@@ -4564,7 +4597,7 @@ requires-dist = [
     { name = "unsloth", specifier = ">=2026.9.11" },
     { name = "vllm", marker = "extra == 'rl'", specifier = ">=0.26.0" },
 ]
-provides-extras = ["rl", "gym"]
+provides-extras = ["rl", "gym", "liger", "gptoss"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -5,16 +5,23 @@ from __future__ import annotations
 import json
 import types
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 
 import pytest
+import torch
 
 from speftr.pesft import (
     PESFT,
     PESFTConfig,
+    _gpt_oss_attention_in_training_mode,
     _normalize_parameters,
     display_parameters,
     save_parameters_to_json,
 )
+
+
+if TYPE_CHECKING:
+    import argparse
 
 
 MLP = ["gate_proj", "up_proj", "down_proj"]
@@ -29,29 +36,37 @@ def _config_from_cli(*argv: str) -> PESFTConfig:
 # --- argument parser -------------------------------------------------------
 
 
+PARSER_DEFAULTS = {
+    "model_name_or_path": "unsloth/Qwen2.5-0.5B-Instruct",
+    "max_seq_length": 2048,
+    "load_in_4bit": False,
+    "train_on_responses": False,
+    "instruction_part": "<|im_start|>user\n",
+    "response_part": "<|im_start|>assistant\n",
+    "lora_r": 8,
+    "lora_alpha": 32,
+    "lora_layers": "all",
+    "use_gradient_checkpointing": "unsloth",
+    "num_train_epochs": 3,
+    "max_steps": -1,
+    "per_device_train_batch_size": 32,
+    "learning_rate": 2e-4,
+    "scheduler": "constant",
+    "eval_strategy": "epoch",
+    "save_strategy": "epoch",
+    "eval_steps": None,
+    "save_steps": None,
+    "packing": False,
+    "router_aux_loss_coef": 0.0,
+    "save_method": "lora",
+    "no_validate_save": False,
+}
+
+
 def test_parser_defaults():
     args = PESFTConfig.get_argument_parser().parse_args([])
-    assert args.model_name_or_path == "unsloth/Qwen2.5-0.5B-Instruct"
-    assert args.max_seq_length == 2048
-    assert args.load_in_4bit is False
-    assert args.train_on_responses is False
-    assert args.instruction_part == "<|im_start|>user\n"
-    assert args.response_part == "<|im_start|>assistant\n"
-    assert args.lora_r == 8
-    assert args.lora_alpha == 32
-    assert args.lora_layers == "all"
-    assert args.use_gradient_checkpointing == "unsloth"
-    assert args.num_train_epochs == 3
-    assert args.per_device_train_batch_size == 32
-    assert args.learning_rate == 2e-4
-    assert args.scheduler == "constant"
-    assert args.eval_strategy == "epoch"
-    assert args.save_strategy == "epoch"
-    assert args.eval_steps is None
-    assert args.save_steps is None
-    assert args.packing is False
-    assert args.save_method == "lora"
-    assert args.no_validate_save is False
+    parsed = {name: getattr(args, name) for name in PARSER_DEFAULTS}
+    assert parsed == PARSER_DEFAULTS
 
 
 def test_parser_defaults_match_dataclass_defaults():
@@ -105,17 +120,20 @@ def test_from_args_parsed_values_land_in_fields():
         "--output_dir",
         "runs/out",
     )
-    assert config.model_name_or_path == "some/model"
-    assert config.max_seq_length == 1024
-    assert config.lora_r == 4
-    assert config.learning_rate == 1e-3
-    assert config.eval_strategy == "steps"
-    assert config.eval_steps == 10
-    assert config.save_strategy == "steps"
-    assert config.save_steps == 20
-    assert config.train_on_responses is True
-    assert config.packing is True
-    assert config.output_dir == "runs/out"
+    expected = {
+        "model_name_or_path": "some/model",
+        "max_seq_length": 1024,
+        "lora_r": 4,
+        "learning_rate": 1e-3,
+        "eval_strategy": "steps",
+        "eval_steps": 10,
+        "save_strategy": "steps",
+        "save_steps": 20,
+        "train_on_responses": True,
+        "packing": True,
+        "output_dir": "runs/out",
+    }
+    assert {name: getattr(config, name) for name in expected} == expected
 
 
 def test_from_args_ignores_unknown_attributes():
@@ -128,7 +146,9 @@ def test_from_args_ignores_unknown_attributes():
 
 
 def test_from_args_partial_namespace_keeps_dataclass_defaults():
-    config = PESFTConfig.from_args(types.SimpleNamespace(lora_r=16))
+    config = PESFTConfig.from_args(
+        cast("argparse.Namespace", types.SimpleNamespace(lora_r=16))
+    )
     assert config.lora_r == 16
     # Fields absent from the namespace keep the dataclass defaults.
     assert config.max_seq_length == PESFTConfig().max_seq_length
@@ -214,10 +234,11 @@ def test_save_parameters_to_json_accepts_mapping(tmp_path):
 # --- PESFT._validate_step_synchronization ----------------------------------
 
 
-def _validate(capsys, **overrides) -> str:
+def _validate(capsys: pytest.CaptureFixture[str], **overrides) -> str:
     holder = types.SimpleNamespace(config=PESFTConfig(**overrides))
-    PESFT._validate_step_synchronization(holder)
-    return capsys.readouterr().out
+    PESFT._validate_step_synchronization(cast("PESFT", holder))
+    output: str = capsys.readouterr().out
+    return output
 
 
 @pytest.mark.parametrize(
@@ -278,7 +299,7 @@ def _sft_config(tmp_path, **overrides):
     holder = types.SimpleNamespace(
         config=PESFTConfig(output_dir=str(tmp_path), **overrides)
     )
-    return PESFT._build_training_arguments(holder)
+    return PESFT._build_training_arguments(cast("PESFT", holder))
 
 
 def test_sft_config_carries_sequence_and_padding_settings(tmp_path):
@@ -310,3 +331,121 @@ def test_sft_config_forwards_optimisation_fields(tmp_path):
     assert args.per_device_train_batch_size == 4
     assert args.gradient_accumulation_steps == 2
     assert args.max_steps == 9
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("unsloth", True), ("True", True), ("False", False), ("false", False)],
+)
+def test_sft_config_gradient_checkpointing_follows_config(
+    tmp_path, mode, expected
+):
+    args = _sft_config(tmp_path, use_gradient_checkpointing=mode)
+    assert args.gradient_checkpointing is expected
+
+
+def test_sft_config_disables_router_aux_loss_by_default(tmp_path):
+    assert _sft_config(tmp_path).router_aux_loss_coef == 0.0
+    args = _sft_config(tmp_path, router_aux_loss_coef=0.01)
+    assert args.router_aux_loss_coef == 0.01
+
+
+def test_from_args_router_aux_loss_coef():
+    config = _config_from_cli("--router_aux_loss_coef", "0.001")
+    assert config.router_aux_loss_coef == 0.001
+
+
+def test_sft_config_forwards_optim(tmp_path):
+    assert _sft_config(tmp_path).optim == "adamw_8bit"
+    assert _sft_config(tmp_path, optim="adamw_torch").optim == "adamw_torch"
+
+
+# --- memory and placement options ----------------------------------------
+
+
+def test_config_rejects_4bit_and_8bit_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        PESFTConfig(load_in_4bit=True, load_in_8bit=True)
+
+
+def test_parser_exposes_memory_and_placement_options():
+    args = PESFTConfig.get_argument_parser().parse_args([])
+    defaults = PESFTConfig()
+    assert args.load_in_8bit is defaults.load_in_8bit is False
+    assert args.optim == defaults.optim == "adamw_8bit"
+    assert args.device_map is defaults.device_map is None
+
+    config = _config_from_cli(
+        "--load_in_8bit",
+        "--optim",
+        "paged_adamw_8bit",
+        "--device_map",
+        "balanced",
+    )
+    assert config.load_in_8bit is True
+    assert config.optim == "paged_adamw_8bit"
+    assert config.device_map == "balanced"
+
+
+def _load_kwargs(**overrides):
+    holder = types.SimpleNamespace(config=PESFTConfig(**overrides))
+    return PESFT._model_load_kwargs(cast("PESFT", holder))
+
+
+def test_model_load_kwargs_forward_quantization():
+    kwargs = _load_kwargs(load_in_8bit=True)
+    assert kwargs["load_in_8bit"] is True
+    assert kwargs["load_in_4bit"] is False
+    assert kwargs["model_name"] == PESFTConfig().model_name_or_path
+
+
+def test_model_load_kwargs_device_map_only_when_set():
+    assert "device_map" not in _load_kwargs()
+    assert _load_kwargs(device_map="balanced")["device_map"] == "balanced"
+
+
+# --- distributed: only the main process writes -----------------------------
+
+
+def test_save_model_on_non_main_rank_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("RANK", "1")
+    holder = types.SimpleNamespace(
+        config=PESFTConfig(output_dir=str(tmp_path / "out")),
+        model=object(),
+        tokenizer=object(),
+    )
+    PESFT.save_model(cast("PESFT", holder))
+    assert not (tmp_path / "out").exists()
+
+
+# --- gpt-oss evaluation attention -------------------------------------------
+
+
+class GptOssAttention(torch.nn.Module):
+    """Stand-in carrying the class name of transformers' gpt-oss attention."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = torch.nn.Linear(2, 2)
+
+
+def test_gpt_oss_attention_stays_in_training_mode_during_eval():
+    model = torch.nn.Sequential(GptOssAttention(), torch.nn.Dropout(0.1))
+    attention, dropout = model[0], model[1]
+
+    with _gpt_oss_attention_in_training_mode(model):
+        assert model.eval() is model
+        assert attention.training
+        assert not dropout.training
+
+    model.eval()
+    assert not attention.training
+    model.train()
+    assert attention.training
+
+
+def test_models_without_gpt_oss_attention_follow_eval():
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    with _gpt_oss_attention_in_training_mode(model):
+        model.eval()
+        assert not model[0].training

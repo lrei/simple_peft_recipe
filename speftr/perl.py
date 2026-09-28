@@ -25,6 +25,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -79,26 +80,62 @@ def _checkpoint_model_class(model_name_or_path: str) -> type[Any]:
     return model_class
 
 
-def _quantization_config(
-    load_in_4bit: bool,  # noqa: FBT001
-) -> BitsAndBytesConfig | None:
-    """Return the bitsandbytes QLoRA config, or ``None`` for bf16 loading.
-
-    Args:
-        load_in_4bit: Whether to quantize the base weights to 4 bits.
+def _fsdp_enabled() -> bool:
+    """Return whether ``accelerate launch`` configured FSDP for this run.
 
     Returns:
-        An NF4 double-quantized config computing in bf16, or ``None``.
+        ``True`` when the ``ACCELERATE_USE_FSDP`` environment variable, which
+        ``accelerate`` sets for FSDP runs, is ``"true"`` (any case).
     """
-    if not load_in_4bit:
+    return os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true"
+
+
+def _device_map() -> str | dict[str, int] | None:
+    """Choose where ``from_pretrained`` places the base model.
+
+    Returns:
+        ``None`` under FSDP, which shards the model itself; the whole model
+        on this process's GPU (``{"": LOCAL_RANK}``) when ``WORLD_SIZE`` is
+        above 1 (DDP via torchrun or ``accelerate launch``), since every
+        rank trains a full copy; otherwise ``"auto"``, which uses one GPU or
+        splits a model too large for one across all visible GPUs.
+    """
+    if _fsdp_enabled():
+        return None
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        return {"": int(os.environ.get("LOCAL_RANK", "0"))}
+    return "auto"
+
+
+def _quantization_config(
+    *, load_in_4bit: bool, load_in_8bit: bool, fsdp: bool
+) -> BitsAndBytesConfig | None:
+    """Return the bitsandbytes config, or ``None`` for bf16 loading.
+
+    Args:
+        load_in_4bit: Quantize the base weights to 4 bits (NF4, QLoRA).
+        load_in_8bit: Quantize the base weights to 8 bits (LLM.int8).
+        fsdp: Whether FSDP will shard the model.
+
+    Returns:
+        An 8-bit config; an NF4 double-quantized config computing in bf16;
+        or ``None`` when neither quantization is requested.
+    """
+    if not (load_in_4bit or load_in_8bit):
         return None
     from transformers import BitsAndBytesConfig  # noqa: PLC0415
 
+    if load_in_8bit:
+        return BitsAndBytesConfig(load_in_8bit=True)
+    # FSDP flattens and shards parameters of one dtype, so the packed 4-bit
+    # weights must be stored as bf16 like the rest of the model.
+    quant_storage = torch.bfloat16 if fsdp else torch.uint8
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_storage=quant_storage,
     )
 
 
@@ -148,14 +185,22 @@ class PERLConfig:
         max_seq_length: Maximum sequence length (None = no limit)
         load_in_4bit: Load the base model in 4-bit (bitsandbytes NF4,
             QLoRA). Requires ``use_vllm=False``: TRL syncs merged weights
-            into vLLM, which corrupts a 4-bit vLLM copy.
+            into vLLM, which corrupts a 4-bit vLLM copy. Under FSDP the
+            4-bit weights are stored as bf16 so FSDP can shard them.
+        load_in_8bit: Load the base model in 8-bit (bitsandbytes
+            LLM.int8). Slower than 4-bit and saves less memory than the
+            weight size suggests. Requires ``use_vllm=False`` (vLLM cannot
+            load 8-bit weights) and excludes ``load_in_4bit``.
         use_vllm: Use vLLM for generation during GRPO
         vllm_mode: vLLM mode ("colocate" or "server")
         vllm_gpu_memory_utilization: GPU memory fraction for vLLM (0.0-1.0)
         vllm_enable_sleep_mode: Sleep vLLM during optimization steps
         lora_r: LoRA rank (default: 1, per "LoRA without Regret")
         lora_alpha: LoRA scaling factor (default: 32)
-        use_gradient_checkpointing: Gradient checkpointing mode
+        use_gradient_checkpointing: ``"true"`` recomputes activations in
+            the backward pass instead of storing them (less memory, slower);
+            ``"false"`` stores them. Forwarded to TRL's
+            ``gradient_checkpointing``.
         target_modules: List of module names to apply LoRA
         output_dir: Directory for saving checkpoints
         num_train_epochs: Number of training epochs
@@ -170,7 +215,16 @@ class PERLConfig:
         logging_steps: Log metrics every N steps
         save_strategy: When to save checkpoints ("epoch" or "steps")
         save_steps: Save checkpoint every N steps (if strategy="steps")
-        optim: Optimizer name
+        optim: Optimizer name (any transformers ``optim``)
+        use_liger_kernel: Compute the GRPO loss with Liger's fused kernel
+            from the last hidden state, so the full completion logits are
+            never materialized. Needs the ``liger`` extra
+            (``pip install speftr[liger]``). Liger also patches the model's
+            layers, but only for architectures it supports, silently
+            skipping others. The fused loss skips final-logit
+            soft-capping (Gemma), so its log-probabilities differ from the
+            model's on such architectures. Incompatible with LoRA on
+            ``lm_head``.
         report_to: Experiment tracking backend
         temperature: Sampling temperature
         num_generations: Number of generations per prompt (default: 8)
@@ -191,6 +245,7 @@ class PERLConfig:
     model_name_or_path: str = "unsloth/Qwen3-4B-Base"
     max_seq_length: int | None = 2048
     load_in_4bit: bool = False
+    load_in_8bit: bool = False
     use_vllm: bool = True  # Use vLLM for generation (faster)
     vllm_mode: str = "colocate"  # "colocate" or "server"
     vllm_gpu_memory_utilization: float = 0.5
@@ -228,6 +283,7 @@ class PERLConfig:
     save_strategy: str = "epoch"  # Save at epoch boundaries
     save_steps: int | None = None  # Only used if save_strategy="steps"
     optim: str = "adamw_8bit"
+    use_liger_kernel: bool = False
     report_to: str = "none"
 
     # Generation configuration
@@ -255,10 +311,14 @@ class PERLConfig:
             None. Validation only.
 
         Raises:
-            ValueError: If ``load_in_4bit`` and ``use_vllm`` are both set.
+            ValueError: If both ``load_in_4bit`` and ``load_in_8bit`` are
+                set, or either is set together with ``use_vllm``.
         """
-        if self.load_in_4bit and self.use_vllm:
-            msg = "load_in_4bit requires use_vllm=False"
+        if self.load_in_4bit and self.load_in_8bit:
+            msg = "load_in_4bit and load_in_8bit are mutually exclusive"
+            raise ValueError(msg)
+        if (self.load_in_4bit or self.load_in_8bit) and self.use_vllm:
+            msg = "load_in_4bit and load_in_8bit require use_vllm=False"
             raise ValueError(msg)
 
     @classmethod
@@ -321,8 +381,8 @@ class PERLConfig:
         train_group.add_argument(
             "--max_steps",
             type=int,
-            default=100,
-            help="Maximum training steps (default: 100)",
+            default=PERLConfig.max_steps,
+            help="Maximum training steps; -1 trains num_train_epochs",
         )
         train_group.add_argument(
             "--learning_rate",
@@ -331,7 +391,75 @@ class PERLConfig:
             help="Learning rate (default: 1e-5)",
         )
 
+        PERLConfig._add_memory_arguments(parser)
         return parser
+
+    @staticmethod
+    def _add_memory_arguments(parser: argparse.ArgumentParser) -> None:
+        """Add the memory, batch and generation-backend options.
+
+        Args:
+            parser: Parser to extend in place.
+
+        Returns:
+            None. The options are added to ``parser``.
+        """
+        defaults = PERLConfig()
+        group = parser.add_argument_group("Memory and Batch Configuration")
+        group.add_argument(
+            "--load_in_4bit",
+            action="store_true",
+            help="Load the base model in 4-bit (QLoRA); needs --no_vllm",
+        )
+        group.add_argument(
+            "--load_in_8bit",
+            action="store_true",
+            help="Load the base model in 8-bit; needs --no_vllm",
+        )
+        group.add_argument(
+            "--no_vllm",
+            action="store_false",
+            dest="use_vllm",
+            help="Generate with transformers instead of vLLM",
+        )
+        group.add_argument(
+            "--optim",
+            type=str,
+            default=defaults.optim,
+            help=f"Optimizer (default: {defaults.optim})",
+        )
+        group.add_argument(
+            "--per_device_train_batch_size",
+            type=int,
+            default=defaults.per_device_train_batch_size,
+            help=(
+                "Completions per device per micro-batch (default: "
+                f"{defaults.per_device_train_batch_size})"
+            ),
+        )
+        group.add_argument(
+            "--gradient_accumulation_steps",
+            type=int,
+            default=defaults.gradient_accumulation_steps,
+            help=(
+                "Micro-batches per optimizer step (default: "
+                f"{defaults.gradient_accumulation_steps})"
+            ),
+        )
+        group.add_argument(
+            "--use_gradient_checkpointing",
+            choices=["true", "false"],
+            default=defaults.use_gradient_checkpointing,
+            help=(
+                "Recompute activations to save memory (default: "
+                f"{defaults.use_gradient_checkpointing})"
+            ),
+        )
+        group.add_argument(
+            "--use_liger_kernel",
+            action="store_true",
+            help="Fused Liger GRPO loss; needs the liger extra",
+        )
 
 
 class PERL:
@@ -437,9 +565,11 @@ class PERL:
         model_class = _checkpoint_model_class(self.config.model_name_or_path)
         load_kwargs = {
             "dtype": torch.bfloat16,
-            "device_map": "auto",
+            "device_map": _device_map(),
             "quantization_config": _quantization_config(
-                self.config.load_in_4bit
+                load_in_4bit=self.config.load_in_4bit,
+                load_in_8bit=self.config.load_in_8bit,
+                fsdp=_fsdp_enabled(),
             ),
         }
         # Try flash_attention_2, fall back to sdpa if not available
@@ -477,15 +607,6 @@ class PERL:
         )
 
         model = get_peft_model(model, lora_config)
-
-        # Enable gradient checkpointing if requested (TRL-only)
-        use_grad_ckpt = self.config.use_gradient_checkpointing.lower()
-        if use_grad_ckpt == "true":
-            # For standard HF models we must call both helpers to keep the
-            # input graph differentiable while checkpoints are recomputed.
-            model.enable_input_require_grads()
-            model.gradient_checkpointing_enable()
-            print("  Gradient checkpointing enabled")
 
         self.model = model
         self.tokenizer = tokenizer
@@ -534,6 +655,11 @@ class PERL:
         print("\nGRPO Configuration:")
         print(f"  num_generations: {self.config.num_generations}")
         print(f"  gradient_accumulation_steps: {grad_accum}")
+        print(
+            "  gradient_checkpointing: "
+            f"{self.config.use_gradient_checkpointing}"
+        )
+        print(f"  use_liger_kernel: {self.config.use_liger_kernel}")
 
     def _create_grpo_config(
         self, max_completion_length: int | None
@@ -563,6 +689,12 @@ class PERL:
             "warmup_steps": self.config.warmup_ratio,
             "lr_scheduler_type": self.config.scheduler,
             "optim": self.config.optim,
+            # GRPOTrainer enables checkpointing (and the input gradients a
+            # PEFT model needs for it) on the model when this is set.
+            "gradient_checkpointing": (
+                self.config.use_gradient_checkpointing.lower() == "true"
+            ),
+            "use_liger_kernel": self.config.use_liger_kernel,
             "logging_steps": self.config.logging_steps,
             "per_device_train_batch_size": (
                 self.config.per_device_train_batch_size

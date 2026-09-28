@@ -33,6 +33,12 @@ gym = [
     "reasoning-gym>=0.1.25",
     "speftr[rl]",
 ]
+liger = [
+    "liger-kernel>=0.8.3",
+]
+gptoss = [
+    "py3langid>=0.4.0",
+]
 
 [dependency-groups]
 dev = [

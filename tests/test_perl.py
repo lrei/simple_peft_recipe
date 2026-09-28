@@ -5,9 +5,15 @@ from __future__ import annotations
 import types
 
 import pytest
+import torch
 import trl
 
-from speftr.perl import PERL, PERLConfig
+from speftr.perl import (
+    PERL,
+    PERLConfig,
+    _device_map,
+    _quantization_config,
+)
 
 
 VLLM_ONLY_KEYS = ("max_tokens", "stop", "stop_token_ids")
@@ -18,7 +24,7 @@ def test_parser_defaults():
     assert args.model_name_or_path == "unsloth/Qwen3-4B-Base"
     assert args.max_seq_length == 2048
     assert args.output_dir == "./models/perl-reasoning"
-    assert args.max_steps == 100
+    assert args.max_steps == PERLConfig.max_steps
     assert args.learning_rate == 1e-5
 
 
@@ -375,3 +381,153 @@ def test_load_model_uses_checkpoint_architecture(tmp_path):
     assert type(model.get_base_model()).__name__ == (
         "Qwen3_5ForConditionalGeneration"
     )
+
+
+# --- Memory and multi-GPU options ------------------------------------------
+
+
+MEMORY_FLAGS = (
+    "load_in_4bit",
+    "load_in_8bit",
+    "use_vllm",
+    "optim",
+    "per_device_train_batch_size",
+    "gradient_accumulation_steps",
+    "use_gradient_checkpointing",
+    "use_liger_kernel",
+)
+
+
+def test_parser_memory_defaults_match_dataclass():
+    args = PERLConfig.get_argument_parser().parse_args([])
+    defaults = PERLConfig()
+    for name in MEMORY_FLAGS:
+        assert getattr(args, name) == getattr(defaults, name), name
+
+
+def test_from_args_memory_flags_land_in_fields():
+    args = PERLConfig.get_argument_parser().parse_args(
+        [
+            "--load_in_8bit",
+            "--no_vllm",
+            "--optim",
+            "adamw_torch",
+            "--per_device_train_batch_size",
+            "4",
+            "--gradient_accumulation_steps",
+            "2",
+            "--use_gradient_checkpointing",
+            "false",
+            "--use_liger_kernel",
+        ]
+    )
+    config = PERLConfig.from_args(args)
+    assert config.load_in_8bit
+    assert not config.load_in_4bit
+    assert not config.use_vllm
+    assert config.optim == "adamw_torch"
+    assert config.per_device_train_batch_size == 4
+    assert config.gradient_accumulation_steps == 2
+    assert config.use_gradient_checkpointing == "false"
+    assert config.use_liger_kernel
+
+
+def test_parser_rejects_unknown_gradient_checkpointing_mode():
+    with pytest.raises(SystemExit):
+        PERLConfig.get_argument_parser().parse_args(
+            ["--use_gradient_checkpointing", "unsloth"]
+        )
+
+
+def test_config_rejects_8bit_with_vllm():
+    with pytest.raises(ValueError, match="use_vllm=False"):
+        PERLConfig(load_in_8bit=True)
+
+
+def test_config_accepts_8bit_without_vllm():
+    assert PERLConfig(load_in_8bit=True, use_vllm=False).load_in_8bit
+
+
+def test_config_rejects_4bit_and_8bit_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        PERLConfig(load_in_4bit=True, load_in_8bit=True, use_vllm=False)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, "auto"),
+        ({"WORLD_SIZE": "1", "LOCAL_RANK": "0"}, "auto"),
+        ({"WORLD_SIZE": "4", "LOCAL_RANK": "3"}, {"": 3}),
+        ({"WORLD_SIZE": "2", "ACCELERATE_USE_FSDP": "true"}, None),
+        ({"WORLD_SIZE": "2", "ACCELERATE_USE_FSDP": "True"}, None),
+        (
+            {
+                "WORLD_SIZE": "2",
+                "LOCAL_RANK": "1",
+                "ACCELERATE_USE_FSDP": "false",
+            },
+            {"": 1},
+        ),
+    ],
+)
+def test_device_map_follows_launcher_environment(monkeypatch, env, expected):
+    for name in ("WORLD_SIZE", "LOCAL_RANK", "ACCELERATE_USE_FSDP"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert _device_map() == expected
+
+
+def test_quantization_config_off_by_default():
+    assert (
+        _quantization_config(
+            load_in_4bit=False, load_in_8bit=False, fsdp=False
+        )
+        is None
+    )
+
+
+def test_quantization_config_8bit():
+    config = _quantization_config(
+        load_in_4bit=False, load_in_8bit=True, fsdp=False
+    )
+    assert config.load_in_8bit
+    assert not config.load_in_4bit
+
+
+@pytest.mark.parametrize(
+    ("fsdp", "storage"), [(False, torch.uint8), (True, torch.bfloat16)]
+)
+def test_quantization_config_4bit_storage_follows_fsdp(fsdp, storage):
+    config = _quantization_config(
+        load_in_4bit=True, load_in_8bit=False, fsdp=fsdp
+    )
+    assert config.load_in_4bit
+    assert config.bnb_4bit_quant_type == "nf4"
+    assert config.bnb_4bit_quant_storage == storage
+
+
+def test_grpo_config_forwards_memory_options(
+    cpu_grpo_config, qwen_tokenizer, tmp_path
+):
+    args = _grpo_config(
+        qwen_tokenizer,
+        tmp_path,
+        use_vllm=False,
+        optim="adamw_torch",
+        use_gradient_checkpointing="false",
+        use_liger_kernel=True,
+    )
+    assert args.optim == "adamw_torch"
+    assert args.gradient_checkpointing is False
+    assert args.use_liger_kernel is True
+
+
+def test_grpo_config_default_memory_options(
+    cpu_grpo_config, qwen_tokenizer, tmp_path
+):
+    args = _grpo_config(qwen_tokenizer, tmp_path, use_vllm=False)
+    assert args.optim == "adamw_8bit"
+    assert args.gradient_checkpointing is True
+    assert args.use_liger_kernel is False

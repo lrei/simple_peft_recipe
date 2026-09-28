@@ -18,15 +18,32 @@ Example:
     >>> config = PESFTConfig.from_args()
     >>> trainer = PESFT(config)
     >>> trainer.train(train_dataset, eval_dataset, formatting_func)
+
+Multi-GPU:
+    Data parallel (DDP), one process per GPU, each holding a full model
+    copy; Unsloth places each process on its own GPU::
+
+        torchrun --nproc_per_node N your_script.py ...
+
+    ``accelerate launch`` works the same way. The effective batch size is
+    ``per_device_train_batch_size * gradient_accumulation_steps * N``.
+    Only the main process prints the parameters and writes files.
+
+    A model that does not fit on one GPU can instead be split across all
+    visible GPUs in a single process (no torchrun) with
+    ``device_map="balanced"``. Layers then run one GPU at a time.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -80,6 +97,15 @@ class PESFTConfig:
         model_name_or_path: HuggingFace model name or local path
         max_seq_length: Maximum sequence length in tokens
         load_in_4bit: Use 4-bit quantization (QLoRA)
+        load_in_8bit: Load the base model in 8-bit (bitsandbytes
+            LLM.int8). Slower than 4-bit and 16-bit; cannot be combined
+            with ``load_in_4bit``.
+        device_map: Passed to the model loader when set, e.g.
+            ``"balanced"`` to split one model's layers across all visible
+            GPUs in a single process, for models that do not fit on one
+            GPU. Not for torchrun/DDP, where Unsloth puts each process on
+            its own GPU (``cuda:LOCAL_RANK``). None keeps Unsloth's
+            placement.
         attn_implementation: Attention backend passed to the model loader.
             ``"sdpa"`` is fastest on a 3090; Unsloth's own default (flex
             attention) recompiles its block masks for every new sequence
@@ -93,8 +119,10 @@ class PESFTConfig:
         lora_r: LoRA rank (adapter dimension)
         lora_alpha: LoRA scaling factor
         lora_layers: Layer preset used to derive target_modules on the CLI
-        use_gradient_checkpointing: Gradient checkpointing mode
-            ("unsloth", "true" or "false")
+        use_gradient_checkpointing: Gradient checkpointing mode:
+            "unsloth" (Unsloth's checkpointing, which offloads activations
+            to CPU), "true" (same) or "false" (off: faster, but activation
+            memory grows with batch size and sequence length)
         target_modules: List of module names to apply LoRA
         output_dir: Directory for saving checkpoints and final model
         num_train_epochs: Number of training epochs
@@ -113,13 +141,20 @@ class PESFTConfig:
         save_strategy: Checkpoint saving strategy (epoch/steps/no)
         save_steps: Save every N steps (when save_strategy='steps')
         save_total_limit: Maximum number of checkpoints to keep
-        optim: Optimizer name
+        optim: Optimizer name; any transformers ``optim`` value
         max_grad_norm: Gradient clipping norm
         report_to: Experiment tracking backend
         packing: Pack multiple short examples into one sequence
         padding_free: Concatenate each batch into one unpadded sequence.
             Off by default: without FlashAttention (e.g. a 3090 with SDPA)
             it is several times slower than padded batches.
+        router_aux_loss_coef: Weight of the Mixture-of-Experts router
+            load-balancing loss; no effect on dense models. 0 disables it
+            and stops the model from returning router logits. The router
+            itself is not a LoRA target (frozen); the loss can only nudge
+            the adapters through the hidden states that feed it. Some MoE
+            implementations (Unsloth's 4-bit gpt-oss) return no router
+            logits and fail when it is enabled.
         validate_save: Validate model files after saving
         save_method: Strategy used when saving the trained model
         random_state: Random seed for reproducibility
@@ -129,6 +164,8 @@ class PESFTConfig:
     model_name_or_path: str = "unsloth/Qwen2.5-0.5B-Instruct"
     max_seq_length: int = 2048
     load_in_4bit: bool = False
+    load_in_8bit: bool = False
+    device_map: str | None = None
     attn_implementation: str = "sdpa"
     chat_template: str | None = "qwen2.5"
     train_on_responses: bool = False
@@ -175,11 +212,26 @@ class PESFTConfig:
     report_to: str = "none"
     packing: bool = False
     padding_free: bool = False
+    router_aux_loss_coef: float = 0.0
 
     # Other configuration
     validate_save: bool = True
     save_method: str = "lora"
     random_state: int = 42
+
+    def __post_init__(self) -> None:
+        """Reject option combinations that cannot load a model.
+
+        Returns:
+            None. Validation only.
+
+        Raises:
+            ValueError: If ``load_in_4bit`` and ``load_in_8bit`` are both
+                set.
+        """
+        if self.load_in_4bit and self.load_in_8bit:
+            msg = "load_in_4bit and load_in_8bit are mutually exclusive"
+            raise ValueError(msg)
 
     @classmethod
     def from_args(cls, args: argparse.Namespace | None = None) -> PESFTConfig:
@@ -266,6 +318,24 @@ class PESFTConfig:
             dest="load_in_4bit",
             help="Use 4-bit quantization (QLoRA)",
             default=False,
+        )
+        model_group.add_argument(
+            "--load_in_8bit",
+            action="store_true",
+            help=(
+                "Load the base model in 8-bit (bitsandbytes); slower than "
+                "4-bit; not with --load_in_4bit"
+            ),
+        )
+        model_group.add_argument(
+            "--device_map",
+            type=str,
+            default=None,
+            help=(
+                "Model placement, e.g. 'balanced' to split a model too "
+                "large for one GPU across all visible GPUs in one process. "
+                "Not for torchrun (default: Unsloth's placement)"
+            ),
         )
         model_group.add_argument(
             "--chat_template",
@@ -368,6 +438,15 @@ class PESFTConfig:
             help="Number of training epochs (default: 3)",
         )
         train_group.add_argument(
+            "--max_steps",
+            type=int,
+            default=-1,
+            help=(
+                "Stop after this many optimizer steps; -1 trains "
+                "num_train_epochs (default: -1)"
+            ),
+        )
+        train_group.add_argument(
             "--per_device_train_batch_size",
             type=int,
             default=32,
@@ -398,6 +477,17 @@ class PESFTConfig:
             help="Fraction of steps used for warmup (default: 0.0)",
         )
         train_group.add_argument(
+            "--optim",
+            type=str,
+            default="adamw_8bit",
+            help=(
+                "Optimizer; any transformers optim name, e.g. adamw_8bit, "
+                "adamw_torch, paged_adamw_8bit (pages optimizer state to "
+                "CPU under memory spikes), adamw_torch_4bit "
+                "(default: adamw_8bit)"
+            ),
+        )
+        train_group.add_argument(
             "--max_grad_norm",
             type=float,
             default=1.0,
@@ -407,6 +497,15 @@ class PESFTConfig:
             "--packing",
             action="store_true",
             help="Enable sequence packing during training (default: disabled)",
+        )
+        train_group.add_argument(
+            "--router_aux_loss_coef",
+            type=float,
+            default=0.0,
+            help=(
+                "MoE router load-balancing loss weight; 0 disables it "
+                "(default: 0.0)"
+            ),
         )
         train_group.add_argument(
             "--weight_decay",
@@ -487,6 +586,71 @@ class PESFTConfig:
         )
 
         return parser
+
+
+def _is_main_process() -> bool:
+    """Tell whether this process should print summaries and write files.
+
+    torchrun and ``accelerate launch`` set ``RANK`` for every process;
+    without a launcher it is unset and the single process is the main one.
+
+    Returns:
+        True for global rank 0 or when not launched distributed.
+    """
+    return os.environ.get("RANK", "0") == "0"
+
+
+def _stay_in_training_mode(
+    module: torch.nn.Module,
+    mode: bool = True,  # noqa: ARG001, FBT001, FBT002
+) -> torch.nn.Module:
+    """Replacement ``train`` that ignores ``mode`` and keeps training on.
+
+    Args:
+        module: The module whose ``train`` this replaces.
+        mode: Requested mode, ignored; the signature is ``nn.Module.train``'s.
+
+    Returns:
+        ``module``, with ``training`` set to True.
+    """
+    module.training = True
+    return module
+
+
+@contextmanager
+def _gpt_oss_attention_in_training_mode(
+    model: torch.nn.Module,
+) -> Iterator[None]:
+    """Keep gpt-oss attention layers in training mode, evaluation included.
+
+    Unsloth runs gpt-oss attention through a flex-attention kernel in
+    training mode. In eval mode it uses an eager path that gives the
+    sliding-window layers the full-attention mask, so evaluation loss on
+    sequences longer than the 128-token window does not match training.
+    The attention layers have no dropout, so training mode changes nothing
+    else. Models without ``GptOssAttention`` layers are left untouched.
+
+    Args:
+        model: The model being trained.
+
+    Yields:
+        None. On exit the layers follow ``train()``/``eval()`` again.
+    """
+    attention_layers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "GptOssAttention"
+    ]
+    for layer in attention_layers:
+        # An instance attribute shadows nn.Module.train, which eval() calls
+        # recursively on every submodule.
+        layer.train = partial(_stay_in_training_mode, layer)
+        layer.training = True
+    try:
+        yield
+    finally:
+        for layer in attention_layers:
+            del layer.train
 
 
 type ParametersInput = Mapping[str, object] | object
@@ -613,7 +777,7 @@ class PESFT:
         )
         from peft import PeftModel  # noqa: PLC0415, F401
 
-        # Now import other libraries after unsloth
+        # Import other libraries after unsloth so its patches apply
         from transformers import PreTrainedTokenizerBase  # noqa: PLC0415, F401
         from trl import SFTConfig, SFTTrainer  # noqa: PLC0415, F401
 
@@ -625,11 +789,10 @@ class PESFT:
 
         self._unsloth_version = unsloth.__version__
 
-        # Prepare output directory
-        Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
-
-        params_dict = display_parameters(self.config)
-        save_parameters_to_json(params_dict, self.config.output_dir)
+        if _is_main_process():
+            Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+            params_dict = display_parameters(self.config)
+            save_parameters_to_json(params_dict, self.config.output_dir)
 
     def _validate_step_synchronization(self) -> None:
         """Validate eval/save cadence when both operate on steps.
@@ -675,6 +838,26 @@ class PESFT:
                 f"is a multiple of eval_steps ({eval_steps})"
             )
 
+    def _model_load_kwargs(self) -> dict[str, object]:
+        """Build keyword arguments for ``FastLanguageModel.from_pretrained``.
+
+        Returns:
+            Loader arguments from ``self.config``. ``device_map`` is only
+            included when set, so Unsloth keeps its own placement
+            (including one GPU per process under torchrun) otherwise.
+        """
+        kwargs: dict[str, object] = {
+            "model_name": self.config.model_name_or_path,
+            "max_seq_length": self.config.max_seq_length,
+            "dtype": None,
+            "load_in_4bit": self.config.load_in_4bit,
+            "load_in_8bit": self.config.load_in_8bit,
+            "attn_implementation": self.config.attn_implementation,
+        }
+        if self.config.device_map is not None:
+            kwargs["device_map"] = self.config.device_map
+        return kwargs
+
     def load_model(
         self,
     ) -> tuple[PeftModel, PreTrainedTokenizerBase]:
@@ -693,13 +876,8 @@ class PESFT:
 
         print(f"Loading model: {self.config.model_name_or_path}")
 
-        # Load base model with Unsloth optimizations
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.config.model_name_or_path,
-            max_seq_length=self.config.max_seq_length,
-            dtype=None,
-            load_in_4bit=self.config.load_in_4bit,
-            attn_implementation=self.config.attn_implementation,
+            **self._model_load_kwargs()
         )
 
         if self.config.chat_template:
@@ -757,11 +935,18 @@ class PESFT:
         )
         use_fp16 = not use_bf16 if torch.cuda.is_available() else False
 
+        # SFTConfig enables checkpointing by default, which would override
+        # use_gradient_checkpointing="false" set on the model.
+        gradient_checkpointing = (
+            self.config.use_gradient_checkpointing.lower() != "false"
+        )
+
         return SFTConfig(
             output_dir=self.config.output_dir,
             max_length=self.config.max_seq_length,
             packing=self.config.packing,
             padding_free=self.config.padding_free,
+            router_aux_loss_coef=self.config.router_aux_loss_coef,
             num_train_epochs=self.config.num_train_epochs,
             max_steps=self.config.max_steps,
             per_device_train_batch_size=(
@@ -774,6 +959,7 @@ class PESFT:
                 self.config.gradient_accumulation_steps
             ),
             max_grad_norm=self.config.max_grad_norm,
+            gradient_checkpointing=gradient_checkpointing,
             learning_rate=self.config.learning_rate,
             lr_scheduler_type=self.config.scheduler,
             # ``warmup_steps`` takes either a step count or, as a float in
@@ -789,8 +975,6 @@ class PESFT:
             save_total_limit=self.config.save_total_limit,
             bf16=use_bf16,
             fp16=use_fp16,
-            bf16_full_eval=use_bf16,
-            fp16_full_eval=use_fp16,
             optim=self.config.optim,
             weight_decay=self.config.weight_decay,
             train_sampling_strategy="group_by_length",
@@ -850,8 +1034,6 @@ class PESFT:
         )
         print(f"bf16: {training_args.bf16}")
         print(f"fp16: {training_args.fp16}")
-        print(f"bf16_full_eval: {training_args.bf16_full_eval}")
-        print(f"fp16_full_eval: {training_args.fp16_full_eval}")
         print("=" * 35)
 
         # Import unsloth first to ensure optimizations are applied
@@ -874,6 +1056,13 @@ class PESFT:
             # (columns in, list of texts out); TRL's annotation does not.
             formatting_func=formatting_func,  # pyright: ignore[reportArgumentType]
         )
+        # Unsloth's trainer turns on bf16/fp16 "full eval", which makes
+        # evaluate() outside training cast the whole model to 16-bit. Its
+        # compiled kernels then return NaN for models whose norm weights it
+        # keeps in float32 (Gemma 4 in 4-bit). Evaluation during training
+        # never casts, so turning it off makes both evaluations agree.
+        trainer.args.bf16_full_eval = False
+        trainer.args.fp16_full_eval = False
         self.trainer = trainer
 
         # Apply train_on_responses_only if enabled
@@ -902,7 +1091,26 @@ class PESFT:
                 "to mask instruction tokens during training."
             )
 
-        # Train
+        with _gpt_oss_attention_in_training_mode(model):
+            self._run_training(
+                trainer, resume_from_checkpoint=resume_from_checkpoint
+            )
+            if eval_dataset is not None:
+                self._run_final_evaluation(trainer)
+
+    @staticmethod
+    def _run_training(
+        trainer: SFTTrainer, *, resume_from_checkpoint: str | bool | None
+    ) -> None:
+        """Run ``trainer.train``, resuming when asked.
+
+        Args:
+            trainer: The configured trainer.
+            resume_from_checkpoint: See ``train``.
+
+        Returns:
+            None. The model is trained in place.
+        """
         print("\nStarting training...")
         if resume_from_checkpoint:
             if isinstance(resume_from_checkpoint, bool):
@@ -914,18 +1122,23 @@ class PESFT:
         else:
             trainer.train()
 
-        # Evaluate (only if eval_dataset provided)
-        if eval_dataset is not None:
-            print("\nEvaluating on test set...")
-            try:
-                eval_results = trainer.evaluate()
-                print(f"Evaluation results: {eval_results}")
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                print(f"⚠ Evaluation failed with OOM: {e}")
-                print(
-                    "  Model is already trained. "
-                    "Evaluate separately if needed."
-                )
+    @staticmethod
+    def _run_final_evaluation(trainer: SFTTrainer) -> None:
+        """Evaluate the trained model and print the metrics.
+
+        Args:
+            trainer: The trainer, after ``train``.
+
+        Returns:
+            None. The metrics, or the out-of-memory error, are printed.
+        """
+        print("\nEvaluating on test set...")
+        try:
+            eval_results = trainer.evaluate()
+            print(f"Evaluation results: {eval_results}")
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            print(f"⚠ Evaluation failed with OOM: {e}")
+            print("  Model is already trained. Evaluate separately if needed.")
 
     def _save_training_metadata(self) -> None:
         """Persist configuration and training arguments alongside artifacts.
@@ -972,6 +1185,9 @@ class PESFT:
             output_dir: Target directory. Defaults to
                 ``self.config.output_dir`` when omitted.
 
+        Under a distributed launch only the main process writes; the
+        others return immediately.
+
         Returns:
             None. Files are written to the chosen output directory.
 
@@ -981,6 +1197,8 @@ class PESFT:
         if self.model is None or self.tokenizer is None:
             msg = "Model and tokenizer must be loaded before saving"
             raise ValueError(msg)
+        if not _is_main_process():
+            return
 
         if save_method is None:
             save_method = self.config.save_method

@@ -163,6 +163,8 @@ commands, data format, hardware and measured results:
 | [intent](examples/intent/README.md) | SFT customer-support intent routing on Banking77 (Granite 3.3 2B) |
 | [text2sql](examples/text2sql/README.md) | 4-bit SFT then GRPO with a SQLite execution reward (SmolLM3-3B) |
 | [rgym](examples/rgym/README.md) | GRPO with verifiable rewards on Reasoning Gym (Qwen3 1.7B, vLLM) |
+| [big](examples/big/README.md) | 4-bit SFT of a 31B model on one 24 GB GPU; multi-GPU and Slurm (Gemma 4 31B) |
+| [gptoss](examples/gptoss/README.md) | 4-bit SFT of an MoE reasoning model to reason in a requested language; 20b on one GPU, 120b split over GPUs (gpt-oss) |
 
 Each training example also has an `<example>_inference.py` that runs
 the trained model without speftr (transformers + peft or vLLM, as a

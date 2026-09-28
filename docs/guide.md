@@ -91,6 +91,7 @@ gets LoRA adapters.
 | `save_method` | `"lora"` | or `"merged_16bit"` |
 | `attn_implementation` | `"sdpa"` | Fastest on a 3090 |
 | `padding_free` | `False` | Without FlashAttention (3090 + SDPA) it is several times slower than padded batches |
+| `router_aux_loss_coef` | 0.0 | MoE router load-balancing loss; the router stays frozen (not a LoRA target), and Unsloth's 4-bit gpt-oss fails with it on |
 
 `PESFTConfig.from_args()` / `get_argument_parser()` expose most fields as
 CLI flags.
@@ -475,7 +476,8 @@ Commands and validated outputs are in each README:
 [instruct](../examples/instruct/README.md#use-the-trained-model-without-speftr),
 [intent](../examples/intent/README.md#use-the-trained-model-without-speftr),
 [text2sql](../examples/text2sql/README.md#use-the-trained-model-without-speftr),
-[rgym](../examples/rgym/README.md#use-the-trained-model-without-speftr).
+[rgym](../examples/rgym/README.md#use-the-trained-model-without-speftr),
+[big](../examples/big/README.md#use-the-trained-model-without-speftr).
 Copy the script next to your adapter and change the prompt builder.
 
 ## 6. Choosing a model
@@ -502,6 +504,7 @@ batch 8 unless noted.
 | Qwen 3.8 27B | `unsloth/Qwen3.8-27B-unsloth-bnb-4bit` | 4-bit, batch 1 × grad-acc 8 | 13.1 | 21.7 GB |
 | Gemma 3 270M | `unsloth/gemma-3-270m-it` | guard example | 4.5 it/s | ~5 GB |
 | Qwen3 0.6B | `unsloth/Qwen3-0.6B-unsloth-bnb-4bit` | 4-bit, instruct example | | |
+| gpt-oss-20b | `unsloth/gpt-oss-20b-unsloth-bnb-4bit` | 4-bit, rank 1, gptoss example (batch 4 × grad-acc 4, 2048 tokens) | 15 | 15.4 GiB |
 
 Gemma 4 used `chat_template="gemma-4"`, Qwen 3.5/3.8 `chat_template=None`.
 
@@ -525,11 +528,16 @@ Rendered by each model's own tokenizer:
 | Gemma 4 | `"gemma-4"` or `None` | `"<\|turn>user\n"` | `"<\|turn>model\n"` |
 | Gemma 2 / 3 / 3n | `"gemma-3"` or `None` | `"<start_of_turn>user\n"` | `"<start_of_turn>model\n"` |
 | Llama 3.x | `"llama-3.1"` or `None` | `"<\|start_header_id\|>user<\|end_header_id\|>\n\n"` | `"<\|start_header_id\|>assistant<\|end_header_id\|>\n\n"` |
+| gpt-oss (harmony) | `None` | `"<\|start\|>user<\|message\|>"` | `"<\|start\|>assistant"` |
 
 - Unsloth has no named template for Qwen 3.5/3.8; use `None`.
 - Qwen 3.5/3.8 templates insert an empty `<think>\n\n</think>\n\n` block
   in assistant turns; it is trained as part of the response. Qwen 3.8
   also prepends a reasoning-effort system prompt.
+- gpt-oss renders the system message as developer instructions and an
+  assistant `thinking` field as the analysis channel; its markers train
+  both the analysis and the final channel
+  ([examples/gptoss](../examples/gptoss/README.md)).
 - Gemma 3 has no system role: the template folds the system message into
   the first user turn.
 - Check yours: `print(tokenizer.apply_chat_template(messages,
@@ -577,6 +585,11 @@ uv run python -m speftr.lora_budget --mode rl \
   a `save_to_disk` directory, or a Hub id.
 - `--sample_size N` extrapolates from N random rows; `--bits_per_token`
   plugs in your measured loss; `--help` lists everything.
+- MoE models (gpt-oss, Qwen3 MoE, Gemma 4 26B-A4B): LoRA on the fused
+  expert weights is counted in sft mode, as PESFT (Unsloth) adapts them
+  (gpt-oss-20b at rank 1: 11,556,864, of which 11,059,200 on experts),
+  and not in rl mode, as PERL does not. `--include_experts true|false`
+  overrides this.
 
 From Python:
 
@@ -618,6 +631,117 @@ Download once and run without Hub access: see
 | SFT hangs before the first step (forked dataset worker stuck) | Fixed in `PESFT` (it disables huggingface_hub telemetry); in your own SFT scripts export `HF_HUB_DISABLE_TELEMETRY=1` |
 | 401 / gated repo errors | Accept the terms on the Hub page, then `hf auth login` or set `HF_TOKEN` |
 
+More memory levers: [Fitting in memory](#10-fitting-in-memory).
+
+## 10. Fitting in memory
+
+Measured on one RTX 3090 (24 GB), LoRA rank 8, one sequence of 2048
+tokens per micro-batch unless noted; peak memory allocated by torch, in
+GiB. The config fields named below are also CLI flags (`--<field>`) of
+`get_argument_parser()`, except `max_completion_length`. Levers, largest
+effect first:
+
+| Lever | Measured effect | `PESFT` | `PERL` |
+|-------|-----------------|---------|--------|
+| 4-bit base weights (NF4, QLoRA) | Weights ≈ ¼ of bf16; the only lever that fits 12B–31B on 24 GB. Gemma 4 31B: 18 GiB of weights, 19.6 GiB peak | `load_in_4bit` | `load_in_4bit` (needs `use_vllm=False`) |
+| Gradient checkpointing | Off: Gemma 4 E4B 4-bit peak 11.3 → 21.0 GiB, 28% faster | `use_gradient_checkpointing`: `"unsloth"` (default, offloads activations to CPU), `"true"`, `"false"` | `use_gradient_checkpointing` (`"true"` default) |
+| Tokens per micro-batch | Gemma 4 31B 4-bit: 19.1 / 19.6 / 20.7 GiB at 1024 / 2048 / 4096 tokens | `per_device_train_batch_size`, `max_seq_length` | `per_device_train_batch_size`, `max_completion_length` |
+| Full-vocabulary logits | A 262k vocabulary (Gemma) costs ~1 GiB of bf16 logits per 2048 tokens, plus fp32 copies; a non-fused loss raised Gemma 4 E4B 4-bit from 10.6 to 16.3 GiB | Always fused by Unsloth; nothing to set | `use_liger_kernel` (`speftr[liger]` extra) |
+| Gradient accumulation | Same peak (±0.07 GiB); keeps the effective batch when the micro-batch shrinks | `gradient_accumulation_steps` | `gradient_accumulation_steps` |
+| 8-bit base weights (LLM.int8) | Weights ≈ ½ of bf16, but peak ≈ bf16 (Gemma 4 E4B 16.3 vs 16.0 GiB) and 5–46% slower; helps only when weights dominate | `load_in_8bit` | `load_in_8bit` (needs `use_vllm=False`) |
+| Optimizer | ≤ 0.15 GiB between `adamw_torch`, `adamw_8bit`, `paged_adamw_8bit`, `adamw_torch_4bit`: LoRA state is tiny. Paged optimizers only page state tensors of ≥ 100k elements, which LoRA rarely has | `optim` (`adamw_8bit`) | `optim` (`adamw_8bit`) |
+
+Loss functions compute the log-sum-exp over the vocabulary in fp32 for
+stability; fused or chunked losses (Unsloth, TRL's default SFT loss,
+Liger) do so per chunk and never hold the full logits.
+
+Recommended combinations:
+
+| Situation | `PESFT` | `PERL` |
+|-----------|---------|--------|
+| One 24 GB GPU | 16-bit up to ~4B; `load_in_4bit` above. From ~12B: batch 1 × `gradient_accumulation_steps`, `max_seq_length` ≤ 4096. Gemma 4 31B is about the limit ([examples/big](../examples/big/README.md)) | bf16 + colocated vLLM for small models; 4-bit without vLLM for larger ones (slow generation); lower batch and `max_completion_length`; Liger for models without final-logit soft-capping |
+| Model fits one A100 (40/80 GB) | bf16 LoRA, no quantization; more GPUs: DDP ([below](#11-multiple-gpus)) | bf16 + colocated vLLM; more GPUs: DDP |
+| Model does not fit one GPU | `load_in_4bit` first; else `device_map="balanced"` over several GPUs | FSDP-QLoRA over several GPUs |
+
+Limits:
+
+- **Liger and soft-capping.** Liger's fused GRPO loss skips final-logit
+  soft-capping (`final_logit_softcapping` in `config.json`, set for
+  Gemma 2 and Gemma 4), so its log-probabilities differ from the
+  model's on those architectures. Liger also silently skips
+  architectures it does not support.
+- **FP8 and NVFP4 are not training bases.** FP8 or NVFP4 weight-only
+  quantization through torchao trains on Ampere but saves no training
+  memory: the weight is dequantized to bf16 and kept for the backward
+  pass. ModelOpt NVFP4 checkpoints (e.g. `nvidia/Gemma-4-31B-IT-NVFP4`)
+  cannot be loaded by transformers. Use the bf16 original with
+  `load_in_4bit`.
+
+## 11. Multiple GPUs
+
+All modes below are implemented but **not yet validated on multi-GPU
+hardware**. `examples/big` has a
+[Slurm template](../examples/big/big.sbatch).
+
+**`PESFT`, data parallel (DDP).** One process per GPU, each with a full
+model copy, so the model must fit one GPU. Launch your unchanged script:
+
+```bash
+torchrun --nproc_per_node 4 my_sft.py
+```
+
+Unsloth puts each process on its own GPU. Effective batch =
+`per_device_train_batch_size × gradient_accumulation_steps × N`; divide
+`gradient_accumulation_steps` by N to keep it. Only rank 0 prints the
+parameters and writes files.
+
+**`PESFT`, one model split over GPUs.** For a model too large for one
+GPU even in 4-bit: `device_map="balanced"` (`--device_map balanced`) in a
+single process, **not** under torchrun. Layers run one GPU at a time, so
+it adds memory, not speed.
+
+**`PERL`, DDP.** `torchrun --nproc_per_node N my_rl.py` (or
+`accelerate launch --num_processes N`). Each rank loads the whole model
+on its GPU; with colocated vLLM each rank also runs its own vLLM engine,
+so `vllm_gpu_memory_utilization` applies per GPU.
+
+**`PERL`, FSDP-QLoRA.** Shards a 4-bit model over the GPUs for models
+too large for one. Set `load_in_4bit=True` and `use_vllm=False`, and
+launch with an accelerate FSDP config; `PERL` then lets FSDP place the
+model and stores the 4-bit weights as bf16 so FSDP can shard them.
+
+```yaml
+# fsdp.yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+num_machines: 1
+num_processes: 4
+mixed_precision: "no"
+fsdp_config:
+  fsdp_version: 1
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: false
+  fsdp_offload_params: false
+```
+
+```bash
+accelerate launch --config_file fsdp.yaml my_rl.py
+```
+
+`fsdp_offload_params: true` also moves the shards to CPU RAM (fits more,
+much slower).
+
+**vLLM.** 4-bit and 8-bit `PERL` runs generate without vLLM. For
+generation on separate GPUs, run TRL's vLLM server there
+(`CUDA_VISIBLE_DEVICES=3 trl vllm-serve --model <model>`), train on the
+others (`CUDA_VISIBLE_DEVICES=0,1,2`) with `vllm_mode="server"`. To serve
+a merged model on several GPUs: `vllm serve <dir>
+--tensor-parallel-size N`.
+
 ## Examples
 
 [examples/README.md](../examples/README.md) indexes the examples and
@@ -626,6 +750,8 @@ explains how to adapt one; each has its own README:
 [instruct](../examples/instruct/README.md) (with `chat.py`),
 [intent](../examples/intent/README.md),
 [text2sql](../examples/text2sql/README.md),
-[rgym](../examples/rgym/README.md). Each also has an
+[rgym](../examples/rgym/README.md),
+[big](../examples/big/README.md),
+[gptoss](../examples/gptoss/README.md). Each also has an
 `<example>_inference.py` that uses the trained model without speftr
 ([After training](#5-after-training)).

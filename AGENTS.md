@@ -58,6 +58,9 @@ examples/       Usage examples only, runnable as modules
   intent/                 SFT intent classification on Banking77.
   text2sql/               SFT then GRPO with a SQLite execution reward.
   rgym/                   GRPO on reasoning-gym tasks via PERL.
+  big/                    4-bit SFT of Gemma 4 31B on one 24 GB GPU;
+                          multi-GPU (torchrun, device_map) and Slurm.
+  gptoss/                 4-bit SFT of gpt-oss 20b/120b (reasoning language).
                 Each training example has `<name>_inference.py`: the
                 trained model without speftr (adapter and merged; transformers
                 and vLLM). Examples are self-contained; small helpers are
@@ -181,5 +184,24 @@ argparse parser (if exposed) and the call that forwards it to TRL.
 
 - `PERLConfig.load_in_4bit` only works without vLLM (`use_vllm=False`):
   TRL 1.13 has no adapter-only weight sync for a 4-bit vLLM copy.
+- `PERLConfig.use_liger_kernel`: Liger's fused GRPO loss ignores
+  final-logit soft-capping, so log-probabilities differ from the model's
+  on Gemma 2/4.
+- Multi-GPU paths (PESFT DDP and `device_map="balanced"`, PERL DDP and
+  FSDP-QLoRA) are not validated on multi-GPU hardware.
+- Native MXFP4 gpt-oss checkpoints (`openai/gpt-oss-*`) are not
+  trainable: Unsloth has no MXFP4 backward and transformers marks MXFP4
+  not trainable. Train on the Unsloth bnb-4bit conversion
+  (`unsloth/gpt-oss-20b-unsloth-bnb-4bit`).
+- PESFT disables HF telemetry process-wide, which makes the `kernels`
+  package fail to fetch Hub kernels ("could not verify publisher trust
+  status"). Only kernel-hub users are affected, e.g. native MXFP4 loading.
+- Unsloth's gpt-oss attention gives sliding-window layers the full mask
+  in eval mode (wrong loss and generations past 128 tokens). PESFT keeps
+  those layers in training mode during evaluation; scripts that load
+  gpt-oss outside PESFT set `UNSLOTH_ENABLE_FLEX_ATTENTION=0` before
+  loading (see `examples/gptoss/`).
+- Unsloth's gpt-oss bnb-4bit checkpoints store experts as separate 4-bit
+  layers that plain transformers cannot load; load them with Unsloth.
 
 Remove entries as they get fixed.

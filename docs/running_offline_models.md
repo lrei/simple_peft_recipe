@@ -36,6 +36,12 @@ Pass the local directory as `model_name_or_path` / `--dataset`.
 Alternative: fill a shared cache (`HF_HOME=/shared/hf`) and distribute
 that directory; Hub ids then keep working unchanged.
 
+- **Unsloth remaps Google ids.** `PESFT` (Unsloth) loads
+  `google/gemma-4-*` ids from the matching `unsloth/*` repo, so offline a
+  cached `google/...` id fails with `Unsloth: Failed to load model. Both
+  AutoConfig and PeftConfig loading failed`. Download and pass the
+  `unsloth/...` id, or pass a local directory.
+
 ## 2. Disable network access at runtime
 
 ```bash

@@ -35,8 +35,11 @@ def _rewards(completions, answer, **kwargs) -> list[float]:
     return scores
 
 
-def _train(output_dir: str, load_in_4bit: bool) -> None:  # noqa: FBT001
-    """Run a short GRPO job and save adapters; executed in a child process."""
+def _train(output_dir: str, options: dict) -> None:
+    """Run a short GRPO job and save adapters; executed in a child process.
+
+    ``options`` are extra ``PERLConfig`` fields (quantization, Liger).
+    """
     import reasoning_gym
     from datasets import Dataset
     from reasoning_gym.utils import SYSTEM_PROMPTS
@@ -69,8 +72,8 @@ def _train(output_dir: str, load_in_4bit: bool) -> None:  # noqa: FBT001
         max_completion_length=64,
         learning_rate=1e-4,
         save_strategy="no",
-        load_in_4bit=load_in_4bit,
         use_vllm=False,
+        **options,
     )
     trainer = PERL(config)
     trainer.train(dataset, [_rewards])
@@ -78,19 +81,26 @@ def _train(output_dir: str, load_in_4bit: bool) -> None:  # noqa: FBT001
 
     import bitsandbytes as bnb
 
-    quantized = any(
-        isinstance(module, bnb.nn.Linear4bit)
-        for module in trainer.model.modules()
-    )
-    assert quantized is load_in_4bit
+    layer_types = {type(module) for module in trainer.model.modules()}
+    assert (bnb.nn.Linear4bit in layer_types) is config.load_in_4bit
+    assert (bnb.nn.Linear8bitLt in layer_types) is config.load_in_8bit
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("load_in_4bit", [False, True])
-def test_perl_grpo_trains_and_saves_lora_adapters(tmp_path, load_in_4bit):
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"load_in_4bit": True},
+        {"load_in_8bit": True},
+        {"use_liger_kernel": True},
+    ],
+    ids=["bf16", "4bit", "8bit", "liger"],
+)
+def test_perl_grpo_trains_and_saves_lora_adapters(tmp_path, options):
     code = (
         "from tests.test_perl_cuda import _train; "
-        f"_train({str(tmp_path)!r}, {load_in_4bit})"
+        f"_train({str(tmp_path)!r}, {options!r})"
     )
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-c", code],

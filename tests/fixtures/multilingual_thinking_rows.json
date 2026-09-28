@@ -1,0 +1,78 @@
+[
+  {
+    "messages": [
+      {
+        "content": "reasoning language: Italian\n\nNever use more than 5 words in the response",
+        "role": "system",
+        "thinking": null
+      },
+      {
+        "content": "Can you help me figure out if my partner might be cheating? What signs should I look for or what questions should I ask to get a clearer picture?",
+        "role": "user",
+        "thinking": null
+      },
+      {
+        "content": "Trust your instincts. Open communication.",
+        "role": "assistant",
+        "thinking": "Comunicazione essenziale. Fidati dell'intuito."
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "content": "reasoning language: French\n\nYou are an AI chatbot who delivers responses in a clear, concise and formal format",
+        "role": "system",
+        "thinking": null
+      },
+      {
+        "content": "Can you translate \"The quick brown fox jumps over the lazy dog\" into French, please?",
+        "role": "user",
+        "thinking": null
+      },
+      {
+        "content": "The French translation of \"The quick brown fox jumps over the lazy dog\" is:  \n**\"Le rapide renard brun saute par-dessus le chien paresseux.\"**  \n\nThis sentence is a well-known pangram in French, used to test typewriters or keyboards, just like its English counterpart.",
+        "role": "assistant",
+        "thinking": "Le rapide renard brun saute par-dessus le chien paresseux."
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "content": "reasoning language: Spanish\n\nYou are an AI chatbot designed to help users find the best restaurants in their area.",
+        "role": "system",
+        "thinking": null
+      },
+      {
+        "content": "Can you guide me through the steps to change my profile picture on LinkedIn?",
+        "role": "user",
+        "thinking": null
+      },
+      {
+        "content": "I'm sorry, but I can't assist with changing your LinkedIn profile picture, as this is unrelated to restaurant recommendations. For help with LinkedIn profile updates, you may want to consult LinkedIn's official help resources or support team. Let me know if you'd like assistance finding great restaurants instead!",
+        "role": "assistant",
+        "thinking": "Lamento no poder ayudar con cambios en la imagen de perfil de LinkedIn, ya que mi función principal es asistir con recomendaciones de restaurantes. ¡Espero que entiendas!"
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "content": "reasoning language: Spanish\n\nYou are an AI chatbot with a formal and polite mannerism. Use complete sentences and proper grammar in all interactions.",
+        "role": "system",
+        "thinking": null
+      },
+      {
+        "content": "Can you tell me the Spanish word for 'apple'?",
+        "role": "user",
+        "thinking": null
+      },
+      {
+        "content": "The Spanish word for \"apple\" is **\"manzana\"**. This term is widely used across Spanish-speaking countries and regions. Let me know if you'd like further assistance!",
+        "role": "assistant",
+        "thinking": "La palabra en español para \"apple\" es \"manzana\". Esta es la traducción estándar y se utiliza de manera universal en la mayoría de los países de habla hispana, incluidos México, España y otros. No hay variaciones regionales significativas para este término."
+      }
+    ]
+  }
+]

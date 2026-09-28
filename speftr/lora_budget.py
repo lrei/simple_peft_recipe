@@ -13,6 +13,15 @@ computed and compared:
    (Gemma 4, Qwen 3.5) only the language-model decoder is counted, as in
    ``speftr.perl``. LoRA adds ``r * (in + out)`` parameters per targeted
    linear layer, so the count is linear in the rank.
+
+   Mixture-of-Experts models (gpt-oss, Qwen3 MoE, Gemma 4 26B-A4B, ...)
+   keep their experts as 3-D ``(num_experts, in, out)`` parameters of an
+   ``experts`` module rather than as linear layers. PESFT (Unsloth)
+   adapts them when the MLP projections are targeted: the fused
+   ``gate_up_proj`` for ``gate_proj``/``up_proj`` and ``down_proj`` for
+   ``down_proj``, each adding ``r * num_experts * (in + out)``. These
+   expert parameters are counted in sft mode and not in rl mode, where
+   PERL adapts linear layers only; ``include_experts`` overrides that.
 2. **Required parameters**: an estimate of how many parameters the
    dataset needs, from the capacity argument in "LoRA Without Regret"
    (Schulman and Thinking Machines Lab, 2025,
@@ -206,6 +215,7 @@ SHAREGPT_ROLES: Final[dict[str, str]] = {
     "system": "system",
 }
 FORMAT_BATCH_SIZE: Final[int] = 1000
+EXPERT_WEIGHT_NDIM: Final[int] = 3
 
 CONVERSATIONAL: Final[str] = "conversational"
 PROMPT_COMPLETION: Final[str] = "prompt-completion"
@@ -256,7 +266,11 @@ class LoraBudgetConfig:
         data_files: Files or globs forwarded to ``datasets.load_dataset``.
         mode: ``"sft"`` counts tokens, ``"rl"`` counts episodes.
         lora_r: LoRA rank; ``None`` uses 8 for sft and PERL's for rl.
-        target_modules: Linear layer names to adapt.
+        target_modules: Linear layer names to adapt; the MLP names also
+            select the matching MoE expert parameters.
+        include_experts: Count LoRA on fused MoE expert parameters;
+            ``None`` counts them for sft (PESFT adapts them) and not for
+            rl (PERL does not).
         text_column: Plain-text column; every token is trained.
         messages_column: Message-list column.
         prompt_column: Columns joined into the user turn.
@@ -338,6 +352,17 @@ class LoraBudgetConfig:
         metadata={
             "help": (
                 "Linear layer names to adapt (default: all attention and MLP)."
+            )
+        },
+    )
+    include_experts: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Count LoRA on fused MoE expert weights (gate_up_proj, "
+                "down_proj of an experts module) selected by the MLP "
+                "targets (default: true for sft, as PESFT/Unsloth adapts "
+                "them; false for rl, as PERL does not)."
             )
         },
     )
@@ -516,6 +541,8 @@ class LoraBudget:
     Attributes:
         rank: LoRA rank the adapter was counted at.
         adapter_parameters: Trainable LoRA parameters at ``rank``.
+        expert_parameters: Part of ``adapter_parameters`` on fused MoE
+            expert weights; 0 when not counted or the model has none.
         parameters_per_rank: Adapter parameters per unit of rank.
         rows: Training rows, ``None`` for rl without a dataset.
         data_format: Detected or chosen dataset format (sft only).
@@ -530,6 +557,7 @@ class LoraBudget:
 
     rank: int
     adapter_parameters: int
+    expert_parameters: int
     parameters_per_rank: int
     rows: int | None
     data_format: str | None
@@ -619,7 +647,11 @@ def _validate(config: LoraBudgetConfig, *, has_rows: bool) -> None:
 
 
 def count_lora_parameters(
-    model_name_or_path: str, rank: int, target_modules: list[str]
+    model_name_or_path: str,
+    rank: int,
+    target_modules: list[str],
+    *,
+    include_experts: bool = True,
 ) -> int:
     """Count trainable LoRA parameters without loading any weights.
 
@@ -630,11 +662,44 @@ def count_lora_parameters(
         model_name_or_path: Model id or local path.
         rank: LoRA rank.
         target_modules: Leaf names of the linear layers to adapt.
+        include_experts: Also count fused MoE expert parameters selected
+            by the MLP names in ``target_modules`` (as PESFT adapts them).
 
     Returns:
         Number of trainable adapter parameters.
+
+    Example:
+        >>> count_lora_parameters(
+        ...     "openai/gpt-oss-20b", 1, PERLConfig().target_modules
+        ... )
+        11556864
+    """
+    linear, experts = _adapter_parameters(
+        model_name_or_path, rank, target_modules
+    )
+    return linear + experts if include_experts else linear
+
+
+def _adapter_parameters(
+    model_name_or_path: str, rank: int, target_modules: list[str]
+) -> tuple[int, int]:
+    """Count LoRA parameters on linear layers and on MoE expert weights.
+
+    Args:
+        model_name_or_path: Model id or local path.
+        rank: LoRA rank.
+        target_modules: Leaf names of the linear layers to adapt.
+
+    Returns:
+        Parameters on targeted linear layers (as peft adapts them) and on
+        the fused expert weights those targets select.
+
+    Raises:
+        NoMatchingPeftModuleError: If the targets select neither a linear
+            layer nor an expert weight.
     """
     from peft import LoraConfig, get_peft_model  # noqa: PLC0415
+    from peft.utils import NoMatchingPeftModuleError  # noqa: PLC0415
     from transformers import (  # noqa: PLC0415
         AutoConfig,
         AutoModelForCausalLM,
@@ -643,13 +708,72 @@ def count_lora_parameters(
     config = AutoConfig.from_pretrained(model_name_or_path)  # nosec B615
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
+    experts = _expert_lora_parameters(model, rank, target_modules)
     lora_config = LoraConfig(
         r=rank,
         target_modules=_language_model_targets(model, target_modules),
     )
-    peft_model = get_peft_model(model, lora_config)
+    try:
+        peft_model = get_peft_model(model, lora_config)
+    except NoMatchingPeftModuleError:
+        # Expert-only targets (e.g. ``down_proj`` on gpt-oss) match no
+        # linear layer.
+        if not experts:
+            raise
+        return 0, experts
     trainable, _ = peft_model.get_nb_trainable_parameters()
-    return int(trainable)
+    return int(trainable), experts
+
+
+def _expert_targeted(projection: str, target_modules: list[str]) -> bool:
+    """Tell whether ``target_modules`` selects an expert projection.
+
+    Args:
+        projection: Expert parameter name (``gate_up_proj``,
+            ``down_proj``, ``gate_proj`` or ``up_proj``).
+        target_modules: Leaf names of the linear layers to adapt.
+
+    Returns:
+        True if the projection is named, or for the fused
+        ``gate_up_proj`` if ``gate_proj`` or ``up_proj`` is.
+    """
+    if projection in target_modules:
+        return True
+    fused_parts = {"gate_proj", "up_proj"}
+    return projection == "gate_up_proj" and bool(
+        fused_parts.intersection(target_modules)
+    )
+
+
+def _expert_lora_parameters(
+    model: torch.nn.Module, rank: int, target_modules: list[str]
+) -> int:
+    """Count LoRA parameters on fused MoE expert weights.
+
+    An expert weight is a 3-D ``(num_experts, in, out)`` parameter
+    (either inner order) of a module whose name ends in ``experts``.
+    LoRA gives every expert its own ``r * (in + out)`` adapter.
+
+    Args:
+        model: Model, typically on the ``meta`` device.
+        rank: LoRA rank.
+        target_modules: Leaf names of the linear layers to adapt.
+
+    Returns:
+        Adapter parameters over all selected expert weights; 0 for dense
+        models and for experts stored as linear layers.
+    """
+    total = 0
+    for name, parameter in model.named_parameters():
+        module_name, _, projection = name.rpartition(".")
+        if (
+            parameter.ndim == EXPERT_WEIGHT_NDIM
+            and module_name.endswith("experts")
+            and _expert_targeted(projection, target_modules)
+        ):
+            num_experts, rows, columns = parameter.shape
+            total += rank * num_experts * (rows + columns)
+    return total
 
 
 def load_rows(config: LoraBudgetConfig) -> Dataset:
@@ -1340,9 +1464,15 @@ def estimate_lora_budget(
     rank = config.lora_r
     if rank is None:
         rank = SFT_DEFAULT_RANK if config.mode == "sft" else PERLConfig.lora_r
-    adapter = count_lora_parameters(
+    include_experts = config.include_experts
+    if include_experts is None:
+        include_experts = config.mode == "sft"
+    linear, experts = _adapter_parameters(
         config.model_name_or_path, rank, config.target_modules
     )
+    if not include_experts:
+        experts = 0
+    adapter = linear + experts
     data_format, tokens, episodes, extrapolated = None, None, None, False
     if config.mode == "rl":
         episodes = rl_episodes(0 if rows is None else len(rows), config)
@@ -1355,6 +1485,7 @@ def estimate_lora_budget(
     return LoraBudget(
         rank=rank,
         adapter_parameters=adapter,
+        expert_parameters=experts,
         parameters_per_rank=adapter // rank,
         rows=None if rows is None else len(rows),
         data_format=None if data_format is None else str(data_format),
@@ -1382,6 +1513,11 @@ def _print_report(config: LoraBudgetConfig, budget: LoraBudget) -> None:
     print(
         f"Adapter params:  {budget.adapter_parameters:,} (rank {budget.rank})"
     )
+    if budget.expert_parameters:
+        print(
+            f"  MoE experts:   {budget.expert_parameters:,} of these "
+            "(fused expert weights; --include_experts false drops them)"
+        )
     print(f"Per unit rank:   {budget.parameters_per_rank:,}")
     rows = "none" if budget.rows is None else f"{budget.rows:,}"
     print(f"Rows:            {rows} ({config.mode})")

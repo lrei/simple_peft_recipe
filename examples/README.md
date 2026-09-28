@@ -21,6 +21,8 @@ without one.
 | `intent/` | `PESFT` multi-class classification (77 intents) with before/after evaluation on Banking77 | Granite 3.3 2B, bf16 | 11 GB | [README](intent/README.md) |
 | `text2sql/` | `PESFT` 4-bit SFT then `PERL` GRPO on the same adapters with a SQLite execution reward | SmolLM3-3B, 4-bit | ≤ 6 GB | [README](text2sql/README.md) |
 | `rgym/` | `PERL` GRPO with verifiable rewards on Reasoning Gym tasks, colocated vLLM, before/after accuracy | Qwen3 1.7B, bf16 | RTX 3090 24 GB (`gym` extra) | [README](rgym/README.md) |
+| `big/` | `PESFT` on a model far larger than the GPU: 4-bit, batch 1 × grad-acc; DDP (`torchrun`), model splitting (`--device_map balanced`), Slurm template (Dolly pirate) | Gemma 4 31B, 4-bit | RTX 3090 24 GB | [README](big/README.md) |
+| `gptoss/` | `PESFT` on an MoE reasoning model: harmony template, response-only loss on reasoning + answer, LoRA on every expert; eval loss and reasoning-language compliance base vs adapter; 120b split over GPUs (`--device_map balanced`), Slurm template (Multilingual-Thinking) | gpt-oss 20b / 120b, 4-bit | 20b: 15.4 GiB (RTX 3090) | [README](gptoss/README.md) |
 
 Hardware is the measured peak VRAM where one was recorded; timings and
 results are in each README.

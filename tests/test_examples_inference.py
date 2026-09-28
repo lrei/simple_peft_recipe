@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from examples.big import big_inference
 from examples.guard import guard_inference
 from examples.instruct import instruct_inference
 from examples.intent import intent_inference
@@ -47,6 +48,7 @@ TARGETS = {
     TINY_QWEN35: MULTIMODAL_TARGETS,
 }
 SCRIPTS = [
+    big_inference,
     guard_inference,
     instruct_inference,
     intent_inference,

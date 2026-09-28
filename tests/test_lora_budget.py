@@ -7,11 +7,14 @@ Fixtures are real rows (long fields trimmed) from:
 ``conversational_prompt_completion`` and ``standard_language_modeling``,
 ``HuggingFaceH4/llava-instruct-mix-vsft`` (messages only) and
 ``philschmid/guanaco-sharegpt-style``; all from the train split.
+``gpt_oss_20b/config.json`` is the ``openai/gpt-oss-20b`` model config
+(Apache-2.0).
 """
 
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 import torch
@@ -38,6 +41,13 @@ DOLLY_COLUMNS += ["--response_column", "response"]
 USER_PART = "<|im_start|>user\n"
 ASSISTANT_PART = "<|im_start|>assistant\n"
 FORMATTING_FUNC = "tests.test_lora_budget:format_dolly_chatml"
+GPT_OSS_20B = str(FIXTURES_DIR / "gpt_oss_20b")
+# gpt-oss-20b at rank 1: 24 layers of q/k/v/o (2880 hidden, 64 x 64 query
+# and 8 x 64 key/value outputs), and 32 experts per layer with a fused
+# gate_up (2880 -> 5760) and a down (2880 -> 2880) projection.
+GPT_OSS_ATTENTION = 24 * (2 * (2880 + 4096) + 2 * (2880 + 512))
+GPT_OSS_GATE_UP = 24 * 32 * (2880 + 5760)
+GPT_OSS_DOWN = 24 * 32 * (2880 + 2880)
 
 
 def format_dolly_chatml(batch) -> list[str]:
@@ -70,7 +80,7 @@ def _fixture_rows(name: str) -> list[dict]:
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".jsonl":
         return [json.loads(line) for line in text.splitlines()]
-    return json.loads(text)
+    return cast("list[dict]", json.loads(text))
 
 
 def _fixture_dataset(name: str) -> Dataset:
@@ -99,6 +109,49 @@ def test_multimodal_counts_only_language_model():
         ".vision_tower." in name and name.endswith("q_proj.linear")
         for name, _ in model.named_modules()
     )
+
+
+def test_moe_experts_are_counted_like_unsloth_adapts_them():
+    counted = lora_budget.count_lora_parameters(GPT_OSS_20B, 1, TARGETS)
+    # Trainable parameters of PESFT on gpt-oss-20b at rank 1.
+    assert counted == 11_556_864
+    assert counted == GPT_OSS_ATTENTION + GPT_OSS_GATE_UP + GPT_OSS_DOWN
+
+
+def test_moe_experts_can_be_excluded():
+    counted = lora_budget.count_lora_parameters(
+        GPT_OSS_20B, 2, TARGETS, include_experts=False
+    )
+    assert counted == 2 * GPT_OSS_ATTENTION
+
+
+@pytest.mark.parametrize(
+    ("targets", "expected"),
+    [
+        (["q_proj", "k_proj", "v_proj", "o_proj"], GPT_OSS_ATTENTION),
+        (["down_proj"], GPT_OSS_DOWN),
+        (["up_proj"], GPT_OSS_GATE_UP),
+        (["gate_up_proj", "down_proj"], GPT_OSS_GATE_UP + GPT_OSS_DOWN),
+    ],
+)
+def test_moe_experts_follow_mlp_targets(targets, expected):
+    assert lora_budget.count_lora_parameters(GPT_OSS_20B, 1, targets) == (
+        expected
+    )
+
+
+def test_moe_experts_default_to_sft_only():
+    rl = LoraBudgetConfig(
+        model_name_or_path=GPT_OSS_20B, mode="rl", max_steps=1, lora_r=1
+    )
+    budget = estimate_lora_budget(rl)
+    assert budget.expert_parameters == 0
+    assert budget.adapter_parameters == GPT_OSS_ATTENTION
+
+    rl.include_experts = True
+    budget = estimate_lora_budget(rl)
+    assert budget.expert_parameters == GPT_OSS_GATE_UP + GPT_OSS_DOWN
+    assert budget.parameters_per_rank == 11_556_864
 
 
 def test_required_parameters_is_half_the_bits():
@@ -507,6 +560,20 @@ def test_main_rl_reports_episodes(monkeypatch, capsys):
     assert report["Episodes"] == "96 (1 bit per episode)"
     assert report["Required params"] == "48 (estimate: bits / 2)"
     assert "Trained tokens" not in report
+
+
+def test_main_reports_moe_expert_share(monkeypatch, capsys):
+    report = _report(
+        monkeypatch,
+        capsys,
+        *("--model_name_or_path", GPT_OSS_20B, "--mode", "rl"),
+        *("--include_experts", "true", "--lora_r", "1"),
+    )
+    experts = GPT_OSS_GATE_UP + GPT_OSS_DOWN
+    assert report["Adapter params"] == "11,556,864 (rank 1)"
+    assert report["MoE experts"].startswith(f"{experts:,} of these")
+    no_experts = _report(monkeypatch, capsys, *DOLLY_COLUMNS, "--lora_r", "1")
+    assert "MoE experts" not in no_experts
 
 
 def test_main_reports_extrapolated_response_tokens(monkeypatch, capsys):
