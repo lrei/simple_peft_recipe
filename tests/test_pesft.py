@@ -13,7 +13,7 @@ import torch
 from speftr.pesft import (
     PESFT,
     PESFTConfig,
-    _gpt_oss_attention_in_training_mode,
+    _modules_in_training_mode,
     _normalize_parameters,
     display_parameters,
     save_parameters_to_json,
@@ -22,6 +22,8 @@ from speftr.pesft import (
 
 if TYPE_CHECKING:
     import argparse
+
+    from trl import SFTTrainer
 
 
 MLP = ["gate_proj", "up_proj", "down_proj"]
@@ -247,6 +249,7 @@ def _validate(capsys: pytest.CaptureFixture[str], **overrides) -> str:
         ("epoch", "steps", 3, 5),
         ("steps", "epoch", 3, 5),
         ("no", "no", 3, 5),
+        ("no", "steps", 3, 5),
         ("steps", "steps", None, 5),
         ("steps", "steps", 3, None),
     ],
@@ -310,6 +313,17 @@ def test_sft_config_carries_sequence_and_padding_settings(tmp_path):
     # attention.
     assert args.padding_free is False
     assert args.train_sampling_strategy == "group_by_length"
+
+
+def test_sft_config_loads_best_model_only_with_evaluation_during_training(
+    tmp_path,
+):
+    assert _sft_config(tmp_path).load_best_model_at_end is True
+    single_eval = _sft_config(
+        tmp_path, eval_strategy="no", save_strategy="steps", save_steps=25
+    )
+    assert single_eval.load_best_model_at_end is False
+    assert single_eval.save_steps == 25
 
 
 def test_sft_config_warmup_ratio_takes_precedence_as_fraction(tmp_path):
@@ -418,34 +432,81 @@ def test_save_model_on_non_main_rank_writes_nothing(tmp_path, monkeypatch):
     assert not (tmp_path / "out").exists()
 
 
-# --- gpt-oss evaluation attention -------------------------------------------
+# --- modules kept in training mode during evaluation ------------------------
 
 
-class GptOssAttention(torch.nn.Module):
-    """Stand-in carrying the class name of transformers' gpt-oss attention."""
+class KernelSwitch(torch.nn.Module):
+    """Module whose forward would pick a kernel from ``self.training``."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.q_proj = torch.nn.Linear(2, 2)
+        self.lora_dropout = torch.nn.Dropout(0.1)
 
 
-def test_gpt_oss_attention_stays_in_training_mode_during_eval():
-    model = torch.nn.Sequential(GptOssAttention(), torch.nn.Dropout(0.1))
-    attention, dropout = model[0], model[1]
+def test_listed_modules_stay_in_training_mode_during_eval():
+    model = torch.nn.Sequential(KernelSwitch(), torch.nn.Dropout(0.1))
+    switch, dropout = model[0], model[1]
 
-    with _gpt_oss_attention_in_training_mode(model):
+    with _modules_in_training_mode(model, ["KernelSwitch"]):
         assert model.eval() is model
-        assert attention.training
+        assert switch.training
         assert not dropout.training
+        assert not switch.lora_dropout.training
+        model.train()
+        assert switch.lora_dropout.training
 
     model.eval()
-    assert not attention.training
+    assert not switch.training
     model.train()
-    assert attention.training
+    assert switch.training
 
 
-def test_models_without_gpt_oss_attention_follow_eval():
-    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
-    with _gpt_oss_attention_in_training_mode(model):
+def test_empty_class_list_leaves_eval_alone():
+    model = torch.nn.Sequential(KernelSwitch())
+    with _modules_in_training_mode(model, []):
         model.eval()
         assert not model[0].training
+    assert "train" not in vars(model[0])
+
+
+def test_eval_in_train_mode_parser_default_matches_dataclass():
+    args = PESFTConfig.get_argument_parser().parse_args([])
+    assert args.eval_in_train_mode == PESFTConfig().eval_in_train_mode == []
+    parsed = PESFTConfig.get_argument_parser().parse_args(
+        ["--eval_in_train_mode", "A", "B"]
+    )
+    assert PESFTConfig.from_args(parsed).eval_in_train_mode == ["A", "B"]
+
+
+class _EvaluateRaises:
+    """Trainer stand-in whose ``evaluate`` raises a given exception."""
+
+    def __init__(self, error: Exception) -> None:
+        """Store the exception to raise.
+
+        Args:
+            error: Raised by ``evaluate``.
+        """
+        self.error = error
+
+    def evaluate(self) -> dict[str, float]:
+        """Raise the stored exception.
+
+        Raises:
+            Exception: The stored exception.
+        """
+        raise self.error
+
+
+def test_final_evaluation_out_of_memory_is_reported_not_raised(capsys):
+    """An OOM in the final evaluation leaves the trained model savable."""
+    trainer = _EvaluateRaises(torch.cuda.OutOfMemoryError("no memory"))
+    PESFT._run_final_evaluation(cast("SFTTrainer", trainer))
+    assert "ran out of GPU memory" in capsys.readouterr().out
+
+
+def test_final_evaluation_other_errors_propagate():
+    """Errors other than OOM are not swallowed."""
+    trainer = _EvaluateRaises(RuntimeError("shape mismatch"))
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        PESFT._run_final_evaluation(cast("SFTTrainer", trainer))

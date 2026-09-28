@@ -187,6 +187,11 @@ argparse parser (if exposed) and the call that forwards it to TRL.
 - `PERLConfig.use_liger_kernel`: Liger's fused GRPO loss ignores
   final-logit soft-capping, so log-probabilities differ from the model's
   on Gemma 2/4.
+- Unsloth's gpt-oss eval-mode kernels: attention gives sliding-window
+  layers the full-attention mask (wrong loss past 128 tokens) and 4-bit
+  experts run every token through every expert (8x/32x expert memory on
+  20b/120b). Fix: `eval_in_train_mode` (set in `examples/gptoss`);
+  `gptoss_eval.py` does the same for its eval-loss pass.
 - Multi-GPU paths (PESFT DDP and `device_map="balanced"`, PERL DDP and
   FSDP-QLoRA) are not validated on multi-GPU hardware.
 - Native MXFP4 gpt-oss checkpoints (`openai/gpt-oss-*`) are not

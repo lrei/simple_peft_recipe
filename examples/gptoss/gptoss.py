@@ -69,13 +69,21 @@ EXAMPLE_DEFAULTS: Final[dict[str, object]] = {
     # the MLP targets include every expert.
     "lora_r": 1,
     "router_aux_loss_coef": 0.0,
+    # Unsloth's eval-mode gpt-oss kernels give sliding-window attention the
+    # full mask and run every token through every expert; Unsloth names
+    # its 4-bit expert class GptOssExperts.
+    "eval_in_train_mode": ["GptOssAttention", "GptOssExperts"],
     "per_device_train_batch_size": 4,
     "gradient_accumulation_steps": 4,
+    # Evaluation keeps each row's logits over the 201k-token vocabulary
+    # in bfloat16 and float32, 2.3 GiB per 2048-token row; 3 rows fit next
+    # to 20b on a 24 GB GPU.
+    "per_device_eval_batch_size": 3,
     "num_train_epochs": 1,
-    "eval_strategy": "steps",
-    "eval_steps": 10,
+    # One evaluation after training; checkpoints only for resuming.
+    "eval_strategy": "no",
     "save_strategy": "steps",
-    "save_steps": 10,
+    "save_steps": 25,
     "logging_steps": 5,
     "output_dir": "./models/speftr-gptoss-20b",
 }
@@ -144,7 +152,7 @@ def main() -> None:
 
     Returns:
         None. The adapter, tokenizer, ``speftr.json``,
-        ``training_args.json`` and the best checkpoint are written to
+        ``training_args.json`` and the checkpoints are written to
         ``--output_dir``.
     """
     config = PESFTConfig.from_args(build_parser().parse_args())

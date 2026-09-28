@@ -5,11 +5,12 @@
 #
 # The 4-bit 120b weights (~58 GiB) do not fit one 40 GB GPU, so data
 # parallel (one full copy per GPU) is not possible there; two 40 GB GPUs
-# is the minimum, more leave room for longer sequences.
+# is the minimum, more leave room for longer sequences. Training on two
+# A100 40GB takes ~65 s per step and peaks at ~37 GB per GPU; evaluation
+# on two GPUs is not measured yet. The eval batch sizes below are
+# estimates from gpt-oss-20b (README, "Memory and time").
 # For gpt-oss-20b on one GPU: MODEL=unsloth/gpt-oss-20b-unsloth-bnb-4bit
 # and --gres=gpu:1.
-#
-# Not yet validated on multi-GPU hardware.
 
 #SBATCH --job-name=speftr-gptoss
 #SBATCH --account=<account>
@@ -39,7 +40,8 @@ OUTPUT_DIR=./models/speftr-gptoss-${SLURM_JOB_ID}
 uv run python -m examples.gptoss.gptoss \
     --model_name_or_path "$MODEL" \
     --device_map balanced \
+    --per_device_eval_batch_size 2 \
     --output_dir "$OUTPUT_DIR"
 
 uv run --extra gptoss python -m examples.gptoss.gptoss_eval \
-    --adapter_dir "$OUTPUT_DIR" --device_map balanced
+    --adapter_dir "$OUTPUT_DIR" --device_map balanced --batch_size 8

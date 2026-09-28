@@ -13,8 +13,10 @@ from __future__ import annotations
 import importlib
 
 import pytest
+import torch
 
 from examples.gptoss import gptoss_inference
+from speftr import PESFTConfig
 
 
 try:
@@ -46,14 +48,14 @@ def gpt_oss_tokenizer():
 
 def requested_language(conversation: list[dict]) -> str:
     """Language named on the first line of the row's system turn."""
-    first_line = conversation[0]["content"].splitlines()[0]
+    first_line: str = conversation[0]["content"].splitlines()[0]
     return first_line.removeprefix("reasoning language: ")
 
 
 def completion_of(conversation: list[dict], tokenizer) -> str:
     """The rendered assistant turn, as a model would generate it."""
-    full = tokenizer.apply_chat_template(conversation, tokenize=False)
-    prompt = tokenizer.apply_chat_template(
+    full: str = tokenizer.apply_chat_template(conversation, tokenize=False)
+    prompt: str = tokenizer.apply_chat_template(
         gptoss_eval.prompt_messages(conversation),
         tokenize=False,
         add_generation_prompt=True,
@@ -71,6 +73,10 @@ def test_example_defaults_pin_the_gpt_oss_recipe():
     assert defaults["chat_template"] is None
     assert defaults["lora_r"] == 1
     assert defaults["router_aux_loss_coef"] == 0.0
+    assert defaults["eval_in_train_mode"] == [
+        "GptOssAttention",
+        "GptOssExperts",
+    ]
     assert defaults["instruction_part"] == "<|start|>user<|message|>"
     assert defaults["response_part"] == "<|start|>assistant"
 
@@ -80,6 +86,12 @@ def test_parser_applies_example_defaults():
     assert args.chat_template is None
     assert args.lora_r == 1
     assert args.train_on_responses is True
+    assert args.eval_in_train_mode == ["GptOssAttention", "GptOssExperts"]
+    # One evaluation after training; checkpoints only for resuming.
+    config = PESFTConfig.from_args(args)
+    assert config.eval_strategy == "no"
+    assert config.save_strategy == "steps"
+    assert config.save_steps == 25
 
 
 def test_format_batch_renders_harmony_channels(
@@ -218,3 +230,23 @@ def test_inference_chats_name_the_reasoning_language():
     ]
     bare = gptoss_inference.build_chats(["Hi"], "French")
     assert bare[0][0]["content"] == "reasoning language: French"
+
+
+class GptOssExperts(torch.nn.Module):
+    """Stand-in carrying the class name of Unsloth's gpt-oss experts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_dropout = torch.nn.Dropout(0.1)
+
+
+def test_experts_run_in_training_mode_only_inside_the_block():
+    model = torch.nn.Sequential(GptOssExperts(), torch.nn.Dropout(0.1))
+    experts, dropout = model[0], model[1]
+    model.eval()
+
+    with gptoss_eval.experts_in_training_mode(model):
+        assert experts.training
+        assert not experts.lora_dropout.training
+        assert not dropout.training
+    assert not experts.training

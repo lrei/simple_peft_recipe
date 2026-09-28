@@ -40,7 +40,7 @@ import argparse
 import json
 import os
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from functools import partial
@@ -136,7 +136,13 @@ class PESFTConfig:
         warmup_steps: Number of warmup steps
         warmup_ratio: Fraction of training steps for warmup (0.0 = none)
         logging_steps: Log metrics every N steps
-        eval_strategy: Evaluation strategy (epoch/steps/no)
+        eval_strategy: Evaluation strategy (epoch/steps/no). With
+            ``epoch``/``steps`` the checkpoint with the best ``eval_loss``
+            is loaded at the end, so ``save_strategy`` must match. With
+            ``no`` there is no evaluation during training and the final
+            model is kept; ``train`` still evaluates it once at the end
+            when given an eval dataset, and ``save_strategy`` is free
+            (e.g. ``steps`` for resumable checkpoints).
         eval_steps: Evaluate every N steps (when eval_strategy='steps')
         save_strategy: Checkpoint saving strategy (epoch/steps/no)
         save_steps: Save every N steps (when save_strategy='steps')
@@ -155,6 +161,14 @@ class PESFTConfig:
             the adapters through the hidden states that feed it. Some MoE
             implementations (Unsloth's 4-bit gpt-oss) return no router
             logits and fail when it is enabled.
+        eval_in_train_mode: Module class names (``type(module).__name__``)
+            that stay in training mode during evaluation, both during and
+            after training. For models whose eval-mode kernels are wrong or
+            much heavier than their training-mode ones. Only safe for
+            modules with no dropout or other training-only behaviour of
+            their own; their children (e.g. LoRA layers) still follow
+            ``eval()``. Evaluation runs without gradients either way.
+            Empty (the default): plain evaluation.
         validate_save: Validate model files after saving
         save_method: Strategy used when saving the trained model
         random_state: Random seed for reproducibility
@@ -213,6 +227,7 @@ class PESFTConfig:
     packing: bool = False
     padding_free: bool = False
     router_aux_loss_coef: float = 0.0
+    eval_in_train_mode: list[str] = field(default_factory=list)
 
     # Other configuration
     validate_save: bool = True
@@ -508,6 +523,17 @@ class PESFTConfig:
             ),
         )
         train_group.add_argument(
+            "--eval_in_train_mode",
+            nargs="*",
+            default=[],
+            metavar="CLASS_NAME",
+            help=(
+                "Module class names kept in training mode during "
+                "evaluation, for eval-mode kernels that are wrong or too "
+                "heavy; only for modules without dropout (default: none)"
+            ),
+        )
+        train_group.add_argument(
             "--weight_decay",
             type=float,
             default=0.0,
@@ -529,7 +555,13 @@ class PESFTConfig:
             type=str,
             choices=["no", "steps", "epoch"],
             default="epoch",
-            help="Evaluation strategy: no, steps, or epoch (default: epoch)",
+            help=(
+                "Evaluation strategy: no, steps, or epoch. 'steps'/'epoch' "
+                "reload the best checkpoint at the end (save_strategy must "
+                "match); 'no' keeps the final model and, with an eval "
+                "dataset, evaluates it once after training "
+                "(default: epoch)"
+            ),
         )
         train_group.add_argument(
             "--random_state",
@@ -602,55 +634,64 @@ def _is_main_process() -> bool:
 
 def _stay_in_training_mode(
     module: torch.nn.Module,
-    mode: bool = True,  # noqa: ARG001, FBT001, FBT002
+    mode: bool = True,  # noqa: FBT001, FBT002
 ) -> torch.nn.Module:
-    """Replacement ``train`` that ignores ``mode`` and keeps training on.
+    """Replacement ``train`` that keeps ``module`` itself in training mode.
+
+    The children still get the requested mode, so a LoRA dropout inside
+    ``module`` follows ``train()``/``eval()`` as usual.
 
     Args:
         module: The module whose ``train`` this replaces.
-        mode: Requested mode, ignored; the signature is ``nn.Module.train``'s.
+        mode: Requested mode, passed on to the children only; the
+            signature is ``nn.Module.train``'s.
 
     Returns:
         ``module``, with ``training`` set to True.
     """
+    for child in module.children():
+        child.train(mode)
     module.training = True
     return module
 
 
 @contextmanager
-def _gpt_oss_attention_in_training_mode(
-    model: torch.nn.Module,
+def _modules_in_training_mode(
+    model: torch.nn.Module, class_names: Collection[str]
 ) -> Iterator[None]:
-    """Keep gpt-oss attention layers in training mode, evaluation included.
+    """Keep the modules of the named classes in training mode.
 
-    Unsloth runs gpt-oss attention through a flex-attention kernel in
-    training mode. In eval mode it uses an eager path that gives the
-    sliding-window layers the full-attention mask, so evaluation loss on
-    sequences longer than the 128-token window does not match training.
-    The attention layers have no dropout, so training mode changes nothing
-    else. Models without ``GptOssAttention`` layers are left untouched.
+    For modules whose forward picks a kernel from ``self.training`` and
+    whose eval-mode kernel is wrong or much heavier than the training-mode
+    one. Only the matching modules themselves stay in training mode; their
+    children still follow ``train()``/``eval()``, so e.g. a LoRA dropout
+    inside them is off during evaluation. Does nothing when
+    ``class_names`` is empty.
 
     Args:
         model: The model being trained.
+        class_names: Class names matched against ``type(module).__name__``;
+            the modules must have no dropout or other training-only
+            behaviour of their own.
 
     Yields:
-        None. On exit the layers follow ``train()``/``eval()`` again.
+        None. On exit the modules follow ``train()``/``eval()`` again.
     """
-    attention_layers = [
+    modules = [
         module
         for module in model.modules()
-        if type(module).__name__ == "GptOssAttention"
+        if type(module).__name__ in class_names
     ]
-    for layer in attention_layers:
+    for module in modules:
         # An instance attribute shadows nn.Module.train, which eval() calls
         # recursively on every submodule.
-        layer.train = partial(_stay_in_training_mode, layer)
-        layer.training = True
+        module.train = partial(_stay_in_training_mode, module)
+        module.training = True
     try:
         yield
     finally:
-        for layer in attention_layers:
-            del layer.train
+        for module in modules:
+            del module.train
 
 
 type ParametersInput = Mapping[str, object] | object
@@ -979,7 +1020,9 @@ class PESFT:
             weight_decay=self.config.weight_decay,
             train_sampling_strategy="group_by_length",
             report_to=self.config.report_to,
-            load_best_model_at_end=True,
+            # The best checkpoint needs evaluations during training; with
+            # eval_strategy="no" the final model is kept and evaluated once.
+            load_best_model_at_end=self.config.eval_strategy != "no",
             metric_for_best_model="eval_loss",
             prediction_loss_only=True,
         )
@@ -996,8 +1039,9 @@ class PESFT:
 
         Args:
             train_dataset: Dataset used for supervised fine-tuning.
-            eval_dataset: Optional evaluation dataset. Pass ``None`` to skip
-                evaluation entirely.
+            eval_dataset: Optional evaluation dataset, evaluated once after
+                training and, per ``eval_strategy``, during it. Pass
+                ``None`` to skip evaluation entirely.
             formatting_func: Callable that converts raw dataset rows into
                 chat-formatted strings understood by the tokenizer.
             resume_from_checkpoint: Either a path to a checkpoint directory,
@@ -1091,7 +1135,7 @@ class PESFT:
                 "to mask instruction tokens during training."
             )
 
-        with _gpt_oss_attention_in_training_mode(model):
+        with _modules_in_training_mode(model, self.config.eval_in_train_mode):
             self._run_training(
                 trainer, resume_from_checkpoint=resume_from_checkpoint
             )
@@ -1136,9 +1180,15 @@ class PESFT:
         try:
             eval_results = trainer.evaluate()
             print(f"Evaluation results: {eval_results}")
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            print(f"⚠ Evaluation failed with OOM: {e}")
-            print("  Model is already trained. Evaluate separately if needed.")
+        except torch.cuda.OutOfMemoryError as e:
+            # The trained model is intact; free the evaluation's memory so
+            # save_model() can still write the adapter.
+            torch.cuda.empty_cache()
+            print(f"⚠ Evaluation ran out of GPU memory: {e}")
+            print(
+                "  The model is trained; save it, then evaluate with a "
+                "smaller per_device_eval_batch_size."
+            )
 
     def _save_training_metadata(self) -> None:
         """Persist configuration and training arguments alongside artifacts.

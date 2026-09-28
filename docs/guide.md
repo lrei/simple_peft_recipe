@@ -87,11 +87,12 @@ gets LoRA adapters.
 | `per_device_train_batch_size` | 32 | × `gradient_accumulation_steps` = effective batch (16-32) |
 | `learning_rate` | 2e-4 | constant schedule |
 | `num_train_epochs` / `max_steps` | 3 / -1 | `max_steps` > 0 overrides epochs |
-| `eval_strategy` / `save_strategy` | `"epoch"` / `"epoch"` | Must match (the best checkpoint by `eval_loss` is loaded at the end). Without an eval set use `"no"` for both |
+| `eval_strategy` / `save_strategy` | `"epoch"` / `"epoch"` | Must match (the best checkpoint by `eval_loss` is loaded at the end). `eval_strategy="no"` keeps the final model and evaluates the eval set once after training; `save_strategy` is then free. Without an eval set use `"no"` for both |
 | `save_method` | `"lora"` | or `"merged_16bit"` |
 | `attn_implementation` | `"sdpa"` | Fastest on a 3090 |
 | `padding_free` | `False` | Without FlashAttention (3090 + SDPA) it is several times slower than padded batches |
 | `router_aux_loss_coef` | 0.0 | MoE router load-balancing loss; the router stays frozen (not a LoRA target), and Unsloth's 4-bit gpt-oss fails with it on |
+| `eval_in_train_mode` | `[]` | Module class names kept in training mode during evaluation, for eval-mode kernels that are wrong or too heavy (gpt-oss example); only for modules without dropout |
 
 `PESFTConfig.from_args()` / `get_argument_parser()` expose most fields as
 CLI flags.

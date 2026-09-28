@@ -31,6 +31,7 @@ import argparse
 import os
 import re
 from collections import Counter
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -41,7 +42,7 @@ from unsloth.chat_templates import train_on_responses_only
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from datasets import Dataset
     from peft import PeftModel
@@ -187,6 +188,41 @@ def compliance_rates(
     return rates
 
 
+@contextmanager
+def experts_in_training_mode(model: torch.nn.Module) -> Iterator[None]:
+    """Run Unsloth's 4-bit gpt-oss experts on their routed tokens only.
+
+    In eval mode they run every token through every expert and zero-weight
+    the unselected ones: ``num_experts / top_k`` times the expert memory
+    of training mode (8x on 20b, 32x on 120b), too much for long rows.
+    Training mode gives the same output (the experts have no dropout) but
+    loops over the experts in Python with a host sync per layer, which is
+    slow for the one-token steps of generation; use it for long
+    teacher-forced passes only. Unsloth names its 4-bit expert class
+    ``GptOssExperts``. Training-mode experts return float32, so run the
+    model under autocast.
+
+    Args:
+        model: A loaded gpt-oss model in eval mode, adapter attached or
+            not. Do not call ``eval()`` or ``generate`` inside the block.
+
+    Yields:
+        None. On exit the experts are back in eval mode.
+    """
+    experts = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "GptOssExperts"
+    ]
+    for module in experts:
+        module.training = True
+    try:
+        yield
+    finally:
+        for module in experts:
+            module.training = False
+
+
 def load_adapter(
     adapter_dir: str, device_map: str | None
 ) -> tuple[PeftModel, PreTrainedTokenizerBase]:
@@ -322,8 +358,9 @@ def eval_loss(
 ) -> float:
     """Mean assistant-turn loss over the rows, one row at a time.
 
-    Rows are rendered and truncated to ``MAX_SEQ_LENGTH`` tokens as in
-    training, so the value is comparable to the trainer's ``eval_loss``.
+    Rows are rendered and truncated to ``MAX_SEQ_LENGTH`` tokens and run
+    under autocast in the model dtype as in training, so the value is
+    comparable to the trainer's ``eval_loss``.
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
@@ -342,7 +379,13 @@ def eval_loss(
         input_ids = tokenizer(text, add_special_tokens=False).input_ids
         input_ids = input_ids[:MAX_SEQ_LENGTH]
         labels = label_mask({"input_ids": [input_ids]})["labels"][0]
-        with torch.inference_mode():
+        # Training-mode experts return float32; autocast runs the layers
+        # after them in the model dtype, as in training.
+        with (
+            torch.inference_mode(),
+            torch.autocast(model.device.type, dtype=model.dtype),
+            experts_in_training_mode(model),
+        ):
             output = model(
                 input_ids=torch.tensor([input_ids], device=model.device),
                 labels=torch.tensor([labels], device=model.device),
@@ -378,8 +421,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
-        help="Prompts generated per batch (default: 16)",
+        default=32,
+        help="Prompts generated per batch; decoding is bound by per-step "
+        "overhead, so larger batches are faster until memory runs out "
+        "(default: 32, ~21.6 GiB peak with gpt-oss-20b)",
     )
     parser.add_argument(
         "--max_new_tokens",

@@ -116,7 +116,9 @@ uv run python -m speftr.lora_budget \
 | Epochs | 1 | As the cookbook |
 | `--max_seq_length` | 2048 | As the cookbook; covers 95% of the rows |
 | `--router_aux_loss_coef` | 0.0 | The router is frozen; Unsloth's 4-bit gpt-oss fails with TRL's load-balancing loss (0.001 in `SFTConfig`) |
-| Eval, save | every 10 steps on the 100 held-out rows | Shows the eval-loss curve; the best checkpoint is reloaded at the end |
+| `--eval_in_train_mode` | `GptOssAttention GptOssExperts` | Unsloth's eval-mode kernels for these give a wrong loss past 128 tokens and 8x/32x expert memory ([Evaluation](#evaluation)) |
+| Eval | once, after training, on the 100 held-out rows (`--eval_strategy no`), 3 rows per batch | The final adapter is kept; evaluating during training would cost ~40 s to 2 min each on a 3090 |
+| Save | a checkpoint every 25 steps | For resuming (`resume_from_checkpoint`) |
 
 ## Run
 
@@ -144,10 +146,13 @@ printed at the end:
 | `--chat_template` / markers | `None` (harmony) / `<\|start\|>user<\|message\|>`, `<\|start\|>assistant` |
 | `--lora_r` | 1 |
 | `--router_aux_loss_coef` | 0.0 |
+| `--eval_in_train_mode` | `GptOssAttention GptOssExperts` |
 | `--per_device_train_batch_size` / `--gradient_accumulation_steps` | 4 / 4 |
 | `--max_seq_length` | 2048 |
 | `--num_train_epochs` | 1 |
-| `--eval_strategy` / `--eval_steps`, `--save_strategy` / `--save_steps` | `steps` / 10 |
+| `--eval_strategy` | `no` (one evaluation after training) |
+| `--save_strategy` / `--save_steps` | `steps` / 25 |
+| `--per_device_eval_batch_size` | 3 |
 | `--device_map` | none (one GPU) |
 | `--output_dir` | `./models/speftr-gptoss-20b` |
 
@@ -161,10 +166,12 @@ spread over all visible GPUs, run one GPU at a time:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss \
     --model_name_or_path unsloth/gpt-oss-120b-unsloth-bnb-4bit \
-    --device_map balanced --output_dir ./models/speftr-gptoss-120b
+    --device_map balanced --per_device_eval_batch_size 2 \
+    --output_dir ./models/speftr-gptoss-120b
 CUDA_VISIBLE_DEVICES=0,1 uv run --extra gptoss \
     python -m examples.gptoss.gptoss_eval \
-    --adapter_dir ./models/speftr-gptoss-120b --device_map balanced
+    --adapter_dir ./models/speftr-gptoss-120b --device_map balanced \
+    --batch_size 8
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss_inference \
     --adapter_dir ./models/speftr-gptoss-120b --device_map auto
 ```
@@ -201,23 +208,59 @@ Unsloth gradient checkpointing):
 | 4-bit weights on the GPU after loading | 11.7 GiB |
 | Peak GPU memory in `nvidia-smi` (whole process), training | 15,758 MiB |
 | Time per optimizer step (16 rows) | ~15 s |
-| One epoch (57 steps, with 6 evaluations of ~116 s each) | 26 min; 29 min end to end with loading and saving |
-| `gptoss_eval.py` (2 × 100 eval losses and 2 × 100 generations of 320 tokens) | 29 min, 16.6 GiB peak allocated by torch |
+| One epoch (57 steps) with `--eval_steps 10 --save_steps 10` (6 evaluations of ~116 s each) | 26 min; 29 min end to end with loading and saving |
+| `gptoss_eval.py` (2 × 100 eval losses and 2 × 100 generations of 320 tokens, `--batch_size 32`) | 18.5 min end to end, 21.6 GiB peak allocated by torch |
 
-**gpt-oss-120b: an estimate, not yet measured.** The weights take ~58
-GiB, split by `--device_map balanced` into ~29 GiB per GPU on two 40 GB
-A100s. Activations grow with the 36 layers (vs 24) at the same hidden
-size, so expect ~5–6 GiB of training overhead instead of ~4 GiB, which
-leaves a few GiB free on each GPU; lower `--per_device_train_batch_size`
-(and raise `--gradient_accumulation_steps` to keep 16) if it runs out of
-memory, or use more GPUs. Split layers run one GPU at a time, and each
-layer has 128 experts instead of 32, so a step takes several times as
-long as with 20b; plan for hours, not minutes, per epoch.
+Evaluation after a 10-step run (`trainer.evaluate()` on the 100
+held-out rows, experts and attention in training mode), by
+`--per_device_eval_batch_size`:
+
+| Eval batch | Time | Mean GPU util | Peak allocated (torch) | Peak `nvidia-smi` | eval_loss |
+|-----------:|-----:|--------------:|-----------------------:|------------------:|----------:|
+| 1 | 79 s | 47% | 14.18 GiB | 15,168 MiB | 1.1233 |
+| 2 | 57 s | 57% | 16.48 GiB | 17,530 MiB | 1.1242 |
+| 3 (default) | 39 s | 79% | 18.78 GiB | 19,890 MiB | 1.1247 |
+| 4 | 35 s | 87% | 21.08 GiB | 22,250 MiB | 1.1204 |
+| 8 | out of memory | | | | |
+
+Each 2048-token row adds 2.3 GiB: its logits over the 201,088-token
+vocabulary in bfloat16 and float32. The loss differs slightly between
+batch sizes because of padding.
+
+`gptoss_eval.py` generation (64 held-out prompts, 320 new tokens), by
+`--batch_size`:
+
+| Batch | Model | Time | Mean GPU util | Peak allocated (torch) | Peak `nvidia-smi` |
+|------:|-------|-----:|--------------:|-----------------------:|------------------:|
+| 16 | base | 311 s | 57% | 16.64 GiB | 17,464 MiB |
+| 32 (default) | base | 157 s | 68% | 21.55 GiB | 22,894 MiB |
+| 16 | adapter | 613 s | 35% | 16.64 GiB | 17,504 MiB |
+| 32 (default) | adapter | 308 s | 41% | 21.55 GiB | 22,574 MiB |
+| 64 | both | out of memory | | | |
+
+Decoding is bound by per-step overhead, not by the GPU, so doubling
+the batch halves the time. The adapter decodes at half the base's speed:
+its LoRA layers on all 768 expert projections add many small kernels
+per token.
+
+**gpt-oss-120b on two A100 40GB** (`--device_map balanced`, example
+defaults): training takes ~65 s per optimizer step with a peak of ~37 GB
+per GPU. The weights take ~58 GiB, ~29 GiB per GPU; split layers run
+one GPU at a time. Evaluation on two GPUs is not measured yet. Estimated
+from the 20b measurements, not measured: the ~10 GiB left on a 40 GB
+GPU next to 29 GiB of weights hold ~2 evaluation rows (2.3 GiB of
+logits each, same vocabulary as 20b), so use
+`--per_device_eval_batch_size 2`; generation needs up to ~0.5 GiB per
+prompt (logits as on 20b plus 4x the expert activations of 128
+experts), so use `gptoss_eval.py --batch_size 8`. If a GPU runs out of
+memory in training, lower `--per_device_train_batch_size` (and raise
+`--gradient_accumulation_steps` to keep 16) or use more GPUs.
 
 ## Results
 
-gpt-oss-20b, one epoch on the 900 training rows, example defaults.
-Eval loss on the 100 held-out rows (base model: 1.809, from
+gpt-oss-20b, one epoch on the 900 training rows, example defaults
+except `--eval_steps 10 --save_steps 10` for the curve below. Eval
+loss on the 100 held-out rows (base model: 1.811, from
 `gptoss_eval.py`):
 
 | Step | 10 | 20 | 30 | 40 | 50 | 57 |
@@ -228,7 +271,7 @@ Eval loss on the 100 held-out rows (base model: 1.809, from
 `gptoss_eval.py` on the saved adapter:
 
 ```text
-eval_loss  base 1.8091  adapter 1.0068
+eval_loss  base 1.8111  adapter 1.0068
 
 Reasoning-language compliance (analysis channel)
 language   rows   base  adapter
@@ -268,15 +311,29 @@ Unsloth's gpt-oss attention (`UNSLOTH_ENABLE_FLEX_ATTENTION=0`, set in
 the loader): in eval mode it gives the sliding-window layers the
 full-attention mask, which degrades the loss and generation past 128
 tokens. transformers' attention applies each layer's mask. During
-training `PESFT` keeps gpt-oss attention on Unsloth's training kernel,
-evaluation included, for the same reason.
+training the example keeps gpt-oss attention on Unsloth's training
+kernel, evaluation included, for the same reason (`eval_in_train_mode`,
+below).
+
+Unsloth's 4-bit gpt-oss experts also choose their kernel from training
+mode: in eval mode every token runs through every expert (32 on 20b,
+128 on 120b) instead of its top 4, which multiplies the expert
+activation memory by 8 (20b) or 32 (120b). The example sets
+`--eval_in_train_mode GptOssAttention GptOssExperts`, so `PESFT` keeps
+both in training mode during evaluation. `gptoss_eval.py` puts the
+experts in training mode for its eval-loss pass only
+(`experts_in_training_mode`). Generation keeps them in eval mode: the
+training-mode kernel loops over the experts in Python, which is slow
+for one-token decoding steps, and the prompts are short. The experts
+have no dropout; both kernels give the same loss up to bfloat16
+rounding.
 
 ## Outputs
 
 `--output_dir` holds the LoRA adapter (`adapter_model.safetensors`,
 `adapter_config.json`, which records the 4-bit base), the tokenizer
 with `chat_template.jinja`, `speftr.json`, `training_args.json` and the
-best checkpoint (`checkpoint-*`).
+checkpoints (`checkpoint-*`, every 25 steps).
 
 ## Use the trained model without speftr
 
@@ -354,6 +411,11 @@ answers in the language of the question.
   repos on the Hub; offline, use the `unsloth/` id or a local path.
 - **Markers**: `response_part` must be `<|start|>assistant` to train the
   reasoning; check the row `gptoss.py` prints before training.
+- **`eval_in_train_mode` must list `GptOssAttention` and
+  `GptOssExperts`** (the example default). Without it, evaluation during
+  training uses Unsloth's eval-mode kernels: a wrong loss past 128 tokens
+  and 8x (20b) or 32x (120b) expert memory, which runs out of memory on
+  120b (see [Evaluation](#evaluation)).
 - **Unsloth's gpt-oss inference attention** is wrong past 128 tokens
   (see [Evaluation](#evaluation)); generate as `gptoss_inference.py`
   does.
