@@ -28,9 +28,10 @@ method; in our opinion, the simplest one for fine-tuning a language model.
 In its simplest form it needs no frozen reference model or KL term, which
 suits PEFT.
 
-We assume the end user is GPU-limited and tuned the defaults for
-a single consumer grade GPU (target: the Nvidia 3090) rather than
-multi-gpu server setups (e.g. the prototypical 8xH100).
+The library defaults target a single 24 GB consumer GPU (RTX 3090).
+Multi-GPU training (data parallel and model splitting) is validated on
+2× A100 40GB; it uses the same defaults plus launch flags, which the
+examples document with measured settings.
 
 ### Sources
 
@@ -173,16 +174,16 @@ GPU (see [Installation](#installation)).
 
 ## Future Work
 
-- More and better examples.
-- Quantized reinforcement learning support.
-- Support for fine-tuning the input embeddings and the LM output head.
+- Quantized RL with vLLM generation (4-bit and 8-bit `PERL` runs
+  generate with transformers: TRL has no adapter-only weight sync for a
+  quantized vLLM copy).
 
 ## Bibliography
 
 ### Links
 
 - https://thinkingmachines.ai/blog/lora/
-- https://docs.unsloth.ai/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide#training-on-completions-only-masking-out-inputs
+- https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide#training-on-completions-only-masking-out-inputs
 - https://www.reddit.com/r/LocalLLaMA/comments/1nwwoab/lora_without_regrets_implemented_in_hugging_face/
 - https://raw.githubusercontent.com/huggingface/trl/main/trl/scripts/sft.py
 - https://huggingface.co/docs/trl/main/en/grpo_trainer
