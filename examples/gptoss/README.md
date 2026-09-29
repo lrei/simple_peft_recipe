@@ -96,16 +96,21 @@ MXFP4, which has no backward pass: they cannot be trained with LoRA.
 LoRA rank 1, alpha 32, on the attention projections and on every
 expert's gate/up and down projections (Unsloth maps the `gate_proj`,
 `up_proj`, `down_proj` targets onto the experts); the router is not
-adapted. Rank 1 is enough here: the dataset has 529,151 response tokens,
-which [`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)
-turns into ~265k needed parameters, far below the rank-1 adapter:
+adapted. Rank 1 is enough here: the 900 training rows have ~0.93M
+response tokens (reasoning and final answer), which
+[`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank) turns
+into ~463k needed parameters, far below the rank-1 adapter (11.6M for
+20b, 67.1M for 120b):
 
 ```bash
 uv run python -m speftr.lora_budget \
-    --model_name_or_path openai/gpt-oss-120b \
-    --dataset HuggingFaceH4/Multilingual-Thinking \
+    --model_name_or_path unsloth/gpt-oss-20b-unsloth-bnb-4bit \
+    --dataset HuggingFaceH4/Multilingual-Thinking --split "train[:900]" \
     --messages_column messages --lora_r 1 --responses_only
 ```
+
+The command takes the first 900 rows rather than the example's seeded
+split, so it prints ~459k.
 
 ## Training settings
 
@@ -452,8 +457,9 @@ answers in the language of the question.
    and `--response_part`
    ([marker table](../../docs/guide.md#chat-templates-and-markers)) and
    probably not `router_aux_loss_coef`.
-4. **Rank**: check it for your data with `python -m speftr.lora_budget
-   --responses_only` (command above).
+4. **Rank**: rerun the [`speftr.lora_budget` command](#model) with your
+   model, dataset and columns
+   ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls
 

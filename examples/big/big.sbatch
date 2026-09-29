@@ -8,15 +8,16 @@
 #            (--device_map unsloth_balanced); for models too large for
 #            one GPU.
 #
-# Neither mode is validated for this model on multi-GPU hardware; model
-# splitting is validated with gpt-oss-120b (examples/gptoss).
+# DDP is validated for this model on 2x A100 40GB (~2.6 s per step,
+# 29.7 GB peak); model splitting is validated with gpt-oss-120b
+# (examples/gptoss).
 
 #SBATCH --job-name=speftr-big
 #SBATCH --account=<account>
 #SBATCH --partition=<gpu-partition>
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=12:00:00
@@ -32,14 +33,16 @@ export HF_HUB_OFFLINE=1
 export HF_HUB_DISABLE_TELEMETRY=1
 
 MODE=${MODE:-ddp}
-NUM_GPUS=${SLURM_GPUS_ON_NODE:-4}
 OUTPUT_DIR=./models/speftr-big-${SLURM_JOB_ID}
 
 if [ "$MODE" = "ddp" ]; then
-    # Effective batch = 1 per GPU x accumulation x GPUs; keep it at 16.
-    uv run torchrun --standalone --nproc_per_node "$NUM_GPUS" \
+    # 2 GPUs x 4 rows x accumulation 2 = 16 rows per optimizer step. For
+    # another GPU count, change --gres, --nproc_per_node and the
+    # accumulation together to keep 16.
+    uv run torchrun --standalone --nproc_per_node 2 \
         -m examples.big.big \
-        --gradient_accumulation_steps $((16 / NUM_GPUS)) \
+        --per_device_train_batch_size 4 \
+        --gradient_accumulation_steps 2 \
         --output_dir "$OUTPUT_DIR"
 else
     uv run python -m examples.big.big --device_map unsloth_balanced \

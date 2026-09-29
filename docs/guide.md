@@ -680,9 +680,10 @@ Limits:
 
 ## 11. Multiple GPUs
 
-`PESFT` model splitting is validated on two A100 40GB with
-gpt-oss-120b; the other modes below are implemented but **not yet
-validated on multi-GPU hardware**. `examples/big` and `examples/gptoss`
+`PESFT` DDP is validated on two A100 40GB with Gemma 4 31B (4-bit) and
+model splitting with gpt-oss-120b; the `PERL` modes below are
+implemented but **not yet validated on multi-GPU hardware**.
+`examples/big` and `examples/gptoss`
 have Slurm templates ([big](../examples/big/big.sbatch),
 [gptoss](../examples/gptoss/gptoss.sbatch)).
 
@@ -697,6 +698,11 @@ Unsloth puts each process on its own GPU. Effective batch =
 `per_device_train_batch_size × gradient_accumulation_steps × N`; divide
 `gradient_accumulation_steps` by N to keep it. Only rank 0 prints the
 parameters and writes files.
+
+Measured with Gemma 4 31B (4-bit) on two A100 40GB
+([examples/big](../examples/big/README.md#several-gpus)): per-GPU batch
+4 × accumulation 2 (16 rows per step) ran at ~2.6 s per step, one epoch
+of Dolly (14,970 rows) in ~40 min, at a peak of 29.7 / 24.0 GB.
 
 **`PESFT`, one model split over GPUs.** For a model too large for one
 GPU even in 4-bit: `device_map="unsloth_balanced"`

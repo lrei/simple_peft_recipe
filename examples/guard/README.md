@@ -57,7 +57,18 @@ With `train_on_responses=True`, `instruction_part`
 `unsloth/gemma-3-270m-it` (Gemma license, not gated): an instruction-tuned
 270M model, small enough to train on all 87k rows in about an hour, and
 already familiar with its chat template. Loaded in 16-bit; LoRA rank 8,
-alpha 32 on all attention and MLP projections.
+alpha 32 on all attention and MLP projections. Rank 8 has 1.90M adapter
+parameters; the 387,579 label tokens need ~194k
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)), so
+rank 1 would suffice:
+
+```bash
+uv run python -m speftr.lora_budget \
+    --model_name_or_path unsloth/gemma-3-270m-it \
+    --dataset allenai/wildguardmix --dataset_config wildguardtrain \
+    --prompt_column prompt --response_column prompt_harm_label \
+    --responses_only
+```
 
 ## Run
 
@@ -200,8 +211,8 @@ For any "text in, one label out" task:
    ([marker table](../../docs/guide.md#chat-templates-and-markers)). Use
    the role `"assistant"` instead of `"model"` in `format_example` for
    non-Gemma templates.
-5. **Rank**: check it against your data with
-   `python -m speftr.lora_budget`
+5. **Rank**: rerun the [`speftr.lora_budget` command](#model) with your
+   model, dataset and columns
    ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls

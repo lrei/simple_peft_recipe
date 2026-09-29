@@ -49,7 +49,17 @@ With `instruction_part` `<|turn>user\n` and `response_part`
 Gemma 4 31B instruct, pre-quantized to 4-bit NF4 (~18 GiB on the GPU).
 Gemma 4 is multimodal; `load_model()` returns a processor and only the
 language model gets LoRA adapters (rank 8, alpha 32, all attention and
-MLP projections).
+MLP projections). Rank 8 has 61.2M adapter parameters; the ~1.3M response
+tokens need ~0.63M, so rank 1 would suffice
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)):
+
+```bash
+uv run python -m speftr.lora_budget \
+    --model_name_or_path unsloth/gemma-4-31B-it-unsloth-bnb-4bit \
+    --dataset TeeZee/dolly-15k-pirate-speech --split "train[:-100]" \
+    --prompt_column instruction context --response_column response \
+    --responses_only
+```
 
 ## Memory budget
 
@@ -126,20 +136,34 @@ printed at the end (the per-flag help shows the `PESFTConfig` ones).
 
 ### Several GPUs
 
-Neither mode is validated with this model on multi-GPU hardware. Model
+DDP is validated with this model on two A100 40GB (below). Model
 splitting is validated with gpt-oss-120b on two A100 40GB
 ([examples/gptoss](../gptoss/README.md#gpt-oss-120b-on-several-gpus)).
 
 **Data parallel (DDP)**: one process per GPU, each with a full 4-bit
-copy (~20 GB, so every GPU needs 24 GB or more). Divide the accumulation
-by the number of GPUs to keep the effective batch at 16:
+copy (~20 GB, so every GPU needs 24 GB or more). Keep the effective
+batch (per-GPU batch × accumulation × GPUs) at 16. On two A100 40GB:
 
 ```bash
-uv run torchrun --nproc_per_node 4 -m examples.big.big \
-    --gradient_accumulation_steps 4
+uv run torchrun --nproc_per_node 2 -m examples.big.big \
+    --per_device_train_batch_size 4 --gradient_accumulation_steps 2
 ```
 
-Only rank 0 writes files.
+Result with the 20-step check flags from [One GPU](#one-gpu) added:
+
+| Measure | Value |
+|---------|-------|
+| Time per optimizer step (16 rows) | ~2.6 s (~6 rows/s) |
+| One epoch (14,970 rows) | ~40 min |
+| GPU utilization, rank 0 / rank 1 | 74% / 65% |
+| Peak GPU memory, rank 0 / rank 1 | 29.7 / 24.0 GB |
+| `train_loss` / `eval_loss` at step 20 (16 eval rows) | 2.49 / 1.868 |
+
+Only rank 0 writes the adapter and metadata; the checkpoint holds the
+RNG state of every rank. Both ranks print some progress lines, and
+PyTorch warns at exit that `destroy_process_group()` was not called;
+both are harmless. With per-GPU batch 4, one process
+(`--nproc_per_node 1`) on one A100 40GB peaks at 24.5 GB.
 
 **Model splitting**: one process, the layers spread over all visible
 GPUs, for GPUs too small for the whole model. It runs one GPU at a time,
@@ -154,9 +178,11 @@ CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.big.big \
 
 ### Slurm
 
-[`big.sbatch`](big.sbatch) is a single-node template for both modes.
-Fill in the `<...>` placeholders (account, partition, clone path, shared
-Hugging Face cache), download the model and dataset beforehand, then:
+[`big.sbatch`](big.sbatch) is a single-node template for both modes. It
+requests two GPUs and in DDP mode runs the per-GPU batch 4 command
+above. Fill in the `<...>` placeholders (account, partition, clone path,
+shared Hugging Face cache), download the model and dataset beforehand,
+then:
 
 ```bash
 sbatch examples/big/big.sbatch                  # DDP on all GPUs
@@ -231,6 +257,9 @@ on several GPUs add `tensor_parallel_size` to the `LLM(...)` call in
    training at 2048 tokens.
 3. **Longer sequences**: raise `--max_seq_length` (4096 measured at
    20.7 GiB) and keep batch 1.
+4. **Rank**: rerun the [`speftr.lora_budget` command](#model) with your
+   model, dataset and columns
+   ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls
 

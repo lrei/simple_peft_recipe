@@ -223,7 +223,7 @@ PROMPT_RESPONSE: Final[str] = "prompt-response chat"
 LANGUAGE_MODELING: Final[str] = "language modeling"
 FORMATTING_FUNC: Final[str] = "formatting_func"
 
-type Message = dict[str, str]
+type Message = dict[str, object]
 type Conversation = list[Message]
 type Sample = (
     str | Conversation | tuple[str, str] | tuple[Conversation, Conversation]
@@ -1011,7 +1011,7 @@ def _prompt_response_messages(
     prompt = "\n\n".join(
         str(row[name]) for name in prompt_columns if row[name]
     )
-    messages = [
+    messages: Conversation = [
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": str(row[response_column])},
     ]
@@ -1022,7 +1022,10 @@ def _prompt_response_messages(
 
 
 def normalize_messages(messages: object) -> Conversation:
-    """Convert role/content or ShareGPT messages to text-only messages.
+    """Convert role/content or ShareGPT messages to text-content messages.
+
+    Other message keys (e.g. an assistant's ``thinking``) are kept, so the
+    chat template renders every field it supports, as in training.
 
     Args:
         messages: List of ``{"role", "content"}`` or ``{"from",
@@ -1036,10 +1039,13 @@ def normalize_messages(messages: object) -> Conversation:
     for message in cast("list[Mapping[str, object]]", messages):
         if "role" in message:
             role, content = message["role"], message["content"]
+            extra = dict(message)
         else:
             role, content = message["from"], message["value"]
+            extra = {}
         normalized.append(
             {
+                **extra,
                 "role": SHAREGPT_ROLES.get(str(role), str(role)),
                 "content": _text_content(content),
             }
@@ -1111,8 +1117,10 @@ def _chat_length(
             "or --text_column"
         )
         raise LoraBudgetError(msg)
+    # The annotation allows only string values, but templates also render
+    # non-string fields such as a ``thinking`` of ``None``.
     text = tokenizer.apply_chat_template(
-        messages,
+        cast("list[dict[str, str]]", messages),
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
     )

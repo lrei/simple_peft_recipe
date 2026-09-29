@@ -6,7 +6,8 @@ Fixtures are real rows (long fields trimmed) from:
 (tldr_rows.json), ``trl-internal-testing/zen`` configs
 ``conversational_prompt_completion`` and ``standard_language_modeling``,
 ``HuggingFaceH4/llava-instruct-mix-vsft`` (messages only) and
-``philschmid/guanaco-sharegpt-style``; all from the train split.
+``philschmid/guanaco-sharegpt-style`` and
+``HuggingFaceH4/Multilingual-Thinking``; all from the train split.
 ``gpt_oss_20b/config.json`` is the ``openai/gpt-oss-20b`` model config
 (Apache-2.0).
 """
@@ -42,6 +43,7 @@ USER_PART = "<|im_start|>user\n"
 ASSISTANT_PART = "<|im_start|>assistant\n"
 FORMATTING_FUNC = "tests.test_lora_budget:format_dolly_chatml"
 GPT_OSS_20B = str(FIXTURES_DIR / "gpt_oss_20b")
+GPT_OSS_TOKENIZER = "unsloth/gpt-oss-20b-unsloth-bnb-4bit"
 # gpt-oss-20b at rank 1: 24 layers of q/k/v/o (2880 hidden, 64 x 64 query
 # and 8 x 64 key/value outputs), and 32 experts per layer with a fused
 # gate_up (2880 -> 5760) and a down (2880 -> 2880) projection.
@@ -344,6 +346,22 @@ def test_sharegpt_messages_map_to_roles():
         "assistant",
     ]
     assert messages[0]["content"] == row["conversations"][0]["value"]
+
+
+def test_assistant_thinking_is_counted_as_trained():
+    tokenizer = AutoTokenizer.from_pretrained(GPT_OSS_TOKENIZER)
+    row = _fixture_rows("multilingual_thinking_rows.json")[0]
+    messages = lora_budget.normalize_messages(row["messages"])
+    responses = lora_budget.count_trained_tokens(
+        tokenizer, messages, responses_only=True
+    )
+    thinking, answer = row["messages"][-1]["thinking"], messages[-1]["content"]
+    expected = tokenizer(
+        f"<|channel|>analysis<|message|>{thinking}<|end|>"
+        f"<|start|>assistant<|channel|>final<|message|>{answer}<|return|>",
+        add_special_tokens=False,
+    )["input_ids"]
+    assert responses == len(expected)
 
 
 def test_prompt_completion_responses_only_counts_completion(qwen_tokenizer):

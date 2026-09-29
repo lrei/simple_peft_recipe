@@ -108,8 +108,18 @@ messages):
   final eval loss 0.10.
 - Evaluation: about 5 min at batch 32; 8.1 GB peak (torch) with adapters,
   10.5 GB for the base model.
-- Rank check (`speftr.lora_budget`): 83,261 response tokens need rank 1;
-  rank 8 has ample headroom.
+- Rank check ([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)):
+  the 83,261 intent-name response tokens need ~42k parameters; rank 8 has
+  14.1M, and rank 1 would suffice. The command below counts Banking77's
+  integer label ids instead of the names (~18k parameters), which leads
+  to the same rank:
+
+  ```bash
+  uv run python -m speftr.lora_budget \
+      --model_name_or_path ibm-granite/granite-3.3-2b-instruct \
+      --dataset legacy-datasets/banking77 --split "train[:-500]" \
+      --prompt_column text --response_column label --responses_only
+  ```
 
 "Invalid" means the first line of the reply is not an intent name; it
 counts as an error in accuracy and macro-F1.
@@ -188,7 +198,8 @@ training](../../docs/guide.md#5-after-training).
    ([marker table](../../docs/guide.md#chat-templates-and-markers)).
    Print one formatted row (the script does) and check the markers
    appear verbatim.
-5. **Rank.** Check it with `speftr.lora_budget`
+5. **Rank.** Rerun the [`speftr.lora_budget` command](#results) with
+   your model, dataset and columns
    ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls

@@ -52,6 +52,17 @@ trained.
 pre-quantized to 4-bit, so it downloads and trains quickly. Qwen models
 are pretrained on ChatML tokens, so the `chatml` template needs no new
 tokens. LoRA rank 8, alpha 32 on all attention and MLP projections.
+Rank 8 has 5.05M adapter parameters; the ~1.3M response tokens of the
+training split need ~0.65M, i.e. rank 2 at least
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)):
+
+```bash
+uv run python -m speftr.lora_budget \
+    --model_name_or_path unsloth/Qwen3-0.6B-unsloth-bnb-4bit \
+    --dataset TeeZee/dolly-15k-pirate-speech --split "train[:95%]" \
+    --prompt_column instruction context --response_column response \
+    --responses_only
+```
 
 ## Run
 
@@ -184,8 +195,8 @@ training](../../docs/guide.md#5-after-training).
    `instruction_part` / `response_part` in `_build_config` to match
    ([marker table](../../docs/guide.md#chat-templates-and-markers)); use
    the same `--chat_template` with `chat.py`.
-4. **Rank**: check it against your data with
-   `python -m speftr.lora_budget --responses_only`
+4. **Rank**: rerun the [`speftr.lora_budget` command](#model) with your
+   model, dataset and columns
    ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls

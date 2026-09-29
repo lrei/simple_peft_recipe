@@ -117,6 +117,20 @@ The RL stage samples with transformers (`use_vllm=False`, set in
 With 128-token completions, transformers sampling is fast enough (3.5
 s/step).
 
+The SFT stage uses LoRA rank 8 (15.1M adapter parameters). Its ~2.2M
+response tokens need ~1.08M parameters, so rank 1 would suffice
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)). The
+command below renders SmolLM3's default template, without the empty
+think block `enable_thinking=False` adds, and prints ~0.92M:
+
+```bash
+uv run python -m speftr.lora_budget \
+    --model_name_or_path HuggingFaceTB/SmolLM3-3B \
+    --dataset b-mc2/sql-create-context --split "train[:-800]" \
+    --prompt_column context question --response_column answer \
+    --responses_only
+```
+
 ## Run
 
 From the repository root (the SFT script needs an NVIDIA GPU to import
@@ -264,7 +278,10 @@ training](../../docs/guide.md#5-after-training).
    ([marker table](../../docs/guide.md#chat-templates-and-markers)), and
    change `CHAT_TEMPLATE_KWARGS` (`enable_thinking` is SmolLM3/Qwen
    specific).
-6. **Faster RL.** For a model vLLM supports natively, save the SFT stage
+6. **Rank (SFT).** Rerun the [`speftr.lora_budget` command](#model) with
+   your model, dataset and columns
+   ([guide](../../docs/guide.md#7-checking-the-rank)).
+7. **Faster RL.** For a model vLLM supports natively, save the SFT stage
    merged (`save_method="merged_16bit"`) and start a bf16 RL run from the
    merged directory with `PERL.load_model()` and `use_vllm=True`
    ([SFT then RL](../../docs/guide.md#4-sft-then-rl)). PERL then trains a
