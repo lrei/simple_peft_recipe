@@ -726,7 +726,9 @@ and the split layers run one GPU at a time.
 **`PERL`, DDP.** `torchrun --nproc_per_node N my_rl.py` (or
 `accelerate launch --num_processes N`). Each rank loads the whole model
 on its GPU; with colocated vLLM each rank also runs its own vLLM engine,
-so `vllm_gpu_memory_utilization` applies per GPU.
+so `vllm_gpu_memory_utilization` applies per GPU. Validated on
+2× A100 40GB with `examples/rgym` (Qwen3 1.7B: 100 steps in 5.8 min,
+24.8 GB peak per GPU; [2-GPU run](../examples/rgym/README.md#two-gpus)).
 
 **vLLM.** 4-bit and 8-bit `PERL` runs generate without vLLM. For
 generation on separate GPUs, run TRL's vLLM server there

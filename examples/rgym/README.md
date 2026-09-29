@@ -150,6 +150,26 @@ its training reward (accuracy + format, maximum 2.0) averages 1.41
 over steps 1–50 and 1.76 over steps 51–100. Gemma 4 E2B runs but
 gains little in 30 steps with these settings.
 
+### Two GPUs
+
+`rgym.py` runs unchanged under `torchrun`: each process loads the model
+on its own GPU, runs its own colocated vLLM engine and trains on its share
+of the prompts. Keep 16 completions per optimizer step with per-GPU batch
+8 × grad-acc 1 × 2 GPUs:
+
+```bash
+uv run torchrun --standalone --nproc_per_node 2 -m examples.rgym.rgym \
+  --output_dir ./models/chainsum-2gpu --max_steps 100 \
+  --eval_dataset_size 100 --vllm_sleep \
+  --per_device_train_batch_size 8 --gradient_accumulation_steps 1
+```
+
+Measured on 2× A100-SXM4-40GB, Qwen3 1.7B, rank 1: 100 steps in 5.8 min
+(~3.5 s/step), 24.8 GB peak and ~72% utilization per GPU (whole job),
+38% → 88% / 91% on 100 problems, 10 min end to end. Each process runs the
+evaluation on its own, so the log shows one accuracy per GPU. Only rank
+0 writes the adapter.
+
 ## Outputs
 
 `--output_dir` receives the LoRA adapter (`adapter_model.safetensors`,
