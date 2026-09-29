@@ -172,12 +172,6 @@ Run them from the repository root as modules, e.g.
 `uv run python -m examples.guard.guard_train --help`. They need an NVIDIA
 GPU (see [Installation](#installation)).
 
-## Future Work
-
-- Quantized RL with vLLM generation (4-bit and 8-bit `PERL` runs
-  generate with transformers: TRL has no adapter-only weight sync for a
-  quantized vLLM copy).
-
 ## Bibliography
 
 ### Links
