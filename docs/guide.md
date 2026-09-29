@@ -439,25 +439,56 @@ curl -s localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
 | Quick check or evaluation in Python | Adapter on its base (transformers + peft) |
 | Several adapters on one base, switched per request | vLLM with several `--lora-modules` |
 | Tools that know nothing about LoRA (`pipeline`, other frameworks) | Merged model |
-| CPU or laptop | Merged model converted to GGUF (below) |
-
-GGUF / llama.cpp, from a merged model (needs a llama.cpp checkout and the
-`gguf` Python package):
-
-```bash
-python llama.cpp/convert_hf_to_gguf.py ./models/my-merged \
-    --outfile my-merged.gguf --outtype q8_0
-llama-server -m my-merged.gguf --jinja -ngl 99 -c 4096 --port 8000
-```
-
-`llama-server` serves the same OpenAI-compatible API with the chat
-template stored in the GGUF; the intent example's merged model in Q8_0
-gave the same replies as transformers.
+| CPU, laptop, llama.cpp or Ollama | Merged model exported to GGUF ([below](#export-to-gguf-llamacpp-ollama)) |
 
 Greedy outputs of the adapter route, the merged model and vLLM agree on
 most but not all prompts: in bf16 two nearly tied tokens can swap, and
 the rest of the reply follows. For Gemma 4 E2B, vLLM and transformers
 already differ on the base model.
+
+### Export to GGUF (llama.cpp, Ollama)
+
+llama.cpp and Ollama run GGUF files. Export the **merged 16-bit** model:
+llama.cpp converts full checkpoints, so an adapter trained on a 4-bit
+base is first merged onto the 16-bit original, as the
+[inference scripts](#inference-scripts-per-example) and
+[Merge an adapter yourself](#merge-an-adapter-yourself) do.
+[`examples/export_gguf.sh`](../examples/export_gguf.sh) takes the path of
+a llama.cpp checkout (it uses `convert_hf_to_gguf.py` and
+`llama-quantize`), converts to a bf16 GGUF (weights, tokenizer and chat
+template in one file), quantizes it and prints the commands to run the
+result:
+
+```bash
+uv run --with gguf examples/export_gguf.sh ./models/my-merged ./gguf \
+    ./llama.cpp Q4_K_M
+llama.cpp/build/bin/llama-server -m ./gguf/my-merged-Q4_K_M.gguf \
+    --jinja -ngl 99 -c 4096 --port 8080
+```
+
+- `--jinja` applies the Jinja chat template stored in the GGUF, the
+  training template (`chat_template.jinja`) byte for byte. The server
+  speaks the OpenAI chat API, like vLLM.
+- Only the conversion needs Python: `convert_hf_to_gguf.py` reads the
+  checkpoint and tokenizer with transformers and writes with the `gguf`
+  package. `uv run --with gguf` runs it in the project environment, which
+  has the transformers version the merged model was saved with. Running
+  the GGUF (`llama-server`, Ollama) needs no Python.
+- Quantization types: `Q8_0` (half the bf16 size) and `Q4_K_M` (under a
+  third) are common choices; `llama-quantize --help` lists all. Measure
+  your task on the quantized file; the
+  [intent example](../examples/intent/README.md#export-to-gguf) lost
+  under one accuracy point with `Q4_K_M`.
+- Ollama: a `Modelfile` with `FROM ./gguf/my-merged-Q4_K_M.gguf`, then
+  `ollama create my-model -f Modelfile`. Ollama may not translate the
+  Jinja template: if `ollama show my-model --modelfile` prints
+  `TEMPLATE {{ .Prompt }}`, messages reach the model without role
+  markers. Write a `TEMPLATE` for the model's format (Granite example in
+  the intent README).
+- Architecture support is llama.cpp's. Its converter registers the
+  architectures of every example model (Gemma 3, Gemma 4, gpt-oss,
+  Qwen3, Qwen 3.5, SmolLM3, Granite); only Granite 3.3 2B (intent) was
+  converted and run.
 
 ### Inference scripts per example
 

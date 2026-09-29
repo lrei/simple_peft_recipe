@@ -53,6 +53,7 @@ examples/       Usage examples only, runnable as modules
                 (`python -m examples.<pkg>.<script>`).
   README.md               Index; each example has its own README.md.
   chat.py                 Interactive chat with a trained model.
+  export_gguf.sh          Merged model -> GGUF for llama.cpp / Ollama.
   guard/                  SFT safety classifier on WildGuardMix (gated).
   instruct/               SFT instruction tuning (Dolly pirate dataset).
   intent/                 SFT intent classification on Banking77.

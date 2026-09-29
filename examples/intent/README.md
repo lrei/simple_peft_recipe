@@ -177,6 +177,61 @@ one engine per route (about 3 min per run in total). The script holds
 the 77 intent names (`INTENTS`) because the prompt lists them all,
 exactly as `intent_eval.build_messages` does.
 
+### Export to GGUF
+
+For llama.cpp or Ollama, export the merged model with
+[`examples/export_gguf.sh`](../export_gguf.sh)
+([guide](../../docs/guide.md#export-to-gguf-llamacpp-ollama)):
+
+```bash
+uv run --with gguf examples/export_gguf.sh \
+    ./models/granite-3.3-2b-lora-banking77-merged \
+    ./gguf ./llama.cpp Q4_K_M
+llama.cpp/build/bin/llama-server --jinja -ngl 99 -c 4096 --port 8080 \
+    -m ./gguf/granite-3.3-2b-lora-banking77-merged-Q4_K_M.gguf
+```
+
+Conversion takes about 25 s, `Q4_K_M` quantization about 20 s, `Q8_0`
+about 8 s. The GGUF's chat template is identical to the adapter's
+`chat_template.jinja`, and `llama-server` renders and tokenizes the
+prompt exactly as transformers does.
+
+300 shuffled test messages (`shuffle(seed=0)`), the `intent_inference`
+prompt and `intent_eval` answer matching, greedy, one request at a time,
+RTX 3090 (llama.cpp built with CUDA). "Same" counts predictions equal
+to the merged transformers model's:
+
+| Format | File | Accuracy | Same | Messages/s | Decode tokens/s |
+|--------|------|----------|------|------------|-----------------|
+| Merged, transformers bf16 | 5.1 GB | 0.803 | reference | 4.2 | |
+| GGUF bf16 | 5.1 GB | 0.803 | 300/300 | 13.4 | 121 |
+| GGUF `Q8_0` | 2.7 GB | 0.800 | 298/300 | 16.8 | 166 |
+| GGUF `Q4_K_M` | 1.5 GB | 0.793 | 289/300 | 19.4 | 209 |
+| Ollama, GGUF `Q4_K_M` with the `TEMPLATE` below | 1.5 GB | 0.793 | 280/300 | 7.6 | |
+| Ollama, GGUF `Q4_K_M`, `FROM` only | 1.5 GB | 0.580 | 202/300 | 5.8 | |
+
+- On a 10-core CPU (`-ngl 0`, i9-7900X): bf16 0.800 at 1.0 messages/s
+  (8 decode tokens/s), `Q8_0` 0.803 at 1.3 (14), `Q4_K_M` 0.797 at 1.9
+  (22).
+- `llama-server` reuses the cached prompt prefix shared by every request
+  (instruction and intent list); the transformers loop encodes each
+  prompt in full.
+- Ollama 0.12.10 imports this GGUF with `TEMPLATE {{ .Prompt }}`: the
+  message reaches the model without Granite's role markers, the answer
+  does not stop, and 74 of 300 answers are invalid. This `Modelfile`
+  restores the training format (Ollama's `currentDate` prints
+  `2026-09-29` where the Jinja template prints `September 29, 2026`):
+
+```text
+FROM ./granite-3.3-2b-lora-banking77-merged-Q4_K_M.gguf
+TEMPLATE """<|start_of_role|>system<|end_of_role|>{{ if .System }}{{ .System }}{{ else }}Knowledge Cutoff Date: April 2024.
+Today's Date: {{ currentDate }}.
+You are Granite, developed by IBM. You are a helpful AI assistant.{{ end }}<|end_of_text|>
+{{ range .Messages }}{{ if ne .Role "system" }}<|start_of_role|>{{ .Role }}<|end_of_role|>{{ .Content }}<|end_of_text|>
+{{ end }}{{ end }}<|start_of_role|>assistant<|end_of_role|>"""
+PARAMETER stop <|end_of_text|>
+```
+
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).
 

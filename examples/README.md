@@ -18,6 +18,7 @@ without one.
 | `guard/` | `PESFT` as a binary text classifier (label as the assistant turn, response-only loss) on WildGuardMix (gated); eval, console tester, token counts | Gemma 3 270M, 16-bit | ~5 GB | [README](guard/README.md) |
 | `instruct/` | `PESFT` chat instruction tuning from instruction/context/response columns with a system prompt (Dolly pirate) | Qwen3 0.6B, 4-bit | small; any 24 GB GPU | [README](instruct/README.md) |
 | `chat.py` | Console chat with an adapter or merged model saved by `PESFT` (Unsloth inference) | any | GPU | [instruct README](instruct/README.md#run) |
+| `export_gguf.sh` | Converts a merged model to GGUF and quantizes it for llama.cpp / Ollama (needs a llama.cpp checkout) | any merged model | CPU | [guide](../docs/guide.md#export-to-gguf-llamacpp-ollama) |
 | `intent/` | `PESFT` multi-class classification (77 intents) with before/after evaluation on Banking77 | Granite 3.3 2B, bf16 | 11 GB | [README](intent/README.md) |
 | `text2sql/` | `PESFT` 4-bit SFT then `PERL` GRPO on the same adapters with a SQLite execution reward | SmolLM3-3B, 4-bit | ≤ 9 GB | [README](text2sql/README.md) |
 | `rgym/` | `PERL` GRPO with verifiable rewards on Reasoning Gym tasks, colocated vLLM, before/after accuracy | Qwen3 1.7B, bf16 | RTX 3090 24 GB (`gym` extra) | [README](rgym/README.md) |
