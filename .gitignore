@@ -225,3 +225,14 @@ docs/assumptions/
 
 # example outputs (default --output_dir of the examples)
 models/
+
+# Local agent and editor configuration
+CLAUDE.md
+.mcp.json
+opencode.json
+.serena/
+.vscode/
+.idea/
+.DS_Store
+*.swp
+.complexipy_cache/
