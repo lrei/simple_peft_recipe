@@ -154,8 +154,10 @@ gains little in 30 steps with these settings.
 
 `rgym.py` runs unchanged under `torchrun`: each process loads the model
 on its own GPU, runs its own colocated vLLM engine and trains on its share
-of the prompts. Keep 16 completions per optimizer step with per-GPU batch
-8 × grad-acc 1 × 2 GPUs:
+of the prompts. The advantage is throughput: each GPU generates and
+trains on half of every step's completions, so the same training takes
+fewer wall-clock minutes. Keep 16 completions per optimizer step with
+per-GPU batch 8 × grad-acc 1 × 2 GPUs:
 
 ```bash
 uv run torchrun --standalone --nproc_per_node 2 -m examples.rgym.rgym \
