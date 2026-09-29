@@ -23,6 +23,7 @@ from examples.big import big_inference
 from examples.guard import guard_inference
 from examples.instruct import instruct_inference
 from examples.intent import intent_inference
+from examples.prefs import prefs_inference
 from examples.rgym import rgym_inference
 from examples.text2sql import text2sql_inference
 
@@ -52,6 +53,7 @@ SCRIPTS = [
     guard_inference,
     instruct_inference,
     intent_inference,
+    prefs_inference,
     text2sql_inference,
     rgym_inference,
 ]

@@ -50,14 +50,17 @@ recipe deviates slightly from any one source.
 - **LoRA targets**: all layers.
 - **Scaling factor**: $\alpha = 32$ (standard practice).
 - **Learning rate schedule**: constant or constant with warmup.
-- **Learning rate**: relatively high, around 1e-4 for SFT and 1e-5 for RL.
+- **Learning rate**: relatively high, around 1e-4 for SFT, 1e-5 for RL
+  and 5e-6 for DPO (about 10x the full fine-tuning rate).
 - **Warmup**: 0 by default (reasonable to have up to 10% of steps)
 - **Batch Size**:
   - 16 or 32 for SFT;
-  - 8 or 16 for RL/GRPO (more would be asking too much for PEFT constraints).
+  - 8 or 16 for RL/GRPO (more would be asking too much for PEFT constraints);
+  - 16 preference pairs for DPO.
 - **Dropout**: no.
 - **Optimizer**: 8bit AdamW by default
-- **Epochs**: 1-3 epochs for SFT, 1-2 for RL (when not using steps)
+- **Epochs**: 1-3 epochs for SFT, 1-2 for RL, 1 for DPO (when not using
+  steps)
 - Gradient checkpointing enabled by default.
 - Train on responses only when training with assistant templates.
 - **SFT attention**: SDPA with padded, length-grouped batches. Unsloth's
@@ -71,8 +74,9 @@ For GRPO, we default to colocated vLLM with GPU memory utilization limited to
 
 The rank follows "LoRA Without Regret": LoRA stores about 2 bits of
 information per parameter, SFT data carries about 1 bit per trained token
-and RL about 1 bit per episode, so an adapter needs roughly
-`trained tokens / 2` (SFT) or `episodes / 2` (RL) parameters.
+and RL about 1 bit per episode (DPO: per preference pair), so an adapter
+needs roughly `trained tokens / 2` (SFT) or `episodes / 2` (RL)
+parameters.
 
 - Rank is the only capacity knob, in powers of two (1, 2, 4, 8, ...).
   Pick the smallest rank that covers the data; `speftr.lora_budget`
@@ -81,7 +85,7 @@ and RL about 1 bit per episode, so an adapter needs roughly
   it costs compute and memory; LoRA Without Regret measures no quality
   loss, while Unsloth's guide warns of overfitting at very large ranks.
 - Defaults: rank 8 for SFT, a safe over-provisioned choice (the smallest
-  rank Unsloth's hyperparameter guide suggests); rank 1 for RL.
+  rank Unsloth's hyperparameter guide suggests); rank 1 for RL and DPO.
 
 The examples use rank 1 (gptoss, rgym, text2sql) and rank 8 (guard,
 intent, instruct, big); each README gives its budget.
@@ -136,11 +140,12 @@ copy parts of the files, or use TRL directly with the parameter values.
 The `examples/` directory only shows the library in use on a few public
 datasets; it is not part of the library.
 
-The `PESFT` and `PERL` classes are thin wrappers around Hugging Face's TRL.
-Their configuration classes expose the parameters a typical user changes,
-with defaults from the "Recipe" above. `PESFT` uses Unsloth, which is faster
-here. `PERL` (GRPO) uses plain transformers and peft: Unsloth's GRPO path
-shows no clear benefit and has more issues.
+The `PESFT`, `PERL` and `PEDPO` classes are thin wrappers around Hugging
+Face's TRL. Their configuration classes expose the parameters a typical
+user changes, with defaults from the "Recipe" above. `PESFT` uses
+Unsloth, which is faster here. `PERL` (GRPO) uses plain transformers and
+peft: Unsloth's GRPO path shows no clear benefit and has more issues.
+`PEDPO` (DPO) also uses plain transformers and peft.
 
 [docs/guide.md](docs/guide.md) is the user guide: data formats,
 formatting and reward functions, configuration, SFT then RL, loading and
@@ -161,6 +166,7 @@ commands, data format, hardware and measured results:
 | [intent](examples/intent/README.md) | SFT customer-support intent routing on Banking77 (Granite 3.3 2B) |
 | [text2sql](examples/text2sql/README.md) | 4-bit SFT then GRPO with a SQLite execution reward (SmolLM3-3B) |
 | [rgym](examples/rgym/README.md) | GRPO with verifiable rewards on Reasoning Gym (Qwen3 1.7B, vLLM) |
+| [prefs](examples/prefs/README.md) | DPO on a preference mix with held-out and RewardBench accuracy (OLMo 2 1B) |
 | [big](examples/big/README.md) | 4-bit SFT of a 31B model on one 24 GB GPU; multi-GPU and Slurm (Gemma 4 31B) |
 | [gptoss](examples/gptoss/README.md) | 4-bit SFT of an MoE reasoning model to reason in a requested language; 20b on one GPU, 120b split over GPUs (gpt-oss) |
 

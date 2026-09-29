@@ -6,6 +6,7 @@ Wrappers around TRL's trainers that train LoRA adapters on language models.
 
 - PESFT: Supervised fine-tuning with SFTTrainer (uses Unsloth)
 - PERL: Reinforcement learning with GRPOTrainer (TRL-only, no Unsloth)
+- PEDPO: Preference optimization with DPOTrainer (TRL-only, no Unsloth)
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
-# Lazy imports to avoid importing unsloth when only using PERL
+# PESFT is imported lazily (below) so these never import unsloth.
+from .pedpo import PEDPO, PEDPOConfig
 from .perl import PERL, PERLConfig
 
 
@@ -34,7 +36,7 @@ if TYPE_CHECKING:  # pragma: no cover - type checking helper
 
 
 def __getattr__(name: str) -> object:
-    """Lazily import PESFT symbols so PERL users never import unsloth.
+    """Lazily import PESFT symbols so PERL and PEDPO never import unsloth.
 
     Args:
         name: Attribute requested from the ``speftr`` package.
@@ -57,8 +59,10 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "PEDPO",
     "PERL",
     "PESFT",
+    "PEDPOConfig",
     "PERLConfig",
     "PESFTConfig",
     "__version__",

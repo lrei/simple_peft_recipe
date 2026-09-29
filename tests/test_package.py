@@ -8,14 +8,16 @@ import sys
 import pytest
 
 import speftr
-from speftr import perl, pesft
+from speftr import pedpo, perl, pesft
 
 
 def test_all_contents():
     assert sorted(speftr.__all__) == sorted(
         [
+            "PEDPO",
             "PERL",
             "PESFT",
+            "PEDPOConfig",
             "PERLConfig",
             "PESFTConfig",
             "__version__",
@@ -38,6 +40,11 @@ def test_version_is_string():
 def test_perl_exported_eagerly():
     assert speftr.PERL is perl.PERL
     assert speftr.PERLConfig is perl.PERLConfig
+
+
+def test_pedpo_exported_eagerly():
+    assert speftr.PEDPO is pedpo.PEDPO
+    assert speftr.PEDPOConfig is pedpo.PEDPOConfig
 
 
 @pytest.mark.parametrize(

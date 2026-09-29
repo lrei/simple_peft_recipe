@@ -20,8 +20,9 @@ computed and compared:
    adapts them when the MLP projections are targeted: the fused
    ``gate_up_proj`` for ``gate_proj``/``up_proj`` and ``down_proj`` for
    ``down_proj``, each adding ``r * num_experts * (in + out)``. These
-   expert parameters are counted in sft mode and not in rl mode, where
-   PERL adapts linear layers only; ``include_experts`` overrides that.
+   expert parameters are counted in sft mode and not in rl or dpo mode,
+   where PERL and PEDPO adapt linear layers only; ``include_experts``
+   overrides that.
 2. **Required parameters**: an estimate of how many parameters the
    dataset needs, from the capacity argument in "LoRA Without Regret"
    (Schulman and Thinking Machines Lab, 2025,
@@ -40,18 +41,24 @@ its claims:
   (``SFT_BITS_PER_TOKEN``, overridable with ``--bits_per_token``);
 - policy-gradient RL gets "only O(1) bits per episode"; its MATH example
   assumes one bit per completion (~10,000 problems x 32 samples = 320,000
-  bits) (``RL_BITS_PER_EPISODE``).
+  bits) (``RL_BITS_PER_EPISODE``). A DPO preference pair is one binary
+  label, so it is counted like an episode: one bit per pair
+  (``DPO_BITS_PER_PAIR``).
 
 So::
 
     sft: bits = trained_tokens * bits_per_token
     rl:  bits = episodes * 1,  episodes = prompts * num_generations * epochs
                                (or max_steps * completions_per_step)
+    dpo: bits = pairs * 1,     pairs = rows * epochs
+                               (or max_steps * pairs_per_step)
     required_parameters = bits / 2
     minimum_rank = ceil(required_parameters / parameters_per_rank)
 
 SFT epochs are ignored: repeating the same tokens adds no information. RL
-episodes are fresh samples, so they count every epoch.
+episodes are fresh samples, so they count every epoch. DPO pairs are
+counted every epoch as well, like RL episodes; the post does not cover
+DPO, so this is an assumption of this module.
 
 Dataset formats (SFT)
 ---------------------
@@ -126,8 +133,8 @@ Large datasets
 ``--sample_size N`` tokenizes N random rows (seed 0) and scales the count
 to the whole set; the report marks the result as extrapolated.
 ``--max_samples N`` instead limits the training set to its first N rows.
-RL mode only counts rows (any columns); with ``--max_steps`` no dataset is
-needed at all.
+RL and DPO modes only count rows (any columns); with ``--max_steps`` no
+dataset is needed at all.
 
 Limitations
 -----------
@@ -157,6 +164,9 @@ Examples:
             --response_part $'<|im_start|>assistant\n'
         uv run python -m speftr.lora_budget --mode rl \
             --model_name_or_path Qwen/Qwen3-0.6B --max_steps 500
+        uv run python -m speftr.lora_budget --mode dpo \
+            --model_name_or_path allenai/OLMo-2-0425-1B-SFT \
+            --dataset allenai/olmo-2-0425-1b-preference-mix
 
     Python::
 
@@ -186,6 +196,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 
 import torch
 
+from speftr.pedpo import PEDPOConfig
 from speftr.perl import PERLConfig, _language_model_targets
 
 
@@ -199,6 +210,7 @@ if TYPE_CHECKING:
 BITS_PER_PARAMETER: Final[float] = 2.0
 SFT_BITS_PER_TOKEN: Final[float] = 1.0
 RL_BITS_PER_EPISODE: Final[float] = 1.0
+DPO_BITS_PER_PAIR: Final[float] = 1.0
 SFT_DEFAULT_RANK: Final[int] = 8
 LOCAL_BUILDERS: Final[dict[str, str]] = {
     ".json": "json",
@@ -241,6 +253,8 @@ EPILOG: Final[str] = r"""examples:
       --instruction_part $'<|im_start|>user\n' \
       --response_part $'<|im_start|>assistant\n'
   %(prog)s --mode rl --model_name_or_path Qwen/Qwen3-0.6B --max_steps 500
+  %(prog)s --mode dpo --model_name_or_path allenai/OLMo-2-0425-1B-SFT \
+      --dataset allenai/olmo-2-0425-1b-preference-mix
 
 Without a column option the dataset format is detected: a messages or
 conversations column (conversational), prompt + completion columns
@@ -260,17 +274,19 @@ class LoraBudgetConfig:
     Attributes:
         model_name_or_path: Model id or local path (config and tokenizer).
         dataset: HF dataset id, local file or ``save_to_disk`` directory.
-            Optional only in rl mode with ``max_steps``.
+            Optional only in rl and dpo mode with ``max_steps``.
         dataset_config: HF dataset configuration name.
         split: Split to load (also selects from a saved ``DatasetDict``).
         data_files: Files or globs forwarded to ``datasets.load_dataset``.
-        mode: ``"sft"`` counts tokens, ``"rl"`` counts episodes.
-        lora_r: LoRA rank; ``None`` uses 8 for sft and PERL's for rl.
+        mode: ``"sft"`` counts tokens, ``"rl"`` counts episodes,
+            ``"dpo"`` counts preference pairs.
+        lora_r: LoRA rank; ``None`` uses 8 for sft, PERL's for rl and
+            PEDPO's for dpo.
         target_modules: Linear layer names to adapt; the MLP names also
             select the matching MoE expert parameters.
         include_experts: Count LoRA on fused MoE expert parameters;
             ``None`` counts them for sft (PESFT adapts them) and not for
-            rl (PERL does not).
+            rl or dpo (PERL and PEDPO do not).
         text_column: Plain-text column; every token is trained.
         messages_column: Message-list column.
         prompt_column: Columns joined into the user turn.
@@ -285,9 +301,11 @@ class LoraBudgetConfig:
         sample_size: Tokenize N random rows and extrapolate.
         bits_per_token: Information per trained token (sft).
         num_generations: Completions per prompt (rl).
-        num_train_epochs: Epochs (rl).
-        max_steps: Optimizer steps; overrides epochs (rl).
+        num_train_epochs: Epochs (rl, dpo); ``None`` uses PERL's for rl
+            and PEDPO's for dpo.
+        max_steps: Optimizer steps; overrides epochs (rl, dpo).
         completions_per_step: Completions per optimizer step (rl).
+        pairs_per_step: Preference pairs per optimizer step (dpo).
     """
 
     model_name_or_path: str = field(
@@ -303,7 +321,7 @@ class LoraBudgetConfig:
             "help": (
                 "HF dataset id, local .json/.jsonl/.parquet/.csv/.tsv/"
                 ".arrow/.txt file or save_to_disk directory. Optional in rl "
-                "mode with --max_steps."
+                "and dpo mode with --max_steps."
             )
         },
     )
@@ -330,11 +348,12 @@ class LoraBudgetConfig:
             )
         },
     )
-    mode: Literal["sft", "rl"] = field(
+    mode: Literal["sft", "rl", "dpo"] = field(
         default="sft",
         metadata={
             "help": (
-                "sft counts trained tokens, rl counts episodes (default: sft)."
+                "sft counts trained tokens, rl counts episodes, dpo counts "
+                "preference pairs (default: sft)."
             )
         },
     )
@@ -343,7 +362,8 @@ class LoraBudgetConfig:
         metadata={
             "help": (
                 f"LoRA rank (default: {SFT_DEFAULT_RANK} for sft, "
-                f"{PERLConfig.lora_r} for rl, as PESFT/PERL)."
+                f"{PERLConfig.lora_r} for rl, {PEDPOConfig.lora_r} for dpo, "
+                "as PESFT/PERL/PEDPO)."
             )
         },
     )
@@ -362,7 +382,7 @@ class LoraBudgetConfig:
                 "Count LoRA on fused MoE expert weights (gate_up_proj, "
                 "down_proj of an experts module) selected by the MLP "
                 "targets (default: true for sft, as PESFT/Unsloth adapts "
-                "them; false for rl, as PERL does not)."
+                "them; false for rl and dpo, as PERL and PEDPO do not)."
             )
         },
     )
@@ -466,9 +486,14 @@ class LoraBudgetConfig:
             )
         },
     )
-    num_train_epochs: int = field(
-        default=PERLConfig.num_train_epochs,
-        metadata={"help": f"Epochs (default: {PERLConfig.num_train_epochs})."},
+    num_train_epochs: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                f"Epochs (default: {PERLConfig.num_train_epochs} for rl, "
+                f"{PEDPOConfig.num_train_epochs} for dpo, as PERL/PEDPO)."
+            )
+        },
     )
     max_steps: int | None = field(
         default=None,
@@ -485,6 +510,20 @@ class LoraBudgetConfig:
             "help": (
                 "Completions per optimizer step, used with --max_steps "
                 f"(default: {PERLConfig.per_device_train_batch_size})."
+            )
+        },
+    )
+    pairs_per_step: int = field(
+        default=(
+            PEDPOConfig.per_device_train_batch_size
+            * PEDPOConfig.gradient_accumulation_steps
+        ),
+        metadata={
+            "help": (
+                "Preference pairs per optimizer step, used with "
+                "--max_steps (default: PEDPO's "
+                f"{PEDPOConfig.per_device_train_batch_size} x "
+                f"{PEDPOConfig.gradient_accumulation_steps})."
             )
         },
     )
@@ -524,9 +563,9 @@ class LoraBudgetConfig:
                 "Estimate whether a LoRA rank has the capacity for a "
                 "dataset. required_parameters = bits / 2 (2 bits per "
                 "parameter); sft bits = trained tokens x bits_per_token, "
-                "rl bits = episodes x 1. Constants from 'LoRA Without "
-                "Regret' (Schulman et al., 2025); the result is an "
-                "order-of-magnitude estimate."
+                "rl bits = episodes x 1, dpo bits = preference pairs x 1. "
+                "Constants from 'LoRA Without Regret' (Schulman et al., "
+                "2025); the result is an order-of-magnitude estimate."
             ),
             epilog=EPILOG,
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -548,6 +587,7 @@ class LoraBudget:
         data_format: Detected or chosen dataset format (sft only).
         trained_tokens: Tokens SFT trains on (sft only).
         episodes: Sampled completions over the run (rl only).
+        pairs: Preference pairs trained on over the run (dpo only).
         extrapolated: Whether ``trained_tokens`` was scaled up from a
             random sample.
         bits: Information the training run must absorb.
@@ -563,6 +603,7 @@ class LoraBudget:
     data_format: str | None
     trained_tokens: int | None
     episodes: int | None
+    pairs: int | None
     extrapolated: bool
     bits: float
     required_parameters: float
@@ -622,9 +663,8 @@ def _validate(config: LoraBudgetConfig, *, has_rows: bool) -> None:
     needs_rows = config.mode == "sft" or config.max_steps is None
     markers = (config.instruction_part, config.response_part)
     problems = {
-        "--dataset is required (optional only in rl with --max_steps)": (
-            needs_rows and not has_rows
-        ),
+        "--dataset is required (optional only in rl and dpo with "
+        "--max_steps)": (needs_rows and not has_rows),
         "--prompt_column and --response_column go together": (
             bool(config.prompt_column) != bool(config.response_column)
         ),
@@ -1373,7 +1413,7 @@ def rl_episodes(num_prompts: int, config: LoraBudgetConfig) -> int:
         num_prompts: Number of prompts in the training set.
         config: Estimate inputs with ``max_steps``,
             ``completions_per_step``, ``num_generations`` and
-            ``num_train_epochs``.
+            ``num_train_epochs`` (``None``: PERL's default).
 
     Returns:
         ``max_steps * completions_per_step`` when ``max_steps`` is set,
@@ -1381,7 +1421,30 @@ def rl_episodes(num_prompts: int, config: LoraBudgetConfig) -> int:
     """
     if config.max_steps is not None:
         return int(config.max_steps * config.completions_per_step)
-    return int(num_prompts * config.num_generations * config.num_train_epochs)
+    epochs = config.num_train_epochs
+    if epochs is None:
+        epochs = PERLConfig.num_train_epochs
+    return int(num_prompts * config.num_generations * epochs)
+
+
+def dpo_pairs(num_rows: int, config: LoraBudgetConfig) -> int:
+    """Count the preference pairs DPO trains on over the whole run.
+
+    Args:
+        num_rows: Number of preference pairs in the training set.
+        config: Estimate inputs with ``max_steps``, ``pairs_per_step``
+            and ``num_train_epochs`` (``None``: PEDPO's default).
+
+    Returns:
+        ``max_steps * pairs_per_step`` when ``max_steps`` is set,
+        otherwise ``num_rows * num_train_epochs``.
+    """
+    if config.max_steps is not None:
+        return int(config.max_steps * config.pairs_per_step)
+    epochs = config.num_train_epochs
+    if epochs is None:
+        epochs = PEDPOConfig.num_train_epochs
+    return int(num_rows * epochs)
 
 
 def required_parameters(bits: float) -> float:
@@ -1454,6 +1517,23 @@ def _sft_measure(
     return data_format, tokens, extrapolated
 
 
+def _default_rank(mode: str) -> int:
+    """Return the rank the matching trainer uses by default.
+
+    Args:
+        mode: ``"sft"``, ``"rl"`` or ``"dpo"``.
+
+    Returns:
+        8 for sft (PESFT), PERL's rank for rl, PEDPO's rank for dpo.
+    """
+    ranks: dict[str, int] = {
+        "sft": SFT_DEFAULT_RANK,
+        "rl": PERLConfig.lora_r,
+        "dpo": PEDPOConfig.lora_r,
+    }
+    return ranks[mode]
+
+
 def estimate_lora_budget(
     config: LoraBudgetConfig, dataset: Dataset | None = None
 ) -> LoraBudget:
@@ -1465,13 +1545,13 @@ def estimate_lora_budget(
             (``max_samples`` still applies).
 
     Returns:
-        Adapter size, trained tokens or episodes, required parameters and
-        minimum rank.
+        Adapter size, trained tokens, episodes or pairs, required
+        parameters and minimum rank.
     """
     rows = _training_rows(config, dataset)
     rank = config.lora_r
     if rank is None:
-        rank = SFT_DEFAULT_RANK if config.mode == "sft" else PERLConfig.lora_r
+        rank = _default_rank(config.mode)
     include_experts = config.include_experts
     if include_experts is None:
         include_experts = config.mode == "sft"
@@ -1481,10 +1561,15 @@ def estimate_lora_budget(
     if not include_experts:
         experts = 0
     adapter = linear + experts
-    data_format, tokens, episodes, extrapolated = None, None, None, False
+    data_format, tokens, extrapolated = None, None, False
+    episodes, pairs = None, None
+    num_rows = 0 if rows is None else len(rows)
     if config.mode == "rl":
-        episodes = rl_episodes(0 if rows is None else len(rows), config)
+        episodes = rl_episodes(num_rows, config)
         bits = episodes * RL_BITS_PER_EPISODE
+    elif config.mode == "dpo":
+        pairs = dpo_pairs(num_rows, config)
+        bits = pairs * DPO_BITS_PER_PAIR
     else:
         sft_rows = cast("Dataset", rows)
         data_format, tokens, extrapolated = _sft_measure(sft_rows, config)
@@ -1499,6 +1584,7 @@ def estimate_lora_budget(
         data_format=None if data_format is None else str(data_format),
         trained_tokens=tokens,
         episodes=episodes,
+        pairs=pairs,
         extrapolated=extrapolated,
         bits=bits,
         required_parameters=required,
@@ -1531,6 +1617,8 @@ def _print_report(config: LoraBudgetConfig, budget: LoraBudget) -> None:
     print(f"Rows:            {rows} ({config.mode})")
     if budget.episodes is not None:
         print(f"Episodes:        {budget.episodes:,} (1 bit per episode)")
+    elif budget.pairs is not None:
+        print(f"Pairs:           {budget.pairs:,} (1 bit per pair)")
     else:
         note = (
             f" (extrapolated from {config.sample_size:,} sampled rows)"

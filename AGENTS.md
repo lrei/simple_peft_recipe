@@ -40,15 +40,18 @@ each file must stay self-contained and readable.
 
 ```text
 speftr/
-  __init__.py   Public API. PERL imported eagerly; PESFT lazily via
-                __getattr__ so PERL users never import unsloth.
+  __init__.py   Public API. PERL and PEDPO imported eagerly; PESFT
+                lazily via __getattr__ so they never import unsloth.
   pesft.py      PESFTConfig + PESFT: supervised fine-tuning (Unsloth +
                 trl.SFTTrainer), display/save_parameters helpers.
   perl.py       PERLConfig + PERL: GRPO RL (transformers/peft +
                 trl.GRPOTrainer, optional colocated vLLM). No Unsloth.
+  pedpo.py      PEDPOConfig + PEDPO: DPO preference optimization
+                (transformers/peft + trl.DPOTrainer). No Unsloth.
   lora_budget.py  LoRA adapter size vs. the parameters a dataset needs
-                ("LoRA Without Regret"); CLI `python -m speftr.lora_budget`
-                and a Python API. No Unsloth.
+                ("LoRA Without Regret"; sft, rl and dpo modes); CLI
+                `python -m speftr.lora_budget` and a Python API. No
+                Unsloth.
 examples/       Usage examples only, runnable as modules
                 (`python -m examples.<pkg>.<script>`).
   README.md               Index; each example has its own README.md.
@@ -59,6 +62,8 @@ examples/       Usage examples only, runnable as modules
   intent/                 SFT intent classification on Banking77.
   text2sql/               SFT then GRPO with a SQLite execution reward.
   rgym/                   GRPO on reasoning-gym tasks via PERL.
+  prefs/                  DPO of OLMo 2 1B SFT via PEDPO; log-likelihood
+                          and RewardBench evaluation.
   big/                    4-bit SFT of Gemma 4 31B on one 24 GB GPU;
                           multi-GPU (torchrun, device_map) and Slurm.
   gptoss/                 4-bit SFT of gpt-oss 20b/120b (reasoning language).
@@ -76,8 +81,9 @@ scripts/        Standalone tooling (git hooks).
 
 Each `XConfig` is a dataclass with `from_args()` and `get_argument_parser()`.
 Trainer lifecycle: `X(config)` → `load_model()` → `train(...)` →
-`save_model()`. `PERL.set_pretrained_model()` continues training adapters
-from a previous stage.
+`save_model()`. `PERL.set_pretrained_model()` and
+`PEDPO.set_pretrained_model()` continue training adapters from a previous
+stage.
 
 ## Environment
 
@@ -141,8 +147,8 @@ hook that strips agent `Co-authored-by:` / `Made-with:` trailers).
   `TYPE_CHECKING` for annotations and imported inside functions at use time.
 - **Unsloth import order:** in SFT code and examples, `import unsloth`
   before `transformers`/`trl`/`peft` so its patches apply (keep
-  `# noqa: I001`). Never import unsloth from `perl.py` or at `speftr`
-  import time.
+  `# noqa: I001`). Never import unsloth from `perl.py`, `pedpo.py` or at
+  `speftr` import time.
 - Low cognitive complexity (complexipy ≤15): single-responsibility
   functions, small well-named helpers, no clever one-liners.
 - Clear names (`user_list`, not `l`). Don't duplicate code; search first.

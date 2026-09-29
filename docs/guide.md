@@ -2,7 +2,9 @@
 
 How to fine-tune your own models on your own data with `speftr`:
 supervised fine-tuning (`PESFT`), GRPO reinforcement learning (`PERL`),
-and what to do with the result. Defaults follow the recipe in the
+DPO preference optimization
+([`PEDPO`](#12-preference-optimization-pedpo-dpo)) and what to do with the
+result. Defaults follow the recipe in the
 [README](../README.md#the-recipe) and target one 24 GB GPU (RTX 3090).
 
 ## 1. Install and import
@@ -13,15 +15,16 @@ Linux + NVIDIA GPU (driver ≥ 580), Python 3.13/3.14, `uv`.
 |--------|-----|
 | Work in a clone (simplest) | `git clone https://github.com/lrei/simple_peft_recipe`, then `uv sync --extra rl`; put your scripts in the clone and run them with `uv run python my_script.py` |
 | Add to your uv project | `uv add "speftr[rl] @ git+https://github.com/lrei/simple_peft_recipe"`, and copy the `[tool.uv]`, `[[tool.uv.index]]` and `[tool.uv.sources]` blocks from this repo's `pyproject.toml`: uv does not inherit them from dependencies, and they hold the version overrides and the CUDA 13 torch index |
-| Copy the code | `speftr/pesft.py` and `speftr/perl.py` are self-contained |
+| Copy the code | `speftr/pesft.py`, `speftr/perl.py` and `speftr/pedpo.py` are self-contained |
 
 Extras: none for SFT only, `rl` for vLLM generation in `PERL`, `gym` for
 the reasoning-gym example.
 
 Imports:
 
-- `import speftr` / `from speftr import PERL, PERLConfig` never imports
-  Unsloth. `PESFT` and `PESFTConfig` are loaded lazily on first access.
+- `import speftr` / `from speftr import PERL, PERLConfig` (or `PEDPO`,
+  `PEDPOConfig`) never imports Unsloth. `PESFT` and `PESFTConfig` are
+  loaded lazily on first access.
 - Unsloth needs a GPU even to import, so SFT scripts cannot run on a
   CPU-only machine.
 - **In SFT scripts, `import unsloth` first**, before `datasets`,
@@ -509,6 +512,8 @@ Commands and validated outputs are in each README:
 [intent](../examples/intent/README.md#use-the-trained-model-without-speftr),
 [text2sql](../examples/text2sql/README.md#use-the-trained-model-without-speftr),
 [rgym](../examples/rgym/README.md#use-the-trained-model-without-speftr),
+[prefs](../examples/prefs/README.md#use-the-trained-model-without-speftr)
+(also prints the base model's reply),
 [big](../examples/big/README.md#use-the-trained-model-without-speftr).
 Copy the script next to your adapter and change the prompt builder.
 
@@ -581,12 +586,13 @@ Rendered by each model's own tokenizer:
 no weights downloaded) and estimates the size your dataset needs, using
 the capacity argument from "LoRA Without Regret" (about 2 bits per
 parameter; about 1 bit per trained SFT token; about 1 bit per RL
-episode). Treat it as an order-of-magnitude check.
+episode or DPO preference pair). Treat it as an order-of-magnitude check.
 
 ```text
 required_parameters = bits / 2
   sft: bits = trained_tokens * bits_per_token
   rl:  bits = prompts * num_generations * epochs  (or max_steps * batch)
+  dpo: bits = pairs * epochs                      (or max_steps * batch)
 minimum_rank = ceil(required_parameters / parameters_at_rank_1)
 ```
 
@@ -620,8 +626,8 @@ uv run python -m speftr.lora_budget --mode rl \
 - MoE models (gpt-oss, Qwen3 MoE, Gemma 4 26B-A4B): LoRA on the fused
   expert weights is counted in sft mode, as PESFT (Unsloth) adapts them
   (gpt-oss-20b at rank 1: 11,556,864, of which 11,059,200 on experts),
-  and not in rl mode, as PERL does not. `--include_experts true|false`
-  overrides this.
+  and not in rl or dpo mode, as PERL and PEDPO do not.
+  `--include_experts true|false` overrides this.
 
 From Python:
 
@@ -768,6 +774,120 @@ others (`CUDA_VISIBLE_DEVICES=0,1,2`) with `vllm_mode="server"`. To serve
 a merged model on several GPUs: `vllm serve <dir>
 --tensor-parallel-size N`.
 
+## 12. Preference optimization (`PEDPO`, DPO)
+
+Lifecycle: `PEDPO(config)` → `load_model()` (or
+`set_pretrained_model(model, tokenizer)`) → `train(train_dataset,
+eval_dataset=None, *, resume_from_checkpoint=None)` → `save_model()`.
+Plain transformers + peft + TRL's `DPOTrainer`; no Unsloth. Start from an
+instruction-tuned (SFT) model with a chat template.
+
+### DPO data contract
+
+A `datasets.Dataset` of preference pairs, in one of two layouts:
+
+- **explicit prompt**: `prompt`, `chosen`, `rejected`. Conversational:
+  `prompt` is a message list ending with the user turn, `chosen` and
+  `rejected` are `[{"role": "assistant", "content": ...}]`. Standard:
+  three strings (EOS is appended to `chosen` and `rejected`).
+- **implicit prompt**: only `chosen` and `rejected`, each a full
+  conversation that shares the same leading turns. TRL takes their
+  longest common prefix as the prompt
+  (e.g. `allenai/olmo-2-0425-1b-preference-mix`).
+
+Message lists are rendered with the tokenizer's chat template. Prompt +
+completion is truncated at the end to `max_length`; pairs whose
+completion is cut off entirely are dropped.
+
+### DPO config
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `model_name_or_path` | `allenai/OLMo-2-0425-1B-SFT` | An SFT model; a merged SFT checkpoint dir works |
+| `lora_r` / `lora_alpha` | 1 / 32 | A pair carries about 1 bit, like an RL episode ([rank](#7-checking-the-rank)) |
+| `learning_rate` | 5e-6 | constant; ~10× the ~5e-7 of full-model DPO (alignment-handbook QLoRA DPO) |
+| `beta` | 0.1 | Higher keeps the policy closer to the reference |
+| `loss_type` | `["sigmoid"]` | Any TRL DPO loss name(s); several are summed with equal weights |
+| `max_length` | 1024 | Prompt + completion tokens |
+| `per_device_train_batch_size` | 4 | Counted in **pairs**; each pair runs two sequences |
+| `gradient_accumulation_steps` | 4 | 16 pairs per optimizer step |
+| `num_train_epochs` / `max_steps` | 1 / -1 | |
+| `precompute_ref_log_probs` | `False` | See below |
+| `load_in_4bit` / `load_in_8bit` | `False` | QLoRA / LLM.int8 |
+| `use_gradient_checkpointing`, `optim`, `use_liger_kernel` | `"true"`, `adamw_8bit`, `False` | As in [Fitting in memory](#10-fitting-in-memory) |
+| `eval_strategy` / `save_strategy` | `"no"` / `"epoch"` | `train` evaluates once after training whenever an eval set is given |
+
+`PEDPOConfig.from_args()` / `get_argument_parser()` expose the main
+fields as CLI flags.
+
+### Reference model
+
+DPO scores the policy against a frozen reference: the model as it is when
+`train` starts. TRL copies the trainable adapter into a frozen adapter
+named `"ref"` and computes reference log-probabilities with it, so no
+second model is loaded; each step runs one extra forward pass without
+gradients.
+
+- After `load_model()` the new adapter is zero, so the reference is the
+  base (SFT) model.
+- After `set_pretrained_model()` (e.g. the in-process PESFT model) the
+  reference is that model, adapter included, and DPO keeps training the
+  same adapter. Its adapter must be named `"default"` (peft's name for
+  the first adapter).
+- `save_model()` writes only the trained adapter, not `"ref"`.
+
+As with [SFT then RL](#4-sft-then-rl), the simplest path from SFT is to
+save the SFT model merged and set `model_name_or_path` to it.
+
+### Precomputing reference log-probabilities
+
+`precompute_ref_log_probs=True` runs the reference over the whole train
+(and eval) set once before training and caches the results, so training
+steps run only the policy. With LoRA the reference shares the base
+weights, so this saves the per-step reference forward pass, not memory;
+for one epoch the total reference compute is the same, for several
+epochs it is paid once. `precompute_ref_batch_size` sets the batch of that
+pass (no gradients, so it can be larger than the training batch). Not
+available with `use_liger_kernel` or streaming (`IterableDataset`) data.
+
+### Rank
+
+```bash
+uv run python -m speftr.lora_budget --mode dpo \
+  --model_name_or_path allenai/OLMo-2-0425-1B-SFT \
+  --dataset allenai/olmo-2-0425-1b-preference-mix
+```
+
+`bits = pairs × epochs` (or `max_steps × pairs_per_step`), at 2 bits per
+parameter. Rank 1 on OLMo 2 1B is 753,664 parameters, room for ~1.5M
+pairs; the whole 378k-pair mix needs ~189k.
+
+### Example
+
+```python
+from datasets import load_dataset
+
+from speftr import PEDPO, PEDPOConfig
+
+pairs = load_dataset("allenai/olmo-2-0425-1b-preference-mix", split="train")
+pairs = pairs.select_columns(["chosen", "rejected"]).train_test_split(
+    test_size=500, seed=0
+)
+
+dpo = PEDPO(PEDPOConfig(max_steps=500, output_dir="./models/my-dpo"))
+dpo.load_model()
+dpo.train(pairs["train"], pairs["test"])
+dpo.save_model()  # LoRA adapter + tokenizer in ./models/my-dpo
+```
+
+[examples/prefs](../examples/prefs/README.md) runs this on 10,000 pairs
+with a held-out split, evaluates by log-likelihood and on RewardBench
+against AllenAI's full-model DPO, and measures time and memory with and
+without `precompute_ref_log_probs`.
+
+DDP works as for `PERL` (`torchrun --nproc_per_node N my_dpo.py`, each
+rank on its own GPU); it is not validated on multi-GPU hardware.
+
 ## Examples
 
 [examples/README.md](../examples/README.md) indexes the examples and
@@ -777,6 +897,7 @@ explains how to adapt one; each has its own README:
 [intent](../examples/intent/README.md),
 [text2sql](../examples/text2sql/README.md),
 [rgym](../examples/rgym/README.md),
+[prefs](../examples/prefs/README.md),
 [big](../examples/big/README.md),
 [gptoss](../examples/gptoss/README.md). Each also has an
 `<example>_inference.py` that uses the trained model without speftr

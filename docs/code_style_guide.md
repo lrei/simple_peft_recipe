@@ -46,7 +46,7 @@ Code should read top to bottom like the steps of the recipe.
 - **Unsloth import order matters.** In SFT code and examples,
   `import unsloth` must run before `transformers`, `trl` or `peft` so its
   patches apply; keep `# noqa: I001` where ruff would reorder. Never import
-  Unsloth from `perl.py` or at `speftr` import time.
+  Unsloth from `perl.py`, `pedpo.py` or at `speftr` import time.
 - Configs are dataclasses with `from_args()` and `get_argument_parser()`.
   A new field goes into the dataclass, its docstring `Attributes`, the
   parser (if exposed on the CLI) and the call that forwards it to TRL.

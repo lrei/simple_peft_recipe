@@ -1,0 +1,158 @@
+[
+  {
+    "chosen": [
+      {
+        "content": "Coffee. Book., stock photo, generate a one liner title",
+        "role": "user"
+      },
+      {
+        "content": "\"Serene Moments: Coffee and a Good Book\"",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "Coffee. Book., stock photo, generate a one liner title",
+        "role": "user"
+      },
+      {
+        "content": "\"Cozy Corner: A Blend of Espresso Wisdom and Pages Unfurled\"",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "gpt-4",
+    "rejected_model": "internlm/internlm2_5-7b-chat",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_80",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  },
+  {
+    "chosen": [
+      {
+        "content": "If a running time problem can be solved using bounding, the problem can also be solved using series.\n1. True\n2. False",
+        "role": "user"
+      },
+      {
+        "content": "2. False\n\nBounding is a technique used to estimate the solution to a problem or a function, often used in optimization problems. However, it's distinct from the application of series to solve problems. Series are often used to represent functions or to solve equations that otherwise might be difficult to solve analytically. Both techniques can be used in various contexts, but they are independent approaches and are not mutually interchangeable. Therefore, if a problem can be solved using bounding, it does not necessarily mean it can be solved using series.",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "If a running time problem can be solved using bounding, the problem can also be solved using series.\n1. True\n2. False",
+        "role": "user"
+      },
+      {
+        "content": "True",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "Qwen/Qwen2.5-3B-Instruct",
+    "rejected_model": "01-ai/Yi-34B-Chat",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_92",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  },
+  {
+    "chosen": [
+      {
+        "content": "Más palabras como determinación",
+        "role": "user"
+      },
+      {
+        "content": "¡Claro! Aquí tienes algunas palabras que son sinónimos o están relacionadas con \"determinación\":\n\n1. Resolución\n2. Firmeza\n3. Decisión\n4. Tenacidad\n5. Perseverancia\n6. Voluntad\n7. Constancia\n8. Empeño\n9. Coraje\n10. Valentía\n\nEstas palabras reflejan cualidades similares de fuerza de voluntad y persistencia.",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "Más palabras como determinación",
+        "role": "user"
+      },
+      {
+        "content": "Aquí van algunas palabras relacionadas con \"determinación\":\n\n1. Perseverancia\n2. Esfuerzo\n3. Firmeza\n4. Voluntad\n5. Compromiso\n6. Comunicación\n7. Coordinación\n8. Concentración\n9. Disciplina\n10. Dedicación\n11. Enfoque\n12. Enérgico\n13. Inspiración\n14. Motivación\n15. Obediencia\n16. Organización\n17. Principios\n18. Proactividad\n19. Progreso\n20. Resolución.",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "gpt-4",
+    "rejected_model": "allenai/tulu-2-13b",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_116",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  },
+  {
+    "chosen": [
+      {
+        "content": "Tarnsalte",
+        "role": "user"
+      },
+      {
+        "content": "I'm sorry, but the term you provided, \"Tarnsalte,\" doesn't seem to be a recognized word in English or any other widely spoken language. Could you please provide more context or check the spelling? This would help me understand what you're looking for and provide you with a more accurate and helpful response.",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "Tarnsalte",
+        "role": "user"
+      },
+      {
+        "content": "Tarnsalte is a Russian city, which is a part of the Kaliningrad Oblast, a federal subject of Russia. It is situated in the Nezvedinsky District. The city is known for being the location of Tarnopol Fortress, which was constructed in the 17th century, and is now a museum in Tarnopol City Museum. ",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "Qwen/Qwen2.5-7B-Instruct",
+    "rejected_model": "olmo2_1b_sft",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_175",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  },
+  {
+    "chosen": [
+      {
+        "content": "Transcribe \"AMONGUS\" to Ancient Greek characters.",
+        "role": "user"
+      },
+      {
+        "content": "In Ancient Greek, \"AMONGUS\" would be transcribed as \"ΑΜΟΝΓΟΥΣ\" or \"ΑΜΟΝΓΑς\".",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "Transcribe \"AMONGUS\" to Ancient Greek characters.",
+        "role": "user"
+      },
+      {
+        "content": "The word \"AMONGUS\" in Ancient Greek characters would be written as αμόνγος.",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "allenai/tulu-2-13b",
+    "rejected_model": "allenai/tulu-2-7b",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_235",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  },
+  {
+    "chosen": [
+      {
+        "content": "애플이 삼성 시가총액보다 6배나 더 큰데 어떻게 이렇게까지 차이가 날수가 있는거야? 를 영어로 번역",
+        "role": "user"
+      },
+      {
+        "content": "How can there be such a huge difference that Apple's market capitalization is six times larger than Samsung's?",
+        "role": "assistant"
+      }
+    ],
+    "rejected": [
+      {
+        "content": "애플이 삼성 시가총액보다 6배나 더 큰데 어떻게 이렇게까지 차이가 날수가 있는거야? 를 영어로 번역",
+        "role": "user"
+      },
+      {
+        "content": "Apple is six times bigger than Samsung's market capitalization, yet how could this gap have emerged?",
+        "role": "assistant"
+      }
+    ],
+    "chosen_model": "gpt-4",
+    "rejected_model": "numind/NuExtract-1.5",
+    "id": "allenai/olmo2-1b-wildchat-unused-on-policy_248",
+    "source": "allenai/olmo2-1b-wildchat-unused-on-policy"
+  }
+]

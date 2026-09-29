@@ -7,7 +7,9 @@ Fixtures are real rows (long fields trimmed) from:
 ``conversational_prompt_completion`` and ``standard_language_modeling``,
 ``HuggingFaceH4/llava-instruct-mix-vsft`` (messages only) and
 ``philschmid/guanaco-sharegpt-style`` and
-``HuggingFaceH4/Multilingual-Thinking``; all from the train split.
+``HuggingFaceH4/Multilingual-Thinking`` and
+``allenai/olmo-2-0425-1b-preference-mix`` (ODC-BY-1.0,
+olmo2_1b_preference_rows.json); all from the train split.
 ``gpt_oss_20b/config.json`` is the ``openai/gpt-oss-20b`` model config
 (Apache-2.0).
 """
@@ -28,6 +30,7 @@ from speftr.lora_budget import (
     LoraBudgetError,
     estimate_lora_budget,
 )
+from speftr.pedpo import PEDPOConfig
 from speftr.perl import PERLConfig
 from tests.conftest import FIXTURES_DIR
 
@@ -203,6 +206,48 @@ def test_rl_without_dataset_uses_max_steps():
 def test_rl_without_dataset_or_max_steps_is_rejected():
     with pytest.raises(LoraBudgetError, match="--dataset is required"):
         estimate_lora_budget(_config(mode="rl"))
+
+
+def test_dpo_pairs_from_rows_and_epochs():
+    config = _config(mode="dpo", num_train_epochs=3)
+    assert lora_budget.dpo_pairs(10_000, config) == 30_000
+
+
+def test_dpo_pairs_from_steps_override_epochs():
+    config = _parse(
+        *("--model_name_or_path", TINY_QWEN2),
+        *("--mode", "dpo", "--max_steps", "100"),
+        *("--pairs_per_step", "16"),
+    )
+    assert lora_budget.dpo_pairs(10_000, config) == 1_600
+
+
+def test_dpo_counts_one_bit_per_preference_pair():
+    rows = _fixture_dataset("olmo2_1b_preference_rows.json")
+    budget = estimate_lora_budget(_config(mode="dpo"), rows)
+    # 6 pairs x 1 epoch (PEDPO default), 1 bit each, 2 bits per parameter.
+    assert budget.rows == 6
+    assert budget.pairs == 6
+    assert budget.episodes is None
+    assert budget.trained_tokens is None
+    assert budget.required_parameters == 3
+    assert budget.rank == PEDPOConfig.lora_r
+    assert budget.sufficient
+
+
+def test_dpo_without_dataset_uses_max_steps_and_pedpo_batch():
+    budget = estimate_lora_budget(_config(mode="dpo", max_steps=100))
+    pairs_per_step = (
+        PEDPOConfig.per_device_train_batch_size
+        * PEDPOConfig.gradient_accumulation_steps
+    )
+    assert budget.rows is None
+    assert budget.pairs == 100 * pairs_per_step
+
+
+def test_dpo_without_dataset_or_max_steps_is_rejected():
+    with pytest.raises(LoraBudgetError, match="--dataset is required"):
+        estimate_lora_budget(_config(mode="dpo"))
 
 
 def test_responses_only_counts_assistant_tokens(qwen_tokenizer, load_fixture):
@@ -577,6 +622,21 @@ def test_main_rl_reports_episodes(monkeypatch, capsys):
     # 6 prompts x 8 generations x 2 epochs (PERL defaults).
     assert report["Episodes"] == "96 (1 bit per episode)"
     assert report["Required params"] == "48 (estimate: bits / 2)"
+    assert "Trained tokens" not in report
+
+
+def test_main_dpo_reports_pairs(monkeypatch, capsys):
+    report = _report(
+        monkeypatch,
+        capsys,
+        *("--dataset", "tests/fixtures/olmo2_1b_preference_rows.json"),
+        *("--mode", "dpo", "--num_train_epochs", "2"),
+    )
+    assert report["Adapter params"].endswith("(rank 1)")
+    assert report["Rows"] == "6 (dpo)"
+    assert report["Pairs"] == "12 (1 bit per pair)"
+    assert report["Required params"] == "6 (estimate: bits / 2)"
+    assert "Episodes" not in report
     assert "Trained tokens" not in report
 
 

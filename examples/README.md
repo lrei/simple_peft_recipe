@@ -1,9 +1,10 @@
 # Examples
 
 Each example uses `speftr` on a public dataset and is meant to be read
-and copied: it shows how to point `PESFT` (SFT) or `PERL` (GRPO) at data,
-a chat template and a reward. They are teaching code; their
-hyperparameters are not tuned for the best score. The library itself is
+and copied: it shows how to point `PESFT` (SFT), `PERL` (GRPO) or
+`PEDPO` (DPO) at data, a chat template and a reward or preference pairs.
+They are teaching code; their hyperparameters are not tuned for the best
+score. The library itself is
 documented in the [user guide](../docs/guide.md).
 
 Run every script from the repo root as a module, e.g.
@@ -22,6 +23,7 @@ without one.
 | `intent/` | `PESFT` multi-class classification (77 intents) with before/after evaluation on Banking77 | Granite 3.3 2B, bf16 | 11 GB | [README](intent/README.md) |
 | `text2sql/` | `PESFT` 4-bit SFT then `PERL` GRPO on the same adapters with a SQLite execution reward | SmolLM3-3B, 4-bit | ≤ 9 GB | [README](text2sql/README.md) |
 | `rgym/` | `PERL` GRPO with verifiable rewards on Reasoning Gym tasks, colocated vLLM, before/after accuracy | Qwen3 1.7B, bf16 | RTX 3090 24 GB (`gym` extra) | [README](rgym/README.md) |
+| `prefs/` | `PEDPO` rank-1 LoRA DPO of an SFT model on its preference mix; held-out preference accuracy and RewardBench implicit-reward accuracy vs AllenAI's full DPO model, no judge | OLMo 2 1B SFT, bf16 | 12.7 GB | [README](prefs/README.md) |
 | `big/` | `PESFT` on a model far larger than the GPU: 4-bit, batch 1 × grad-acc; DDP (`torchrun`), model splitting (`--device_map unsloth_balanced`), Slurm template (Dolly pirate) | Gemma 4 31B, 4-bit | RTX 3090 24 GB; DDP: 2× A100 40GB | [README](big/README.md) |
 | `gptoss/` | `PESFT` on an MoE reasoning model: harmony template, response-only loss on reasoning + answer, LoRA on every expert; eval loss and reasoning-language compliance base vs adapter; 120b split over GPUs (`--device_map unsloth_balanced`), Slurm template (Multilingual-Thinking) | gpt-oss 20b / 120b, 4-bit | 20b: 15.4 GiB (RTX 3090); 120b: 2× A100 40GB | [README](gptoss/README.md) |
 
@@ -41,22 +43,23 @@ general rules.
 Every training script has the same shape:
 
 1. **Config**: a `build_config` / `_build_config` function fills a
-   `PESFTConfig` or `PERLConfig`. Recipe defaults stay unless the task
-   needs otherwise; look here for the chat template, response-only
-   markers and batch size.
+   `PESFTConfig`, `PERLConfig` or `PEDPOConfig`. Recipe defaults stay
+   unless the task needs otherwise; look here for the chat template,
+   response-only markers and batch size.
 2. **Data**: a loader returns `datasets.Dataset` objects. Swap it for
    `load_dataset("json", data_files=...)` or your own source.
-3. **Formatting** (SFT) or **rewards** (RL): the task-specific
-   function. SFT examples render each row with the chat
-   template; RL examples build a `prompt` column and score completions.
+3. **Formatting** (SFT), **rewards** (RL) or **pairs** (DPO): the
+   task-specific part. SFT examples render each row with the chat
+   template; RL examples build a `prompt` column and score completions;
+   the DPO example passes `chosen`/`rejected` conversations as they are.
 4. **Lifecycle**: `load_model()` → `train(...)` → `save_model()`.
 
 To adapt one, pick the example closest to your task (classification:
 `guard` or `intent`; free-form answers: `instruct`; verifiable outputs:
-`text2sql` or `rgym`), then change the loader, the formatting or reward
-function and the model's chat-template markers. Print one formatted row
-before training to catch wrong markers. Each
-README ends with the concrete steps and pitfalls for that example.
+`text2sql` or `rgym`; preference pairs: `prefs`), then change the
+loader, the formatting or reward function and the model's chat-template
+markers. Print one formatted row before training to catch wrong
+markers. Each README ends with the concrete steps and pitfalls for that example.
 
 The LoRA rank is chosen with
 [`speftr.lora_budget`](../docs/guide.md#7-checking-the-rank), which
