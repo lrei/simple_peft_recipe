@@ -192,8 +192,11 @@ argparse parser (if exposed) and the call that forwards it to TRL.
   experts run every token through every expert (8x/32x expert memory on
   20b/120b). Fix: `eval_in_train_mode` (set in `examples/gptoss`);
   `gptoss_eval.py` does the same for its eval-loss pass.
-- Multi-GPU paths (PESFT DDP and `device_map="balanced"`, PERL DDP and
-  FSDP-QLoRA) are not validated on multi-GPU hardware.
+- PESFT model splitting (`device_map="unsloth_balanced"`) is validated
+  on 2× A100 40GB with gpt-oss-120b; PESFT DDP and PERL DDP/FSDP-QLoRA
+  are not validated on multi-GPU hardware.
+- Unsloth's 4-bit gpt-oss expert training is CPU-bound (a Python loop
+  over the experts): ~17–19% GPU utilization per GPU on 120b.
 - Native MXFP4 gpt-oss checkpoints (`openai/gpt-oss-*`) are not
   trainable: Unsloth has no MXFP4 backward and transformers marks MXFP4
   not trainable. Train on the Unsloth bnb-4bit conversion

@@ -4,7 +4,7 @@ LoRA SFT of gpt-oss on ``HuggingFaceH4/Multilingual-Thinking``: every
 row's system turn asks for a "reasoning language" and the assistant turn
 reasons (``thinking``) in that language before answering. The same
 script trains gpt-oss-20b on one GPU and gpt-oss-120b split over several
-(``--device_map balanced``); ``--model_name_or_path`` picks the model.
+(``--device_map unsloth_balanced``); ``--model_name_or_path`` picks the model.
 
 - The base is Unsloth's bitsandbytes 4-bit conversion
   (``unsloth/gpt-oss-*-unsloth-bnb-4bit``); OpenAI's MXFP4 checkpoints
@@ -24,7 +24,9 @@ Usage:
     uv run python -m examples.gptoss.gptoss
     CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss \
         --model_name_or_path unsloth/gpt-oss-120b-unsloth-bnb-4bit \
-        --device_map balanced --output_dir ./models/speftr-gptoss-120b
+        --device_map unsloth_balanced --per_device_train_batch_size 8 \
+        --gradient_accumulation_steps 2 --per_device_eval_batch_size 2 \
+        --output_dir ./models/speftr-gptoss-120b
 
 Memory, timings, results and Slurm: ``examples/gptoss/README.md``.
 """

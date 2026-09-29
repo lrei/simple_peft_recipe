@@ -5,9 +5,11 @@
 # MODE=ddp   (default) one process per GPU, each with a full model copy;
 #            needs the 4-bit model (~20 GB) to fit on every GPU.
 # MODE=split one process, the model's layers spread over all GPUs
-#            (--device_map balanced); for models too large for one GPU.
+#            (--device_map unsloth_balanced); for models too large for
+#            one GPU.
 #
-# Both modes are implemented but not yet validated on multi-GPU hardware.
+# Neither mode is validated for this model on multi-GPU hardware; model
+# splitting is validated with gpt-oss-120b (examples/gptoss).
 
 #SBATCH --job-name=speftr-big
 #SBATCH --account=<account>
@@ -40,6 +42,6 @@ if [ "$MODE" = "ddp" ]; then
         --gradient_accumulation_steps $((16 / NUM_GPUS)) \
         --output_dir "$OUTPUT_DIR"
 else
-    uv run python -m examples.big.big --device_map balanced \
+    uv run python -m examples.big.big --device_map unsloth_balanced \
         --output_dir "$OUTPUT_DIR"
 fi

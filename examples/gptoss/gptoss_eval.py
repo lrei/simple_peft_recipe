@@ -20,7 +20,9 @@ fixed train/eval split, the response-only markers and the channel parsing.
 Usage (``py3langid`` comes with the ``gptoss`` extra):
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval \\
-        --adapter_dir ./models/speftr-gptoss-120b --device_map balanced
+        --adapter_dir ./models/speftr-gptoss-120b \\
+        --device_map unsloth_balanced --batch_size 4 --max_new_tokens 128 \\
+        --num_rows 40
 
 Results and hardware: ``examples/gptoss/README.md``.
 """
@@ -236,8 +238,8 @@ def load_adapter(
 
     Args:
         adapter_dir: Directory written by ``PESFT.save_model("lora")``.
-        device_map: ``None`` for one GPU, or e.g. ``"balanced"`` to split
-            a model that does not fit one GPU.
+        device_map: ``None`` for one GPU, or e.g. ``"unsloth_balanced"``
+            to split a model that does not fit one GPU.
 
     Returns:
         The adapted model in inference mode and its tokenizer (harmony
@@ -415,8 +417,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device_map",
         default=None,
-        help="e.g. 'balanced' to split the model over all visible GPUs "
-        "(default: one GPU)",
+        help="e.g. 'unsloth_balanced' to split the model over all visible "
+        "GPUs (default: one GPU)",
     )
     parser.add_argument(
         "--batch_size",
@@ -433,6 +435,14 @@ def parse_args() -> argparse.Namespace:
         help="Tokens generated per prompt; the start of the reasoning is "
         "enough to identify its language (default: 320)",
     )
+    parser.add_argument(
+        "--num_rows",
+        type=int,
+        default=None,
+        help="Evaluate only the first N held-out rows (a random sample, "
+        "the split is shuffled); generation on gpt-oss-120b is slow "
+        "(default: all 100)",
+    )
     return parser.parse_args()
 
 
@@ -445,15 +455,21 @@ def main() -> None:
     """
     args = parse_args()
     _, eval_rows = load_splits()
+    if args.num_rows is not None:
+        eval_rows = eval_rows.select(range(args.num_rows))
     model, tokenizer = load_adapter(args.adapter_dir, args.device_map)
 
     with model.disable_adapter():
         base_loss = eval_loss(model, tokenizer, eval_rows)
         base_compliant = score_compliance(model, tokenizer, eval_rows, args)
+    # Printed before the adapter pass so a run cut short keeps the base
+    # numbers.
+    requested = eval_rows["reasoning_language"]
+    print(f"\nbase eval_loss {base_loss:.4f}")
+    print(f"base compliance {compliance_rates(requested, base_compliant)}")
     adapter_loss = eval_loss(model, tokenizer, eval_rows)
     adapter_compliant = score_compliance(model, tokenizer, eval_rows, args)
 
-    requested = eval_rows["reasoning_language"]
     base_rates = compliance_rates(requested, base_compliant)
     adapter_rates = compliance_rates(requested, adapter_compliant)
     counts = Counter(requested)

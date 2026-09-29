@@ -662,7 +662,7 @@ Recommended combinations:
 |-----------|---------|--------|
 | One 24 GB GPU | 16-bit up to ~4B; `load_in_4bit` above. From ~12B: batch 1 × `gradient_accumulation_steps`, `max_seq_length` ≤ 4096. Gemma 4 31B is about the limit ([examples/big](../examples/big/README.md)) | bf16 + colocated vLLM for small models; 4-bit without vLLM for larger ones (slow generation); lower batch and `max_completion_length`; Liger for models without final-logit soft-capping |
 | Model fits one A100 (40/80 GB) | bf16 LoRA, no quantization; more GPUs: DDP ([below](#11-multiple-gpus)) | bf16 + colocated vLLM; more GPUs: DDP |
-| Model does not fit one GPU | `load_in_4bit` first; else `device_map="balanced"` over several GPUs | FSDP-QLoRA over several GPUs |
+| Model does not fit one GPU | `load_in_4bit` first; else `device_map="unsloth_balanced"` over several GPUs | FSDP-QLoRA over several GPUs |
 
 Limits:
 
@@ -680,9 +680,11 @@ Limits:
 
 ## 11. Multiple GPUs
 
-All modes below are implemented but **not yet validated on multi-GPU
-hardware**. `examples/big` has a
-[Slurm template](../examples/big/big.sbatch).
+`PESFT` model splitting is validated on two A100 40GB with
+gpt-oss-120b; the other modes below are implemented but **not yet
+validated on multi-GPU hardware**. `examples/big` and `examples/gptoss`
+have Slurm templates ([big](../examples/big/big.sbatch),
+[gptoss](../examples/gptoss/gptoss.sbatch)).
 
 **`PESFT`, data parallel (DDP).** One process per GPU, each with a full
 model copy, so the model must fit one GPU. Launch your unchanged script:
@@ -697,9 +699,23 @@ Unsloth puts each process on its own GPU. Effective batch =
 parameters and writes files.
 
 **`PESFT`, one model split over GPUs.** For a model too large for one
-GPU even in 4-bit: `device_map="balanced"` (`--device_map balanced`) in a
-single process, **not** under torchrun. Layers run one GPU at a time, so
-it adds memory, not speed.
+GPU even in 4-bit: `device_map="unsloth_balanced"`
+(`--device_map unsloth_balanced`) in a single process, **not** under
+torchrun. It is Unsloth's planner: it reserves room for the output head
+and logits on the head's GPU and balances the rest; transformers'
+`"balanced"` splits the weights evenly without that reserve. Layers run
+one GPU at a time, so it adds memory, not speed.
+
+Measured with gpt-oss-120b (4-bit, LoRA rank 1 on attention and every
+expert, 2048 tokens) on two A100 40GB
+([examples/gptoss](../examples/gptoss/README.md#gpt-oss-120b-on-two-a100-40gb)):
+`unsloth_balanced` put 28 / 28 GiB of weights on the two GPUs
+(`"balanced"`: 27 / 33 GB). With micro-batch 8 × accumulation 2 one
+epoch of 57 steps trained in 34.7 min (~36 s per step) at a peak of
+36.0 / 36.8 GB; `"balanced"` with 4 × 4 took 57.3 min (~60 s per step)
+for the same losses. GPU utilization stays at ~17–19% per GPU: Unsloth's
+4-bit gpt-oss experts loop over the experts in Python on one CPU core,
+and the split layers run one GPU at a time.
 
 **`PERL`, DDP.** `torchrun --nproc_per_node N my_rl.py` (or
 `accelerate launch --num_processes N`). Each rank loads the whole model

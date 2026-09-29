@@ -22,7 +22,7 @@ Usage:
         --reasoning_language French --prompt "Why is the sky blue?"
     CUDA_VISIBLE_DEVICES=0,1 uv run python \\
         -m examples.gptoss.gptoss_inference \\
-        --adapter_dir ./models/speftr-gptoss-120b --device_map auto
+        --adapter_dir ./models/speftr-gptoss-120b --device_map unsloth_balanced
 
 See "Use the trained model without speftr" in ``examples/gptoss/README.md``.
 """
@@ -130,8 +130,9 @@ def load_adapter_model(
 
     Args:
         adapter_dir: Directory written by ``save_model("lora")``.
-        device_map: ``None`` for one GPU, or e.g. ``"auto"`` to spread a
-            model that does not fit one GPU over all visible GPUs.
+        device_map: ``None`` for one GPU, or e.g. ``"unsloth_balanced"``
+            to split a model that does not fit one GPU over all visible
+            GPUs.
 
     Returns:
         The adapted model in eval mode and the tokenizer saved with the
@@ -225,8 +226,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device_map",
         default=None,
-        help="'auto' spreads the model over all visible GPUs "
-        "(default: one GPU)",
+        help="'unsloth_balanced' splits the model evenly over all visible "
+        "GPUs (default: one GPU)",
     )
     parser.add_argument(
         "--prompt",

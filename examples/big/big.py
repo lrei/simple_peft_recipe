@@ -21,7 +21,7 @@ Usage:
     uv run python -m examples.big.big --max_steps 20 --eval_size 16
     torchrun --nproc_per_node 4 -m examples.big.big \
         --gradient_accumulation_steps 4
-    uv run python -m examples.big.big --device_map balanced
+    uv run python -m examples.big.big --device_map unsloth_balanced
 
 Memory, timings, multi-GPU and Slurm: ``examples/big/README.md``.
 """

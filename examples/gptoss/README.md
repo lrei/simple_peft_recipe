@@ -112,7 +112,7 @@ uv run python -m speftr.lora_budget \
 | Setting | Value | Why |
 |---------|-------|-----|
 | Learning rate, schedule | 2e-4, constant (PESFT defaults) | The cookbook also uses 2e-4; the recipe keeps it constant |
-| Batch | 4 × gradient accumulation 4 = 16 | The cookbook's effective batch; 57 optimizer steps per epoch |
+| Batch | 4 × gradient accumulation 4 = 16 (120b: 8 × 2) | The cookbook's effective batch; 57 optimizer steps per epoch |
 | Epochs | 1 | As the cookbook |
 | `--max_seq_length` | 2048 | As the cookbook; covers 95% of the rows |
 | `--router_aux_loss_coef` | 0.0 | The router is frozen; Unsloth's 4-bit gpt-oss fails with TRL's load-balancing loss (0.001 in `SFTConfig`) |
@@ -161,19 +161,27 @@ printed at the end:
 The 4-bit 120b weights (~58 GiB) do not fit one 40 GB GPU, so
 data-parallel training (a full copy per GPU, `torchrun`) is impossible
 there. Split the model instead: one process, no `torchrun`, layers
-spread over all visible GPUs, run one GPU at a time:
+spread over all visible GPUs, run one GPU at a time.
+`--device_map unsloth_balanced` is Unsloth's planner: it reserves room
+for the output head and its logits on the head's GPU and balances the
+rest; transformers' `balanced` splits the weights evenly without that
+reserve. Settings, memory and time for two A100 40GB:
+[Memory and time](#gpt-oss-120b-on-two-a100-40gb).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss \
     --model_name_or_path unsloth/gpt-oss-120b-unsloth-bnb-4bit \
-    --device_map balanced --per_device_eval_batch_size 2 \
+    --device_map unsloth_balanced \
+    --per_device_train_batch_size 8 --gradient_accumulation_steps 2 \
+    --per_device_eval_batch_size 2 \
     --output_dir ./models/speftr-gptoss-120b
 CUDA_VISIBLE_DEVICES=0,1 uv run --extra gptoss \
     python -m examples.gptoss.gptoss_eval \
-    --adapter_dir ./models/speftr-gptoss-120b --device_map balanced \
-    --batch_size 8
+    --adapter_dir ./models/speftr-gptoss-120b \
+    --device_map unsloth_balanced --batch_size 4 --max_new_tokens 128 \
+    --num_rows 40
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss_inference \
-    --adapter_dir ./models/speftr-gptoss-120b --device_map auto
+    --adapter_dir ./models/speftr-gptoss-120b --device_map unsloth_balanced
 ```
 
 ### Slurm
@@ -198,6 +206,8 @@ id or a local directory, not `openai/gpt-oss-120b`
 ([offline guide](../../docs/running_offline_models.md)).
 
 ## Memory and time
+
+### gpt-oss-20b on one RTX 3090
 
 Measured with gpt-oss-20b on one RTX 3090 (24 GB), the example
 defaults (batch 4 × accumulation 4, 2048 tokens, rank 1, `adamw_8bit`,
@@ -243,18 +253,38 @@ the batch halves the time. The adapter decodes at half the base's speed:
 its LoRA layers on all 768 expert projections add many small kernels
 per token.
 
-**gpt-oss-120b on two A100 40GB** (`--device_map balanced`, example
-defaults): training takes ~65 s per optimizer step with a peak of ~37 GB
-per GPU. The weights take ~58 GiB, ~29 GiB per GPU; split layers run
-one GPU at a time. Evaluation on two GPUs is not measured yet. Estimated
-from the 20b measurements, not measured: the ~10 GiB left on a 40 GB
-GPU next to 29 GiB of weights hold ~2 evaluation rows (2.3 GiB of
-logits each, same vocabulary as 20b), so use
-`--per_device_eval_batch_size 2`; generation needs up to ~0.5 GiB per
-prompt (logits as on 20b plus 4x the expert activations of 128
-experts), so use `gptoss_eval.py --batch_size 8`. If a GPU runs out of
-memory in training, lower `--per_device_train_batch_size` (and raise
-`--gradient_accumulation_steps` to keep 16) or use more GPUs.
+### gpt-oss-120b on two A100 40GB
+
+Measured on two A100-PCIE-40GB: one epoch (57 steps of 16 rows) on the
+900 training rows, example defaults otherwise (2048 tokens, rank 1 on
+attention and every expert), one evaluation after training at
+`--per_device_eval_batch_size 2`:
+
+| Setting | `balanced`, 4 × 4 | `unsloth_balanced`, 8 × 2 (recommended) |
+|---------|-------------------|-----------------------------------------|
+| 4-bit weights per GPU after loading | 27 / 33 GB | 28 / 28 GiB |
+| Peak GPU memory, GPU 0 / GPU 1 | 30.1 / 36.9 GB | 36.0 / 36.8 GB |
+| Time per optimizer step | ~60 s | ~36 s |
+| Training (57 steps) | 57.3 min | 34.7 min |
+| train_loss / final eval_loss | 1.019 / 0.925 | 1.019 / 0.925 |
+
+With `unsloth_balanced` the whole run takes 41 min: ~5 min loading,
+34.7 min training and 199 s for the final evaluation. Micro-batch
+16 × 1 runs out of memory.
+
+- **GPU utilization is ~17–19% per GPU.** Unsloth's 4-bit gpt-oss
+  experts loop over the 128 experts of each layer in Python, which keeps
+  one CPU core at 100%, and the split layers run one GPU at a time.
+  gpt-oss-20b on one GPU reaches 89%.
+- **Keep the experts in the LoRA targets.** `--lora_layers attention`
+  (8 × 2) has the same step time (36.5 s), a higher eval loss after 10
+  steps (1.159 vs 1.085 with the experts) and a higher peak (40.4 GB).
+- **`gptoss_eval.py`**: with `--device_map auto --batch_size 8`
+  generation ran out of memory on GPU 1 (40.2 GB) during prefill; use
+  `--device_map unsloth_balanced --batch_size 4`. Generation on 120b is
+  slow (~1 prompt per minute for the base model, ~0.7 for the adapter at
+  128 new tokens), so evaluate a subset: `--max_new_tokens 128
+  --num_rows 40` takes 90 min for base and adapter together.
 
 ## Results
 
@@ -286,6 +316,31 @@ overall     100    26%     100%
 The base model reasons in English whatever language is requested (it
 reads "reasoning language" as the language of the answer). After one
 epoch every held-out analysis channel is in the requested language.
+
+gpt-oss-120b, one epoch with the recommended two-GPU settings
+([above](#gpt-oss-120b-on-two-a100-40gb)): train_loss 1.019, final
+eval_loss 0.925. `gptoss_eval.py` on the saved adapter:
+
+`gptoss_eval.py` on the saved adapter, first 40 held-out rows,
+`--device_map unsloth_balanced --batch_size 4 --max_new_tokens 128
+--num_rows 40` (90 min on two A100 40GB, 34.6 GB peak per GPU):
+
+```text
+eval_loss  base 2.3001  adapter 0.9169
+
+Reasoning-language compliance (analysis channel)
+language   rows   base  adapter
+English       9   100%     100%
+French        7     0%     100%
+German        8     0%     100%
+Italian       8     0%     100%
+Spanish       8     0%     100%
+overall      40    22%     100%
+```
+
+The 120b base model behaves like the 20b one: it reasons in English
+whatever language is requested; with the adapter every analysis channel
+is in the requested language.
 
 ## Evaluation
 
@@ -379,7 +434,8 @@ answers in the language of the question.
   `unsloth/gpt-oss-*-unsloth-bnb-4bit` base it was trained on. vLLM
   LoRA needs a 16-bit base, and merging into OpenAI's MXFP4 or a 16-bit
   gpt-oss is not covered by this example.
-- **120b**: `--device_map auto` spreads the model over all visible GPUs.
+- **120b**: `--device_map unsloth_balanced` splits the model evenly over
+  all visible GPUs (the loader the eval script uses on 120b).
 
 ## Adapt it to your data or model
 

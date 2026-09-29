@@ -126,7 +126,9 @@ printed at the end (the per-flag help shows the `PESFTConfig` ones).
 
 ### Several GPUs
 
-Implemented but **not yet validated on multi-GPU hardware**.
+Neither mode is validated with this model on multi-GPU hardware. Model
+splitting is validated with gpt-oss-120b on two A100 40GB
+([examples/gptoss](../gptoss/README.md#gpt-oss-120b-on-several-gpus)).
 
 **Data parallel (DDP)**: one process per GPU, each with a full 4-bit
 copy (~20 GB, so every GPU needs 24 GB or more). Divide the accumulation
@@ -141,11 +143,13 @@ Only rank 0 writes files.
 
 **Model splitting**: one process, the layers spread over all visible
 GPUs, for GPUs too small for the whole model. It runs one GPU at a time,
-so it is no faster than one large GPU. Not under torchrun:
+so it is no faster than one large GPU. `unsloth_balanced` is Unsloth's
+planner, which reserves room for the output head and logits on the
+head's GPU; transformers' `balanced` does not. Not under torchrun:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.big.big \
-    --device_map balanced
+    --device_map unsloth_balanced
 ```
 
 ### Slurm
@@ -156,7 +160,7 @@ Hugging Face cache), download the model and dataset beforehand, then:
 
 ```bash
 sbatch examples/big/big.sbatch                  # DDP on all GPUs
-MODE=split sbatch examples/big/big.sbatch       # --device_map balanced
+MODE=split sbatch examples/big/big.sbatch       # --device_map unsloth_balanced
 ```
 
 It sets `HF_HUB_OFFLINE=1`: offline, Unsloth needs the `unsloth/` model

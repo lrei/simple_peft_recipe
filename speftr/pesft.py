@@ -31,7 +31,9 @@ Multi-GPU:
 
     A model that does not fit on one GPU can instead be split across all
     visible GPUs in a single process (no torchrun) with
-    ``device_map="balanced"``. Layers then run one GPU at a time.
+    ``device_map="unsloth_balanced"``: Unsloth's planner reserves room
+    for the output head and logits on the head's GPU, which transformers'
+    ``"balanced"`` does not. Layers then run one GPU at a time.
 """
 
 from __future__ import annotations
@@ -101,11 +103,11 @@ class PESFTConfig:
             LLM.int8). Slower than 4-bit and 16-bit; cannot be combined
             with ``load_in_4bit``.
         device_map: Passed to the model loader when set, e.g.
-            ``"balanced"`` to split one model's layers across all visible
-            GPUs in a single process, for models that do not fit on one
-            GPU. Not for torchrun/DDP, where Unsloth puts each process on
-            its own GPU (``cuda:LOCAL_RANK``). None keeps Unsloth's
-            placement.
+            ``"unsloth_balanced"`` to split one model's layers across all
+            visible GPUs in a single process, for models that do not fit
+            on one GPU. Not for torchrun/DDP, where Unsloth puts each
+            process on its own GPU (``cuda:LOCAL_RANK``). None keeps
+            Unsloth's placement.
         attn_implementation: Attention backend passed to the model loader.
             ``"sdpa"`` is fastest on a 3090; Unsloth's own default (flex
             attention) recompiles its block masks for every new sequence
@@ -347,9 +349,9 @@ class PESFTConfig:
             type=str,
             default=None,
             help=(
-                "Model placement, e.g. 'balanced' to split a model too "
-                "large for one GPU across all visible GPUs in one process. "
-                "Not for torchrun (default: Unsloth's placement)"
+                "Model placement, e.g. 'unsloth_balanced' to split a model "
+                "too large for one GPU across all visible GPUs in one "
+                "process. Not for torchrun (default: Unsloth's placement)"
             ),
         )
         model_group.add_argument(
