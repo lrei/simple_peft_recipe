@@ -134,9 +134,9 @@ Limitations
 The result is an order-of-magnitude estimate, not a guarantee: the bits
 per token of your data may be far below 1 (use your model's measured loss
 in bits with ``--bits_per_token``), and the post finds that LoRA past its
-capacity trains less efficiently rather than hitting a hard floor. The
-README recipe deliberately keeps more headroom (1 parameter per SFT token,
-minimum rank 8). Only the model config and tokenizer are downloaded; the
+capacity trains less efficiently rather than hitting a hard floor.
+PESFT's default rank 8 is a safe over-provisioned choice. Only the model
+config and tokenizer are downloaded; the
 dataset is loaded in full. Unsloth is not imported.
 
 Examples:

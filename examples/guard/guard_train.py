@@ -324,7 +324,7 @@ def main() -> None:
     with tokenizer_config_path.open("w") as handle:
         json.dump(tokenizer_config, handle, indent=2)
 
-    print(f"✓ Saved instruction: '{INSTRUCTION}'")
+    print(f"Saved instruction: '{INSTRUCTION}'")
 
 
 if __name__ == "__main__":

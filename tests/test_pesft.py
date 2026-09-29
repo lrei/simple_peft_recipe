@@ -291,7 +291,7 @@ def test_step_sync_warns_and_suggests_next_multiple(capsys):
     )
     assert "Warning" in out
     assert "not a multiple" in out
-    assert "e.g., 120" in out
+    assert "e.g. 120" in out
     assert "validated" not in out
 
 

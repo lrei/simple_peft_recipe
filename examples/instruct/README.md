@@ -82,7 +82,7 @@ You: Who was George Washington?
 Assistant: George washington was an american president of th' united states from 1789 until 1797. He was a key figure in th' founding of th' united states and played a critical role in th' development of th' new republic.
 ```
 
-Both scripts take `--help`. Key flags:
+Both scripts take `--help`. Main flags:
 
 | Script | Flag | Default |
 |--------|------|---------|
@@ -107,8 +107,8 @@ Both scripts take `--help`. Key flags:
 
 ## Hardware
 
-Runs on one RTX 3090 (24 GB) with plenty of headroom; Qwen3 0.6B 4-bit is
-a [validated model](../../docs/guide.md#validated-models). No timing has
+Runs on one RTX 3090 (24 GB); Qwen3 0.6B 4-bit is a
+[validated model](../../docs/guide.md#validated-models). No timing has
 been recorded for this example. One epoch at the defaults is about 890
 optimizer steps (14,260 training rows, effective batch 16).
 

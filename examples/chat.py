@@ -224,7 +224,7 @@ def main() -> None:
             user_input = user_input.strip()
 
             if not user_input:
-                print("Please enter a non-empty message or type 'exit'.")
+                print("Empty message; type a message or 'exit'.")
                 continue
 
             if user_input.lower() in {"exit", "quit"}:

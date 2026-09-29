@@ -3,7 +3,7 @@
 Tests protect behaviour that users and copied snippets rely on: config
 defaults that encode the recipe, argument parsing, length calculations,
 parameter serialization, reward functions, label extraction, and whether
-training actually runs and saves adapters. How to run them is in
+training runs and saves adapters. How to run them is in
 [development.md](development.md).
 
 ## Layout
@@ -49,7 +49,7 @@ def test_pesft_trains_and_saves_lora_adapters(tmp_path): ...
 model and dataset downloads. Keep them small enough for one RTX 3090.
 
 Code that imports Unsloth runs in a child interpreter (see
-`tests/test_pesft_cuda.py`) so `import unsloth` really happens before
+`tests/test_pesft_cuda.py`) so `import unsloth` runs before
 `transformers` and its patches do not leak into other tests.
 
 ## Real data

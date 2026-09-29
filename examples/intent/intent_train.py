@@ -17,7 +17,7 @@ Usage:
 
 Dataset: ``legacy-datasets/banking77`` (CC-BY-4.0). Model:
 ``ibm-granite/granite-3.3-2b-instruct`` (Apache-2.0).
-See ``examples/intent/README.md`` for the full walkthrough.
+Results and adaptation steps: ``examples/intent/README.md``.
 """
 
 from __future__ import annotations

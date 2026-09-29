@@ -67,7 +67,7 @@ def load_instruction_from_config(model_path: str, fallback: str) -> str:
             print(f"Using fallback instruction: '{fallback}'")
             return fallback
         instruction = str(config.get("instruction_prefix", fallback))
-        print(f"✓ Loaded instruction from config: '{instruction}'")
+        print(f"Loaded instruction from config: '{instruction}'")
         return instruction
 
     print(
@@ -164,7 +164,7 @@ def main() -> None:
             prompt = prompt.strip()
 
             if not prompt:
-                print("Please enter a non-empty prompt or type 'exit'.")
+                print("Empty prompt; type a prompt or 'exit'.")
                 continue
 
             if prompt.lower() in {"exit", "quit"}:

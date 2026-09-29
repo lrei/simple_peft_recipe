@@ -324,7 +324,7 @@ epoch every held-out analysis channel is in the requested language.
 
 gpt-oss-120b, one epoch with the recommended two-GPU settings
 ([above](#gpt-oss-120b-on-two-a100-40gb)): train_loss 1.019, final
-eval_loss 0.925. `gptoss_eval.py` on the saved adapter:
+eval_loss 0.925.
 
 `gptoss_eval.py` on the saved adapter, first 40 held-out rows,
 `--device_map unsloth_balanced --batch_size 4 --max_new_tokens 128
@@ -356,7 +356,7 @@ twice, with the adapter disabled (the base model) and enabled:
   masked as in training (Unsloth's `train_on_responses_only` with the
   example's markers) and cut at 2048 tokens. It equals the trainer's
   `eval_loss` for the same adapter.
-- **Reasoning-language compliance**, the check of the cookbook: generate
+- **Reasoning-language compliance**, the cookbook's check: generate
   greedily from the system and user turns, take the analysis channel,
   identify its language with `py3langid`, and count it as compliant when
   it is the requested one. Only the first 320 tokens are generated

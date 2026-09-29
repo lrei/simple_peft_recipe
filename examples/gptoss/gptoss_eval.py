@@ -7,9 +7,9 @@ should make the analysis channel follow the requested language. On the
 held-out rows (``load_splits``) this script reports, for the base model
 and for the adapter on the same 4-bit base:
 
-- **eval loss**: mean token loss on the assistant turn (analysis and
+- eval loss: mean token loss on the assistant turn (analysis and
   final channels), masked exactly as in training;
-- **reasoning-language compliance**: the share of generated analysis
+- reasoning-language compliance: the share of generated analysis
   channels whose language (``py3langid``) is the requested one, per
   language and overall. Only the start of the reasoning is generated
   (``--max_new_tokens``).

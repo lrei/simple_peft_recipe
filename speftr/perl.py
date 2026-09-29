@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """PERL: Parameter-Efficient Reinforcement Learning with LoRA.
 
-This module provides a reusable class-based interface for training language
-models with LoRA adapters using TRL's GRPOTrainer. The design follows
-HuggingFace's pattern of separating configuration from training logic.
+Trains LoRA adapters on a causal language model with transformers, peft and
+TRL's GRPOTrainer (no Unsloth). ``PERLConfig`` holds the settings; ``PERL``
+loads, trains and saves.
 
-Based on "LoRA without Regret" (Schulman et al., 2025) which found:
-- Very low ranks (even rank 1) work effectively for RL
-- Optimal learning rate is ~10x higher than full fine-tuning
-- Effective batch sizes should remain < 32
-- Train for 1 epoch (RL requires minimal capacity)
+Based on "LoRA without Regret" (Schulman et al., 2025), which found:
+- Low ranks, down to rank 1, work for RL
+- The best learning rate is ~10x that of full fine-tuning
+- Effective batch sizes should stay < 32
+- 1 epoch is enough (RL needs little adapter capacity)
 
 Reference: https://huggingface.co/docs/trl/main/en/lora_without_regret
 
@@ -169,10 +169,10 @@ def _language_model_targets(
 class PERLConfig:
     r"""Configuration for Parameter-Efficient Reinforcement Learning.
 
-    This dataclass contains all hyperparameters needed for GRPO training
-    with LoRA. Defaults based on "LoRA without Regret" (Schulman et al., 2025)
-    which recommends: rank 1, learning rate 10x higher than full fine-tuning,
-    effective batch sizes < 32, and 1 epoch of training.
+    Hyperparameters for GRPO training with LoRA. Defaults follow "LoRA
+    without Regret" (Schulman et al., 2025), which recommends rank 1, a
+    learning rate 10x that of full fine-tuning, effective batch sizes < 32
+    and 1 epoch of training.
 
     Fields are grouped as model and vLLM loading (``model_name_or_path``
     to ``vllm_enable_sleep_mode``), LoRA (``lora_r`` to
@@ -252,8 +252,8 @@ class PERLConfig:
     vllm_enable_sleep_mode: bool = True  # Sleep vLLM during optimization
 
     # LoRA configuration (RL-optimized per "LoRA without Regret")
-    lora_r: int = 1  # Very low rank works for RL!
-    lora_alpha: int = 32  # Standard alpha
+    lora_r: int = 1  # Rank 1 is enough for RL per the paper.
+    lora_alpha: int = 32
     use_gradient_checkpointing: str = "true"  # TRL-only mode
     target_modules: list[str] = field(
         default_factory=lambda: [
@@ -269,11 +269,11 @@ class PERLConfig:
 
     # GRPO training configuration
     output_dir: str = "./models/perl-reasoning"
-    num_train_epochs: int = 2  # Default: 2 epochs
+    num_train_epochs: int = 2
     max_steps: int = -1  # -1 = use num_train_epochs
     # Counted in completions: 8 = one prompt x ``num_generations``.
     per_device_train_batch_size: int = 8
-    per_device_eval_batch_size: int = 8  # Evaluation batch size
+    per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 1  # Default single prompt per update
     learning_rate: float = 1e-5
     weight_decay: float = 0.01
@@ -465,9 +465,9 @@ class PERLConfig:
 class PERL:
     """Parameter-Efficient Reinforcement Learning trainer.
 
-    This class encapsulates the complete GRPO training pipeline for
-    fine-tuning language models with LoRA adapters. It handles model
-    loading, LoRA setup, GRPO training, and model saving.
+    Loads a model with transformers and peft and attaches LoRA adapters
+    (or continues from ``set_pretrained_model``), trains with TRL's
+    GRPOTrainer, and saves the adapters or a merged model.
 
     Instances expose ``config`` (training configuration), ``model``
     (language model with LoRA adapters), ``tokenizer`` and ``trainer``
@@ -490,7 +490,6 @@ class PERL:
         Args:
             config: Fully specified reinforcement-learning configuration.
         """
-        # Import required modules
         from peft import LoraConfig, get_peft_model, PeftModel  # noqa: PLC0415, F401, I001
         from transformers import (  # noqa: PLC0415, F401
             AutoModelForCausalLM,
@@ -518,8 +517,7 @@ class PERL:
 
         Use this to continue training LoRA adapters from a previous stage
         (e.g., after supervised fine-tuning with PESFT) instead of loading
-        a new model. This allows seamless continuation of the same LoRA
-        adapters across different training stages.
+        a new model. GRPO then updates those same adapters.
 
         Args:
             model: Pre-trained model with LoRA adapters
@@ -539,17 +537,16 @@ class PERL:
         """
         self.model = model
         self.tokenizer = tokenizer
-        print("\n✓ Using pre-trained model from previous training stage")
+        print("\nContinuing from the model passed to set_pretrained_model")
 
     def load_model(
         self,
     ) -> tuple[PeftModel, PreTrainedTokenizerBase]:
-        """Load a merged model and attach RL-specific LoRA adapters.
+        """Load a base (or merged) checkpoint and attach new LoRA adapters.
 
         Returns:
             Tuple containing the PEFT-wrapped model and tokenizer.
         """
-        # Import required modules
         from peft import LoraConfig, get_peft_model, PeftModel  # noqa: PLC0415, F401, I001
         from transformers import (  # noqa: PLC0415, F401
             AutoTokenizer,
@@ -557,11 +554,10 @@ class PERL:
         )
 
         print(f"\nLoading model: {self.config.model_name_or_path}")
-        print("Using TRL-only mode (no Unsloth dependencies)")
 
         # Load merged model from disk. The model id is user-supplied (often
         # a local path), so pinning a Hub revision does not apply (B615).
-        print("  Loading merged model with transformers...")
+        print("  Loading with transformers (no Unsloth)...")
         model_class = _checkpoint_model_class(self.config.model_name_or_path)
         load_kwargs = {
             "dtype": torch.bfloat16,
@@ -619,11 +615,14 @@ class PERL:
             # even when the user does not supply explicit stop strings.
             self.config.stop_sequences = [tokenizer.eos_token]
 
-        print("✓ Model loaded successfully")
+        print("Model loaded.")
         return model, tokenizer
 
     def _calculate_max_lengths(self) -> tuple[int | None, int | None]:
-        """Derive sensible prompt/completion limits when unspecified.
+        """Fill in the prompt and completion limits that are unset.
+
+        An unset prompt limit is half of ``max_seq_length``; an unset
+        completion limit is ``max_seq_length`` minus the prompt limit.
 
         Returns:
             Pair of integers (or ``None``) representing ``max_prompt_length``
@@ -673,7 +672,6 @@ class PERL:
         Returns:
             Initialised ``GRPOConfig`` ready to hand to ``GRPOTrainer``.
         """
-        # Import required modules
         from trl import GRPOConfig  # noqa: PLC0415
 
         grad_accum = self.config.gradient_accumulation_steps
@@ -767,8 +765,7 @@ class PERL:
         Returns:
             vLLM ``generation_kwargs`` for ``GRPOConfig``.
         """
-        # CRITICAL: Set max_tokens for vLLM to respect
-        # max_completion_length
+        # vLLM stops at max_tokens, so it carries max_completion_length.
         generation_kwargs: dict[str, Any] = {}
         if max_completion_length is not None:
             generation_kwargs["max_tokens"] = max_completion_length
@@ -827,7 +824,6 @@ class PERL:
             None. Progress is logged to stdout and the underlying model is
             updated in-place.
         """
-        # Import required modules
         from trl import GRPOTrainer  # noqa: PLC0415
 
         if self.model is None or self.tokenizer is None:
@@ -849,9 +845,7 @@ class PERL:
         # Initialize GRPO trainer
         trainer_kwargs: dict[str, Any] = {
             "model": self.model,
-            # ``processing_class`` tells TRL how to tokenize prompts during
-            # sampling; handing it the tokenizer keeps the pipeline fully
-            # deterministic across training and evaluation.
+            # TRL tokenizes prompts and decodes completions with this.
             "processing_class": self.tokenizer,
             "reward_funcs": reward_funcs,
             "args": training_args,
@@ -862,8 +856,8 @@ class PERL:
             trainer_kwargs["eval_dataset"] = eval_dataset
 
         mem_before_trainer = torch.cuda.memory_allocated() / 1024**3
-        # Logging VRAM usage helps users see how much headroom GRPOTrainer
-        # consumes before the actual training loop begins.
+        # Shows how much GPU memory GRPOTrainer's setup takes before
+        # training starts.
         print(
             f"\nGPU memory before GRPOTrainer init: "
             f"{mem_before_trainer:.2f} GB"
@@ -883,7 +877,7 @@ class PERL:
         print("\nStarting GRPO training...")
         trainer.train()
 
-        print("\nGRPO training complete!")
+        print("\nGRPO training complete.")
 
     def save_model(self, save_method: str = "lora") -> None:
         """Persist the policy (adapters or merged weights) to disk.
@@ -923,4 +917,4 @@ class PERL:
             raise ValueError(msg)
         self.tokenizer.save_pretrained(output_dir)
 
-        print("✓ Model saved successfully")
+        print("Model saved.")

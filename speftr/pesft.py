@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """PESFT: Parameter-Efficient Supervised Fine-Tuning with LoRA.
 
-This module provides a reusable class-based interface for training language
-models with LoRA adapters using TRL's SFTTrainer. The design follows
-HuggingFace's pattern of separating configuration from training logic.
+Trains LoRA adapters on a causal language model with Unsloth and TRL's
+SFTTrainer. ``PESFTConfig`` holds the settings; ``PESFT`` loads, trains and
+saves.
 
 Example:
     Basic usage with default configuration:
@@ -63,21 +63,16 @@ if TYPE_CHECKING:
 class PESFTConfig:
     r"""Configuration for Parameter-Efficient Supervised Fine-Tuning.
 
-    This dataclass contains all hyperparameters needed for LoRA fine-tuning
-    with TRL's SFTTrainer. Defaults are based on the working configuration
-    of the guard example (``examples/guard/guard_train.py``).
+    Hyperparameters for LoRA fine-tuning with TRL's SFTTrainer. Defaults
+    come from the guard example (``examples/guard/guard_train.py``).
 
     Fields are grouped as model (``model_name_or_path`` to
     ``response_part``), LoRA (``lora_r`` to ``target_modules``), training
     (``output_dir`` to ``packing``) and other settings.
 
-    When train_on_responses=True, the model only learns from the
-    assistant's responses, not from the user's instructions. This is
-    useful for:
-
-    - Reducing overfitting to specific instruction formats
-    - Focusing learning on response generation quality
-    - Following best practices for instruction-following models
+    With ``train_on_responses=True`` the instruction tokens are masked and
+    the loss covers only the assistant's responses, so the model is not
+    trained to reproduce the instruction format.
 
     The instruction_part and response_part define the chat template
     markers that separate user instructions from model responses.
@@ -92,8 +87,8 @@ class PESFTConfig:
     - Qwen models (2.5, 3): instruction_part ``"<|im_start|>user\n"``,
       response_part ``"<|im_start|>assistant\n"``
 
-    Users must ensure these markers align with their model's chat
-    template format when enabling train_on_responses.
+    With ``train_on_responses`` set, the markers must match the model's
+    chat template.
 
     Attributes:
         model_name_or_path: HuggingFace model name or local path
@@ -378,8 +373,8 @@ class PESFTConfig:
                 "For Gemma models: '<start_of_turn>user\\n'. "
                 "For Llama models: "
                 "'<|start_header_id|>user<|end_header_id|>\\n\\n'. "
-                "For other models, specify manually based on your model's "
-                "chat template format. "
+                "For other models, copy the marker from the model's chat "
+                "template. "
                 "(default: <|im_start|>user\\n for Qwen ChatML)"
             ),
         )
@@ -393,8 +388,8 @@ class PESFTConfig:
                 "For Gemma models: '<start_of_turn>model\\n'. "
                 "For Llama models: "
                 "'<|start_header_id|>assistant<|end_header_id|>\\n\\n'. "
-                "For other models, specify manually based on your model's "
-                "chat template format. "
+                "For other models, copy the marker from the model's chat "
+                "template. "
                 "(default: <|im_start|>assistant\\n for Qwen ChatML)"
             ),
         )
@@ -430,9 +425,9 @@ class PESFTConfig:
             choices=["unsloth", "True", "False"],
             default="unsloth",
             help=(
-                "Gradient checkpointing option: 'unsloth' (use Unsloth's "
-                "optimized checkpointing), 'True' (enable standard "
-                "checkpointing), 'False' (disable checkpointing) "
+                "Gradient checkpointing: 'unsloth' (Unsloth's "
+                "checkpointing, offloads activations to CPU), 'True' "
+                "(standard checkpointing), 'False' (off) "
                 "(default: unsloth)"
             ),
         )
@@ -762,7 +757,7 @@ def save_parameters_to_json(
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
 
-    print(f"\n✓ Parameters saved to {output_path}")
+    print(f"\nParameters saved to {output_path}")
 
     return output_path
 
@@ -770,12 +765,10 @@ def save_parameters_to_json(
 class PESFT:
     """Parameter-Efficient Supervised Fine-Tuning trainer.
 
-    This class encapsulates the complete training pipeline for fine-tuning
-    language models with LoRA adapters using TRL's SFTTrainer. It handles
-    model loading, LoRA setup, training, evaluation, and model saving.
-
-    The design follows HuggingFace's pattern of separating configuration
-    (PESFTConfig) from training logic (PESFT class).
+    Loads a model with Unsloth, attaches LoRA adapters, trains and
+    evaluates with TRL's SFTTrainer, and saves the adapters or a merged
+    model. Lifecycle: ``PESFT(config)``, ``load_model()`` (``train`` calls
+    it when needed), ``train(...)``, ``save_model()``.
 
     Instances expose ``config`` (training configuration), ``model``
     (language model with LoRA adapters), ``tokenizer`` (with the chat
@@ -805,9 +798,8 @@ class PESFT:
         # telemetry thread holds its HTTP client lock deadlocks the child.
         hub_constants.HF_HUB_DISABLE_TELEMETRY = True
 
-        # Unsloth patches several Transformer internals during import. We do
-        # it first so later imports (transformers, trl, peft) see the patched
-        # implementations and automatically benefit from the speedups.
+        # Unsloth patches transformers, trl and peft internals on import, so
+        # it must be imported before them.
         import unsloth  # noqa: PLC0415
 
         # Unsloth wraps torch.__getattr__, so torch's own filter for these
@@ -843,7 +835,7 @@ class PESFT:
         The Hugging Face Trainer expects ``save_steps`` to be a multiple of
         ``eval_steps`` whenever ``load_best_model_at_end`` is enabled. When
         that relationship is broken the "best" checkpoint can lag behind
-        evaluation, so we emit an explicit warning for the user.
+        evaluation, so a warning is printed.
 
         Returns:
             None. The result of the check is printed to stdout.
@@ -863,21 +855,21 @@ class PESFT:
         # Check if save_steps is a multiple of eval_steps
         if save_steps % eval_steps != 0:
             print(
-                f"⚠️  Warning: save_steps ({save_steps}) is not a multiple of "
+                f"Warning: save_steps ({save_steps}) is not a multiple of "
                 f"eval_steps ({eval_steps})."
             )
             print(
-                "   This may cause issues with load_best_model_at_end=True "
-                "since checkpoints won't be saved at evaluation points."
+                "  load_best_model_at_end=True can then pick a best "
+                "evaluation step that has no saved checkpoint."
             )
             suggested = eval_steps * (save_steps // eval_steps + 1)
             print(
-                "   Consider adjusting save_steps to be a multiple of "
-                f"eval_steps (e.g., {suggested})."
+                "  Set save_steps to a multiple of eval_steps, "
+                f"e.g. {suggested}."
             )
         else:
             print(
-                f"✓ Step synchronization validated: save_steps ({save_steps}) "
+                f"Step synchronization validated: save_steps ({save_steps}) "
                 f"is a multiple of eval_steps ({eval_steps})"
             )
 
@@ -908,10 +900,9 @@ class PESFT:
 
         Returns:
             Tuple containing the PEFT-wrapped model and tokenizer. The
-            tokenizer is augmented with the requested chat template so
-            downstream formatting functions can rely on it.
+            tokenizer carries ``config.chat_template`` when one is set.
         """
-        # Import unsloth first to ensure optimizations are applied
+        # Unsloth before peft/transformers so its patches apply.
         from unsloth import FastLanguageModel  # noqa: PLC0415, I001
         from unsloth.chat_templates import get_chat_template  # noqa: PLC0415
         from peft import PeftModel  # noqa: PLC0415, F401
@@ -962,9 +953,9 @@ class PESFT:
         """Construct the ``trl.SFTConfig`` for this run.
 
         Returns:
-            SFTConfig populated from ``self.config``. Precision flags
-            (bf16/fp16) are inferred from the local hardware so users do not
-            have to remember the correct combination.
+            SFTConfig populated from ``self.config``. Precision follows the
+            GPU: bf16 where supported, otherwise fp16; both off without
+            CUDA.
         """
         from trl import SFTConfig  # noqa: PLC0415
 
@@ -1072,17 +1063,15 @@ class PESFT:
         training_args = self._build_training_arguments()
         self.training_args = training_args
 
-        # Log critical eval settings to verify configuration
-        print("\n=== Evaluation Configuration ===")
+        print("\nEvaluation settings:")
         print(
-            "per_device_eval_batch_size: "
+            "  per_device_eval_batch_size: "
             f"{training_args.per_device_eval_batch_size}"
         )
-        print(f"bf16: {training_args.bf16}")
-        print(f"fp16: {training_args.fp16}")
-        print("=" * 35)
+        print(f"  bf16: {training_args.bf16}")
+        print(f"  fp16: {training_args.fp16}")
 
-        # Import unsloth first to ensure optimizations are applied
+        # ``__init__`` imported unsloth, so trl is already patched.
         from trl import SFTTrainer  # noqa: PLC0415, I001
         from unsloth.chat_templates import train_on_responses_only  # noqa: PLC0415
 
@@ -1114,7 +1103,7 @@ class PESFT:
         # Apply train_on_responses_only if enabled
         if self.config.train_on_responses:
             print(
-                "\n🦥 Applying train_on_responses_only "
+                "\nApplying train_on_responses_only "
                 "(masking instruction tokens)..."
             )
             trainer = cast(
@@ -1126,14 +1115,10 @@ class PESFT:
                 ),
             )
             self.trainer = trainer
-            print("   ✓ train_on_responses_only applied successfully")
         else:
+            print("\nTraining on full sequences, instruction tokens included.")
             print(
-                "\n📝 Training on full sequence "
-                "(including instruction tokens)."
-            )
-            print(
-                "   Pass --train_on_responses with matching template markers "
+                "  Pass --train_on_responses with matching template markers "
                 "to mask instruction tokens during training."
             )
 
@@ -1186,7 +1171,7 @@ class PESFT:
             # The trained model is intact; free the evaluation's memory so
             # save_model() can still write the adapter.
             torch.cuda.empty_cache()
-            print(f"⚠ Evaluation ran out of GPU memory: {e}")
+            print(f"Warning: evaluation ran out of GPU memory: {e}")
             print(
                 "  The model is trained; save it, then evaluate with a "
                 "smaller per_device_eval_batch_size."
@@ -1195,9 +1180,9 @@ class PESFT:
     def _save_training_metadata(self) -> None:
         """Persist configuration and training arguments alongside artifacts.
 
-        Saving these files directly next to the adapters makes it trivial to
-        reproduce a run or understand its hyperparameters long after the
-        training job finished.
+        Writes ``speftr.json`` (the PESFT config) and ``training_args.json``
+        (the SFTConfig) next to the saved model, to reproduce or inspect the
+        run.
 
         Returns:
             None. Files are written to ``config.output_dir``.
@@ -1221,7 +1206,7 @@ class PESFT:
         serializable_args: dict[str, object] = dict(args_data)
         with args_path.open("w", encoding="utf-8") as handle:
             json.dump(serializable_args, handle, indent=2, sort_keys=True)
-        print(f"✓ Training arguments saved to {args_path}")
+        print(f"Training arguments saved to {args_path}")
 
     def save_model(
         self,
@@ -1277,6 +1262,6 @@ class PESFT:
                 self.tokenizer,
                 save_method=save_method,
             )
-            print("✓ Merged model saved successfully")
+            print("Merged model saved.")
 
         self._save_training_metadata()

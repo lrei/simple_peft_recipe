@@ -129,7 +129,7 @@ def load_instruction_from_config(model_path: str, fallback: str) -> str:
         return fallback
 
     instruction = str(config.get("instruction_prefix", fallback))
-    print(f"✓ Loaded instruction from config: '{instruction}'")
+    print(f"Loaded instruction from config: '{instruction}'")
     return instruction
 
 

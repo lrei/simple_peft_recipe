@@ -114,22 +114,36 @@ The RL stage samples with transformers (`use_vllm=False`, set in
 - vLLM runs SmolLM3 through its Transformers backend, which wraps the same
   transformers class that is being trained; colocated training then fails.
 
-With 128-token completions, transformers sampling is fast enough (3.5
+With 128-token completions, transformers sampling is fast enough (3.7
 s/step).
 
-The SFT stage uses LoRA rank 8 (15.1M adapter parameters). Its ~2.2M
-response tokens need ~1.08M parameters, so rank 1 would suffice
-([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)). The
-command below renders SmolLM3's default template, without the empty
-think block `enable_thinking=False` adds, and prints ~0.92M:
+Both stages use LoRA rank 1, alpha 32, on all attention and MLP
+projections: 1,889,280 adapter parameters
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)).
 
-```bash
-uv run python -m speftr.lora_budget \
-    --model_name_or_path HuggingFaceTB/SmolLM3-3B \
-    --dataset b-mc2/sql-create-context --split "train[:-800]" \
-    --prompt_column context question --response_column answer \
-    --responses_only
-```
+- **SFT.** The 77,777 training rows, rendered as `text2sql_sft` renders
+  them, have 2.15M response tokens, which need ~1.07M parameters: rank 1
+  suffices. The command below renders SmolLM3's default template,
+  without the empty think block `enable_thinking=False` adds, and
+  prints ~0.92M:
+
+  ```bash
+  uv run python -m speftr.lora_budget \
+      --model_name_or_path HuggingFaceTB/SmolLM3-3B \
+      --dataset b-mc2/sql-create-context --split "train[:-800]" \
+      --prompt_column context question --response_column answer \
+      --responses_only --lora_r 1
+  ```
+
+- **GRPO.** The RL stage keeps training the SFT adapter, so it is rank 1
+  too. 150 steps × 16 completions are 2,400 episodes, which need ~1,200
+  parameters (1 bit per episode): rank 1 suffices.
+
+  ```bash
+  uv run python -m speftr.lora_budget --mode rl \
+      --model_name_or_path HuggingFaceTB/SmolLM3-3B \
+      --max_steps 150 --completions_per_step 16
+  ```
 
 ## Run
 
@@ -140,7 +154,7 @@ Unsloth):
 # 1. Base model score
 uv run python -m examples.text2sql.text2sql_eval \
   --model_path HuggingFaceTB/SmolLM3-3B
-# 2. SFT (the measured run used 300 steps)
+# 2. SFT (300 steps, as in Results)
 uv run python -m examples.text2sql.text2sql_sft --max_steps 300
 # 3. Score the SFT adapters (default --model_path)
 uv run python -m examples.text2sql.text2sql_eval
@@ -159,7 +173,7 @@ Key flags (`--help` lists all):
 | | `--load_in_4bit` / `--no-load_in_4bit` | on |
 | | `--max_steps` / `--num_epochs` | -1 (use epochs) / 1 |
 | | `--per_device_batch_size` | 16 |
-| | `--lora_r`, `--learning_rate` | 8, 2e-4 |
+| | `--lora_r`, `--learning_rate` | 1, 2e-4 |
 | | `--eval_rows` | 300 |
 | | `--output_dir` | `./models/smollm3-3b-sql-sft` |
 | `text2sql_rl` | `--model_name_or_path` | `./models/smollm3-3b-sql-sft` (SFT adapter directory) |
@@ -175,19 +189,19 @@ Fixed in code: `max_seq_length` 1024 (both stages), GRPO
 
 ## Results
 
-One RTX 3090, 4-bit base, LoRA r=8, 490 held-out questions:
+One RTX 3090, 4-bit base, LoRA r=1, 490 held-out questions:
 
 | Model | Exact match | Execution accuracy | Valid SQL |
 |-------|-------------|--------------------|-----------|
-| Base | 0.471 | 0.637 | 0.943 |
-| SFT (300 steps, batch 16) | 0.761 | 0.839 | 0.996 |
-| + GRPO (150 steps, 16 completions/step) | 0.792 | 0.867 | 0.994 |
+| Base | 0.469 | 0.633 | 0.933 |
+| SFT (300 steps, batch 16) | 0.749 | 0.835 | 0.992 |
+| + GRPO (150 steps, 16 completions/step) | 0.773 | 0.863 | 0.996 |
 
-| Stage | Speed | Time | Peak VRAM |
-|-------|-------|------|-----------|
-| SFT | 1.0 s/step | 5 min | 5.8 GB (nvidia-smi) |
-| GRPO | 3.5 s/step | 9 min | 3.0 GB (torch), 5.3 GB (nvidia-smi) |
-| Evaluation (bf16) | | under 1.5 min | 6.7 GB (torch), 8.4 GB (nvidia-smi) |
+| Stage | Speed | Time | End of training | Peak VRAM |
+|-------|-------|------|-----------------|-----------|
+| SFT | 1.0 s/step | 5 min | train loss 0.031, eval loss 0.043 | 5.7 GB (nvidia-smi) |
+| GRPO | 3.7 s/step | 9 min | mean reward 0.84 (steps 141–150) | 3.7 GB (torch), 5.3 GB (nvidia-smi; brief peaks to 8.8 GB) |
+| Evaluation (bf16) | | under 2 min | | 6.6 GB (torch), 8.4 GB (nvidia-smi) |
 
 ## Outputs
 
@@ -241,8 +255,8 @@ tokenizer and `chat_template.jinja`. It loads without peft, like any Hub
 checkpoint (`AutoModelForCausalLM`, `pipeline`, `vllm serve
 ./models/smollm3-3b-sql-sft-merged`).
 
-Both routes gave the same queries with both engines; the GRPO command
-printed `SELECT COUNT(*) FROM singer WHERE age > 30` twice. The
+Both routes give the same queries with both engines; the GRPO command
+prints `SELECT COUNT(*) FROM singer WHERE age > 30` twice. The
 transformers run takes about 1 min and 6.5 GB of VRAM; vLLM reserves 80%
 of the GPU whatever the model size and starts one engine per route
 (about 3 min per run in total).
@@ -278,8 +292,9 @@ training](../../docs/guide.md#5-after-training).
    ([marker table](../../docs/guide.md#chat-templates-and-markers)), and
    change `CHAT_TEMPLATE_KWARGS` (`enable_thinking` is SmolLM3/Qwen
    specific).
-6. **Rank (SFT).** Rerun the [`speftr.lora_budget` command](#model) with
-   your model, dataset and columns
+6. **Rank.** Rerun the [`speftr.lora_budget` commands](#model) with your
+   model, dataset and columns (SFT) and your GRPO steps and completions
+   per step (RL); the SFT rank is the pipeline's rank
    ([guide](../../docs/guide.md#7-checking-the-rank)).
 7. **Faster RL.** For a model vLLM supports natively, save the SFT stage
    merged (`save_method="merged_16bit"`) and start a bf16 RL run from the

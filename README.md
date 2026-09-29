@@ -7,29 +7,26 @@
 Parameter-Efficient Fine-Tuning (PEFT) is a set of techniques that adapt large
 pretrained models to new tasks by updating only a small fraction of their
 parameters. Instead of retraining the entire model, PEFT learns
-small update parameters, achieving comparable performance with drastically
-reduced compute, memory, and storage requirements.
+small update parameters and reaches comparable performance with much less
+compute, memory and storage.
 
 When resources are limited (few GPUs, little time, or a small team),
-extensive experimentation isn’t practical. A well-tested “recipe” for PEFT
-provides a reliable starting point that works across common settings without
-exhaustive tuning. It captures best practices, stable defaults, and proven
-configurations so users can focus on their data, task, and getting results
-quickly rather than parameter sweeps. In short, a good recipe turns PEFT from
-a research challenge into more of an accessible, repeatable engineering process.
+extensive experimentation isn't practical. A tested "recipe" for PEFT is a
+starting point that works across common settings without tuning: it fixes
+the defaults and configurations so users can spend their time on the data
+and task instead of parameter sweeps.
 
 LoRA is our primary PEFT method: we freeze the base model and learn low-rank
 updates. It can match the quality of "full fine-tuning" (FullFT) with far fewer
-trainable parameters, resulting in lower memory/compute, faster training, and
-minimal storage overhead. LoRA adapters are tiny, swappable files that can be
-merged into the base weights for zero-overhead inference or loaded at runtime
-(e.g., in vLLM) to avoid altering the base model, allowing hot-swapping
-multiple adapters.
+trainable parameters, so it needs less memory and compute, trains faster and
+stores little. LoRA adapters are small files that can be merged into the base
+weights (no inference overhead) or loaded at runtime (e.g., in vLLM) without
+altering the base model, which allows hot-swapping multiple adapters.
 
-GRPO (Group Relative Policy Optimization) is a lightweight reinforcement
-learning (RL) method -- in our opinion, the simplest and easiest for
-fine-tuning a language model. At its simplest, it doesn't require a
-frozen reference model or KL term, making it preferable for PEFT.
+GRPO (Group Relative Policy Optimization) is a reinforcement learning (RL)
+method; in our opinion, the simplest one for fine-tuning a language model.
+In its simplest form it needs no frozen reference model or KL term, which
+suits PEFT.
 
 We assume the end user is GPU-limited and tuned the defaults for
 a single consumer grade GPU (target: the Nvidia 3090) rather than
@@ -37,25 +34,22 @@ multi-gpu server setups (e.g. the prototypical 8xH100).
 
 ### Sources
 
-The PEFT recipe presented in this codebase revolves around LoRA.
-The main sources for this recipe are:
+The recipe is built around LoRA. Its main sources are:
 
 - LoRA Without Regret by John Schulman and Thinking Machines Lab (and references)
 - LoRA Hyperparameters Guide by Unsloth (and references)
 - Hugging Face TRL GRPO Trainer documentation (and references)
 
-These are themselves partially based on previously published research.
-Other resources have contributed as well as some experimentation.
-You can find more information in the Bibliography section.
-
-In certain cases we deviate slightly from any one source.
+These build on earlier published research. Other resources and our own
+experiments contributed; see the Bibliography section. In some cases the
+recipe deviates slightly from any one source.
 
 ## The Recipe
 
-- **Apply LoRA to ALL layers.**
+- **LoRA targets**: all layers.
 - **Scaling factor**: $\alpha = 32$ (standard practice).
-- **Learning rate schedule**: Constant or Constant with warmup.
-- **Relatively High Learning Rates**: around 1e-4 for SFT and 1e-5 for RL.
+- **Learning rate schedule**: constant or constant with warmup.
+- **Learning rate**: relatively high, around 1e-4 for SFT and 1e-5 for RL.
 - **Warmup**: 0 by default (reasonable to have up to 10% of steps)
 - **Batch Size**:
   - 16 or 32 for SFT;
@@ -70,21 +64,26 @@ In certain cases we deviate slightly from any one source.
   FlashAttention-class kernels and are several times slower on a 3090.
 
 For GRPO, we default to colocated vLLM with GPU memory utilization limited to
-0.5. For the examples, vLLM sleep mode was used.
+0.5. The examples use vLLM sleep mode.
 
 ### Rank Selection
 
-- **Choose rank based on dataset size and capacity requirements**:
-  - Higher ranks needed for larger datasets
-  - Easy starting rule-of-thumb:
-    - 1 parameter per token in SFT;
-    - 1 parameter per example in RL;
-    - Minimum LoRA rank of 8.
+The rank follows "LoRA Without Regret": LoRA stores about 2 bits of
+information per parameter, SFT data carries about 1 bit per trained token
+and RL about 1 bit per episode, so an adapter needs roughly
+`trained tokens / 2` (SFT) or `episodes / 2` (RL) parameters.
 
-This is considerably more than "LoRA Without Regret" but in our experience,
-it makes things work well with minimum sweeps/tuning.
-Note: I believe current implementation of unsloth doesn't support going below
-lora rank 8.
+- Rank is the only capacity knob, in powers of two (1, 2, 4, 8, ...).
+  Pick the smallest rank that covers the data; `speftr.lora_budget`
+  computes it.
+- A rank below what the data needs trains less efficiently. A rank above
+  it costs compute and memory; LoRA Without Regret measures no quality
+  loss, while Unsloth's guide warns of overfitting at very large ranks.
+- Defaults: rank 8 for SFT, a safe over-provisioned choice (the smallest
+  rank Unsloth's hyperparameter guide suggests); rank 1 for RL.
+
+The examples use rank 1 (gptoss, rgym, text2sql) and rank 8 (guard,
+intent, instruct, big); each README gives its budget.
 
 #### Checking a rank against a dataset
 
@@ -93,11 +92,10 @@ lora rank 8.
 
 ### Caveats
 
-At the moment we don't officially support fine-tuning of input embeddings or
-the output head. This means models will not learn to use tokens they have
-not been trained on. This can be an issue if there is a mismatch with the
-chosen template - e.g. using ChatML tokens with a model that hasn't been
-pretrained to use it.
+Fine-tuning the input embeddings or the output head is not supported, so
+models do not learn to use tokens they were not trained on. This is a problem
+when the chosen template does not match the model, e.g. ChatML tokens with a
+model not pretrained on them.
 
 ## Installation
 
@@ -117,10 +115,10 @@ uv sync --extra gym              # + reasoning-gym (RL example; includes rl)
 uv sync --all-extras --group dev # everything, plus the quality tooling
 ```
 
-The versions are pinned in `uv.lock`. The project deliberately runs newer
-transformers/TRL than the released unsloth declares, which is what makes
-Gemma 4 and Qwen 3.5/3.8 usable. transformers is held at 5.13.1 because
-vLLM 0.26 cannot read the per-layer Gemma 4 configs of later releases.
+The versions are pinned in `uv.lock`. The project runs newer transformers/TRL
+than the released unsloth declares; Gemma 4 and Qwen 3.5/3.8 need them.
+transformers is held at 5.13.1 because vLLM 0.26 cannot read the per-layer
+Gemma 4 configs of later releases.
 
 ### Development
 
@@ -137,14 +135,13 @@ copy parts of the files, or use TRL directly with the parameter values.
 The `examples/` directory only shows the library in use on a few public
 datasets; it is not part of the library.
 
-The `PESFT` and `PERL` classes are minor wrappers around Hugging Face's TRL.
-Their configuration classes expose the parameters that a typical user would
-want or need to change, with defaults for all of them from the above
-"Recipe". `PESFT` uses Unsloth, which is faster and more convenient here.
-`PERL` (GRPO) does not: the Unsloth version gave no obvious benefit and came
-with a few more issues.
+The `PESFT` and `PERL` classes are thin wrappers around Hugging Face's TRL.
+Their configuration classes expose the parameters a typical user changes,
+with defaults from the "Recipe" above. `PESFT` uses Unsloth, which is faster
+here. `PERL` (GRPO) uses plain transformers and peft: Unsloth's GRPO path
+shows no clear benefit and has more issues.
 
-**[docs/guide.md](docs/guide.md)** is the user guide: data formats,
+[docs/guide.md](docs/guide.md) is the user guide: data formats,
 formatting and reward functions, configuration, SFT then RL, loading and
 serving the result, validated models and troubleshooting. To run without
 Hub access, see [docs/running_offline_models.md](docs/running_offline_models.md).
@@ -176,9 +173,9 @@ GPU (see [Installation](#installation)).
 
 ## Future Work
 
-- More & Better examples.
+- More and better examples.
 - Quantized reinforcement learning support.
-- Easy support for fine-tuning input embeddings and LM output head.
+- Support for fine-tuning the input embeddings and the LM output head.
 
 ## Bibliography
 

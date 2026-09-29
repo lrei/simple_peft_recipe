@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """speftr: Parameter-efficient training utilities with LoRA adapters.
 
-This package provides reusable class-based interfaces for training language
-models with LoRA adapters using TRL's trainers.
+Wrappers around TRL's trainers that train LoRA adapters on language models.
 
 - PESFT: Supervised fine-tuning with SFTTrainer (uses Unsloth)
 - PERL: Reinforcement learning with GRPOTrainer (TRL-only, no Unsloth)

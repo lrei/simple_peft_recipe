@@ -90,7 +90,7 @@ from a previous stage.
   - extra `rl`: vLLM (PERL generation); extra `gym`: reasoning-gym (+ rl).
 - The environment is large (torch, vLLM, unsloth); don't re-sync casually.
 - Unsloth refuses to import without a GPU; SFT code and the guard/instruct
-  examples can't even be imported on a CPU-only machine.
+  examples cannot be imported on a CPU-only machine.
 - Gated HF datasets/models use the cached `hf auth login` token or
   `HF_TOKEN`.
 

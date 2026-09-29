@@ -1,1 +1,1 @@
-"""Guard classification examples using WildGuardMix dataset."""
+"""Prompt-safety classification example on WildGuardMix (SFT with PESFT)."""

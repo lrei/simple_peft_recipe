@@ -7,7 +7,7 @@ with one of the 77 intents of Banking77 (`card_arrival`,
 every intent name, so the same prompt scores the base model and the
 fine-tuned one, and adding an intent needs no new output head.
 
-It shows the most common SFT setup: a labelled dataset, a chat prompt
+It shows a standard SFT setup: a labelled dataset, a chat prompt
 built from each row, and a loss on the answer only.
 
 ## Files and speftr APIs
@@ -78,7 +78,7 @@ uv run python -m examples.intent.intent_train --max_steps 300
 uv run python -m examples.intent.intent_eval
 ```
 
-Key flags (`--help` lists all):
+Main flags (`--help` lists all):
 
 | Script | Flag | Default |
 |--------|------|---------|

@@ -296,12 +296,14 @@ class RewardLogger:
             is_correct = reward > accuracy_threshold
 
             self.logger.info("=" * 80)
-            self.logger.info("Example Generation (step %d):", self.call_count)
+            self.logger.info(
+                "Sample completion (reward call %d):", self.call_count
+            )
             self.logger.info("-" * 80)
             self.logger.info("Completion: %s", completion)
             self.logger.info("-" * 40)
-            self.logger.info("Extracted Answer: %s", extracted)
-            self.logger.info("Expected Answer: %s", expected)
+            self.logger.info("Extracted answer: %s", extracted)
+            self.logger.info("Expected answer: %s", expected)
             self.logger.info("Correct: %s (reward: %.2f)", is_correct, reward)
             self.logger.info("=" * 80)
 
@@ -405,7 +407,7 @@ def evaluate_model(  # noqa: PLR0913
     sample_count = len(eval_dataset)
     logger.info("=" * 80)
     logger.info(
-        "Evaluating on %d samples (batch_size=%d)",
+        "Evaluating on %d problems (batch size %d)",
         sample_count,
         batch_size,
     )
@@ -534,8 +536,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora_r",
         type=int,
-        default=8,
-        help="LoRA rank for RL (default: 8)",
+        default=1,
+        help="LoRA rank for RL (default: 1)",
     )
     parser.add_argument(
         "--learning_rate",
@@ -925,7 +927,7 @@ def main() -> None:
         "Final model accuracy: %.2f%%", final_results["accuracy"] * 100
     )
     improvement = (final_results["accuracy"] - base_results["accuracy"]) * 100
-    logger.info("Improvement: %+.2f%%", improvement)
+    logger.info("Accuracy change: %+.2f points", improvement)
     logger.info("=" * 80)
 
     logger.info("Saving model...")
@@ -938,7 +940,7 @@ def main() -> None:
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
-    logger.info("Training complete!")
+    logger.info("Training complete.")
 
 
 if __name__ == "__main__":

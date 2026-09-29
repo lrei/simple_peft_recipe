@@ -1,6 +1,6 @@
 # speftr user guide
 
-How to fine-tune **your own** models on **your own** data with `speftr`:
+How to fine-tune your own models on your own data with `speftr`:
 supervised fine-tuning (`PESFT`), GRPO reinforcement learning (`PERL`),
 and what to do with the result. Defaults follow the recipe in the
 [README](../README.md#the-recipe) and target one 24 GB GPU (RTX 3090).
@@ -97,7 +97,7 @@ gets LoRA adapters.
 `PESFTConfig.from_args()` / `get_argument_parser()` expose most fields as
 CLI flags.
 
-### Example: your JSONL of messages → saved adapter
+### Example: from a JSONL of messages to a saved adapter
 
 `data/train.jsonl`, one conversation per line:
 
@@ -209,7 +209,7 @@ def reward(completions, answer, **kwargs) -> list[float]: ...
 `load_in_4bit=True` with `use_vllm=True` raises `ValueError`: TRL syncs
 merged weights into vLLM after each step, which corrupts a 4-bit vLLM
 copy. Without vLLM, generation runs in transformers and is several times
-slower (~30 s/step for Qwen 3.5 2B), but the base model takes about a
+slower (~35 s/step for Qwen 3.5 2B), but the base model takes about a
 quarter of the memory.
 
 ### Example: GSM8K with an exact-match reward
@@ -509,15 +509,15 @@ batch 8 unless noted.
 
 Gemma 4 used `chat_template="gemma-4"`, Qwen 3.5/3.8 `chat_template=None`.
 
-RL: `examples/rgym` on `chain_sum` (rank 8, 16 generations, batch 8 ×
+RL: `examples/rgym` on `chain_sum` (rank 1, 16 generations, batch 8 ×
 grad-acc 2, 512-token completions), accuracy before → after:
 
 | Model | Setup | Result |
 |-------|-------|--------|
-| Qwen3 1.7B (`Qwen/Qwen3-1.7B`) | bf16 + vLLM colocate | 27% → 77% in 100 steps |
-| Qwen 3.5 2B (`Qwen/Qwen3.5-2B`) | bf16 + vLLM colocate | 23% → 97% in 30 steps |
-| Qwen 3.5 2B | 4-bit, no vLLM | 39% → 92% in 30 steps; model 1.8 GB, ~30 s/step |
-| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM, `vllm_gpu_memory_utilization=0.45`, batch 2 × grad-acc 8 | Runs; no accuracy gain in 30 steps (needs tuning) |
+| Qwen3 1.7B (`Qwen/Qwen3-1.7B`) | bf16 + vLLM colocate | 27% → 89% in 100 steps |
+| Qwen 3.5 2B (`Qwen/Qwen3.5-2B`) | bf16 + vLLM colocate | 23% → 94% in 30 steps |
+| Qwen 3.5 2B | 4-bit, no vLLM | 39% → 94% in 30 steps; model 1.8 GB, ~35 s/step |
+| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM, `vllm_gpu_memory_utilization=0.45`, batch 2 × grad-acc 8 | Runs; 44% → 48% in 30 steps (needs tuning) |
 
 ### Chat templates and markers
 
@@ -559,8 +559,8 @@ required_parameters = bits / 2
 minimum_rank = ceil(required_parameters / parameters_at_rank_1)
 ```
 
-The README rule of thumb (1 parameter per SFT token, minimum rank 8)
-keeps twice this headroom.
+PESFT's default rank 8 is a safe over-provisioned choice; the smallest
+rank this reports is enough.
 
 ```bash
 # SFT: your JSONL, response tokens only
@@ -629,7 +629,7 @@ Download once and run without Hub access: see
 | Formatting function never called | Dataset has a `text` column or `prompt` + `completion` columns; rename them |
 | Response-only loss trains nothing / everything | `instruction_part` / `response_part` don't match the rendered template; print one formatted row |
 | Adapter loads but outputs look like the base model | Loaded with `AutoModelForCausalLM` on a multimodal checkpoint; use the `architectures` class ([above](#load-an-adapter-for-inference-transformers--peft)) |
-| SFT hangs before the first step (forked dataset worker stuck) | Fixed in `PESFT` (it disables huggingface_hub telemetry); in your own SFT scripts export `HF_HUB_DISABLE_TELEMETRY=1` |
+| SFT hangs before the first step (forked dataset worker stuck) | `PESFT` avoids it by disabling huggingface_hub telemetry; in your own SFT scripts export `HF_HUB_DISABLE_TELEMETRY=1` |
 | 401 / gated repo errors | Accept the terms on the Hub page, then `hf auth login` or set `HF_TOKEN` |
 
 More memory levers: [Fitting in memory](#10-fitting-in-memory).
@@ -682,7 +682,7 @@ Limits:
 
 `PESFT` DDP is validated on two A100 40GB with Gemma 4 31B (4-bit) and
 model splitting with gpt-oss-120b; the `PERL` modes below are
-implemented but **not yet validated on multi-GPU hardware**.
+implemented but not validated on multi-GPU hardware.
 `examples/big` and `examples/gptoss`
 have Slurm templates ([big](../examples/big/big.sbatch),
 [gptoss](../examples/gptoss/gptoss.sbatch)).

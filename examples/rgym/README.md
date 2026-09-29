@@ -83,6 +83,19 @@ mode, so it already produces `<think>` reasoning and solves some problems,
 which GRPO needs to get a signal. Any chat model with a template works via
 `--model_name_or_path`.
 
+LoRA rank 1, alpha 32, on all attention and MLP projections (PERL's
+defaults): 1,089,536 adapter parameters on Qwen3 1.7B. RL learns about
+1 bit per episode (sampled completion)
+([`speftr.lora_budget`](../../docs/guide.md#7-checking-the-rank)): 100
+steps × 16 completions are 1,600 episodes, which need ~800 parameters,
+so rank 1 suffices:
+
+```bash
+uv run python -m speftr.lora_budget --mode rl \
+    --model_name_or_path Qwen/Qwen3-1.7B \
+    --max_steps 100 --completions_per_step 16
+```
+
 ## Run
 
 Needs the `gym` extra (`uv sync --extra gym`). From the repository root:
@@ -111,29 +124,31 @@ Key flags (`--help` lists all):
 | `--max_steps` | 100 | Optimizer steps |
 | `--num_generations` | 16 | Completions per prompt |
 | `--per_device_train_batch_size` × `--gradient_accumulation_steps` | 8 × 2 | In completions; must be a multiple of `--num_generations` (16 = one prompt per step) |
-| `--lora_r`, `--learning_rate`, `--scheduler` | 8, 1e-5, `constant` | `--warmup_ratio` (0.1) has no effect with `constant` |
+| `--lora_r`, `--learning_rate`, `--scheduler` | 1, 1e-5, `constant` | `--warmup_ratio` (0.1) has no effect with `constant` |
 | `--temperature`, `--top_p`, `--top_k`, `--min_p` | 0.6, 0.95, 20, 0.0 | Used for training and evaluation |
 | `--max_prompt_length`, `--max_completion_length` | 512, 512 | |
 | `--vllm_sleep` | off | Frees vLLM memory during optimizer steps; recommended |
 | `--vllm_gpu_memory_utilization` | 0.5 | GPU share reserved for colocated vLLM |
 | `--no_vllm` | vLLM on | Sample with transformers instead |
 | `--load_in_4bit` | off | Requires `--no_vllm` |
-| `--output_dir` | `./models/sudoku-perl` | Set it to something meaningful |
+| `--output_dir` | `./models/sudoku-perl` | Set it per run |
 
 ## Results
 
-`chain_sum`, one RTX 3090, LoRA r=8, 16 generations, batch 8 × grad-acc 2,
+`chain_sum`, one RTX 3090, LoRA r=1, 16 generations, batch 8 × grad-acc 2,
 512-token completions, `--vllm_sleep`:
 
 | Model | Setup | Steps | Accuracy before → after | Train time |
 |-------|-------|-------|-------------------------|------------|
-| Qwen3 1.7B | bf16 + vLLM | 100 | 27% → 77% (100 problems) | 13 min, ~8 s/step |
-| Qwen 3.5 2B | bf16 + vLLM | 30 | 23% → 97% (64 problems) | 7 min, ~13 s/step |
-| Qwen 3.5 2B | 4-bit, `--no_vllm` | 30 | 39% → 92% (64 problems) | 15 min, ~30 s/step |
-| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM 0.45, batch 2 × grad-acc 8 | 30 | 44% → 44% (64 problems) | 7 min |
+| Qwen3 1.7B | bf16 + vLLM | 100 | 27% → 89% (100 problems) | 13 min, ~8 s/step |
+| Qwen 3.5 2B | bf16 + vLLM | 30 | 23% → 94% (64 problems) | 6 min, ~13 s/step |
+| Qwen 3.5 2B | 4-bit, `--no_vllm` | 30 | 39% → 94% (64 problems) | 17 min, ~35 s/step |
+| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM 0.45, batch 2 × grad-acc 8 | 30 | 44% → 48% (64 problems) | 7 min |
 
-The Qwen3 1.7B run took 17 min end to end, including both evaluations.
-Gemma 4 E2B runs but did not improve in 30 steps with these settings.
+The Qwen3 1.7B run takes 16 min end to end, including both evaluations;
+its training reward (accuracy + format, maximum 2.0) averages 1.41
+over steps 1–50 and 1.76 over steps 51–100. Gemma 4 E2B runs but
+gains little in 30 steps with these settings.
 
 ## Outputs
 
@@ -170,12 +185,12 @@ Engine: transformers. Merged model saved to ./models/chainsum-merged
 
 >>> State the final answer to the following arithmetic problem: 4 + 3 =
 adapter: <think>
-Okay, let's see. [...] There's no trick here, just simple addition. So the answer should be 7.
+Okay, let's see. [...] Yep, 4 plus 3 is indeed 7. No issues here.
 </think>
 
 <answer>7</answer>
 merged:  <think>
-Okay, let's see. [...] There's no trick or anything here. Just simple addition. So the answer should be 7.
+Okay, let's see. [...] Yep, 4 plus 3 is indeed 7. No issues here.
 </think>
 
 <answer>7</answer>
@@ -190,8 +205,8 @@ checkpoint (`AutoModelForCausalLM`, `pipeline`, `vllm serve
 
 `--adapter_dir` defaults to `rgym`'s default `--output_dir`
 (`./models/sudoku-perl`); the commands use the run from [Run](#run). The
-answers agreed on both questions with both engines (`7`, `1692`); the
-reasoning text differed in a few words on one question per engine, where
+answers agree on both questions with both engines (`7`, `1692`); the
+reasoning text differs in a few words on one question per engine, where
 two tokens are nearly tied in bf16 and the rest of the reply follows.
 The transformers run takes about 1 min and 4.6 GB of VRAM; vLLM reserves
 80% of the GPU whatever the model size and starts one engine per route
@@ -233,6 +248,9 @@ training](../../docs/guide.md#5-after-training).
 4. **Prompt.** Change `--developer_prompt` / `--developer_role`, or
    `ReasoningGymDataset.__getitem__`; keep asking for the tags your reward
    parses.
+5. **Rank.** Rerun the [`speftr.lora_budget` command](#model) with your
+   model, `--max_steps` and completions per step (batch × grad-acc)
+   ([guide](../../docs/guide.md#7-checking-the-rank)).
 
 ## Pitfalls
 
@@ -243,7 +261,7 @@ training](../../docs/guide.md#5-after-training).
   --gradient_accumulation_steps 8`.
 - **4-bit needs `--no_vllm`.** `--load_in_4bit` with vLLM raises
   `ValueError`: PERL cannot sync LoRA updates into a 4-bit vLLM copy.
-  Without vLLM, steps are slower (30 vs 13 s for Qwen 3.5 2B).
+  Without vLLM, steps are slower (35 vs 13 s for Qwen 3.5 2B).
 - **Out of memory in general.** Lower `--max_completion_length` or the
   batch (keep batch × grad-acc a multiple of `--num_generations`), lower
   `--vllm_gpu_memory_utilization`, and pass `--vllm_sleep`.

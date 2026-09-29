@@ -2,8 +2,8 @@
 
 A guardrail sits in front of an LLM and flags prompts that ask for harmful
 content. This example fine-tunes a tiny chat model to read a prompt and
-answer with one word, `harmful` or `unharmful`. It is the simplest way to
-turn a labelled text-classification dataset into chat SFT: an instruction
+answer with one word, `harmful` or `unharmful`. It shows the minimal way
+to turn a labelled text-classification dataset into chat SFT: an instruction
 plus the text in the user turn, the label in the assistant turn, loss on
 the label only.
 
@@ -81,7 +81,7 @@ uv run python -m examples.guard.guard_test             # try prompts by hand
 uv run python -m examples.guard.guard_count_tokens     # length statistics
 ```
 
-Every script takes `--help`. Key flags:
+Every script takes `--help`. Main flags:
 
 | Script | Flag | Default |
 |--------|------|---------|
@@ -127,7 +127,7 @@ hour.
 | Harmful recall | 0.38 |
 | Unharmful recall | 0.97 |
 
-The model is conservative: it rarely flags a safe prompt but misses most
+The model is conservative: it flags 3% of safe prompts and misses 62% of
 harmful ones. It is a teaching example, not a production guard.
 
 ## Outputs

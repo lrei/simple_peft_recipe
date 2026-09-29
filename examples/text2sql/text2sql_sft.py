@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         help="Load the base model in 4-bit (QLoRA) (default: on)",
     )
     parser.add_argument(
-        "--lora_r", type=int, default=8, help="LoRA rank (default: 8)"
+        "--lora_r", type=int, default=1, help="LoRA rank (default: 1)"
     )
     parser.add_argument(
         "--learning_rate",
