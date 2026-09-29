@@ -662,7 +662,7 @@ Recommended combinations:
 |-----------|---------|--------|
 | One 24 GB GPU | 16-bit up to ~4B; `load_in_4bit` above. From ~12B: batch 1 × `gradient_accumulation_steps`, `max_seq_length` ≤ 4096. Gemma 4 31B is about the limit ([examples/big](../examples/big/README.md)) | bf16 + colocated vLLM for small models; 4-bit without vLLM for larger ones (slow generation); lower batch and `max_completion_length`; Liger for models without final-logit soft-capping |
 | Model fits one A100 (40/80 GB) | bf16 LoRA, no quantization; more GPUs: DDP ([below](#11-multiple-gpus)) | bf16 + colocated vLLM; more GPUs: DDP |
-| Model does not fit one GPU | `load_in_4bit` first; else `device_map="unsloth_balanced"` over several GPUs | FSDP-QLoRA over several GPUs |
+| Model does not fit one GPU | `load_in_4bit` first; else `device_map="unsloth_balanced"` over several GPUs | `load_in_4bit` without vLLM; generation is slow |
 
 Limits:
 
@@ -727,36 +727,6 @@ and the split layers run one GPU at a time.
 `accelerate launch --num_processes N`). Each rank loads the whole model
 on its GPU; with colocated vLLM each rank also runs its own vLLM engine,
 so `vllm_gpu_memory_utilization` applies per GPU.
-
-**`PERL`, FSDP-QLoRA.** Shards a 4-bit model over the GPUs for models
-too large for one. Set `load_in_4bit=True` and `use_vllm=False`, and
-launch with an accelerate FSDP config; `PERL` then lets FSDP place the
-model and stores the 4-bit weights as bf16 so FSDP can shard them.
-
-```yaml
-# fsdp.yaml
-compute_environment: LOCAL_MACHINE
-distributed_type: FSDP
-num_machines: 1
-num_processes: 4
-mixed_precision: "no"
-fsdp_config:
-  fsdp_version: 1
-  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_sharding_strategy: FULL_SHARD
-  fsdp_state_dict_type: SHARDED_STATE_DICT
-  fsdp_cpu_ram_efficient_loading: true
-  fsdp_sync_module_states: true
-  fsdp_use_orig_params: false
-  fsdp_offload_params: false
-```
-
-```bash
-accelerate launch --config_file fsdp.yaml my_rl.py
-```
-
-`fsdp_offload_params: true` also moves the shards to CPU RAM (fits more,
-much slower).
 
 **vLLM.** 4-bit and 8-bit `PERL` runs generate without vLLM. For
 generation on separate GPUs, run TRL's vLLM server there

@@ -5,7 +5,6 @@ from __future__ import annotations
 import types
 
 import pytest
-import torch
 import trl
 
 from speftr.perl import (
@@ -459,20 +458,11 @@ def test_config_rejects_4bit_and_8bit_together():
         ({}, "auto"),
         ({"WORLD_SIZE": "1", "LOCAL_RANK": "0"}, "auto"),
         ({"WORLD_SIZE": "4", "LOCAL_RANK": "3"}, {"": 3}),
-        ({"WORLD_SIZE": "2", "ACCELERATE_USE_FSDP": "true"}, None),
-        ({"WORLD_SIZE": "2", "ACCELERATE_USE_FSDP": "True"}, None),
-        (
-            {
-                "WORLD_SIZE": "2",
-                "LOCAL_RANK": "1",
-                "ACCELERATE_USE_FSDP": "false",
-            },
-            {"": 1},
-        ),
+        ({"WORLD_SIZE": "2", "LOCAL_RANK": "1"}, {"": 1}),
     ],
 )
 def test_device_map_follows_launcher_environment(monkeypatch, env, expected):
-    for name in ("WORLD_SIZE", "LOCAL_RANK", "ACCELERATE_USE_FSDP"):
+    for name in ("WORLD_SIZE", "LOCAL_RANK"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -480,32 +470,19 @@ def test_device_map_follows_launcher_environment(monkeypatch, env, expected):
 
 
 def test_quantization_config_off_by_default():
-    assert (
-        _quantization_config(
-            load_in_4bit=False, load_in_8bit=False, fsdp=False
-        )
-        is None
-    )
+    assert _quantization_config(load_in_4bit=False, load_in_8bit=False) is None
 
 
 def test_quantization_config_8bit():
-    config = _quantization_config(
-        load_in_4bit=False, load_in_8bit=True, fsdp=False
-    )
+    config = _quantization_config(load_in_4bit=False, load_in_8bit=True)
     assert config.load_in_8bit
     assert not config.load_in_4bit
 
 
-@pytest.mark.parametrize(
-    ("fsdp", "storage"), [(False, torch.uint8), (True, torch.bfloat16)]
-)
-def test_quantization_config_4bit_storage_follows_fsdp(fsdp, storage):
-    config = _quantization_config(
-        load_in_4bit=True, load_in_8bit=False, fsdp=fsdp
-    )
+def test_quantization_config_4bit_is_nf4():
+    config = _quantization_config(load_in_4bit=True, load_in_8bit=False)
     assert config.load_in_4bit
     assert config.bnb_4bit_quant_type == "nf4"
-    assert config.bnb_4bit_quant_storage == storage
 
 
 def test_grpo_config_forwards_memory_options(

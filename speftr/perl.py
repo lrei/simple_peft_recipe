@@ -80,42 +80,29 @@ def _checkpoint_model_class(model_name_or_path: str) -> type[Any]:
     return model_class
 
 
-def _fsdp_enabled() -> bool:
-    """Return whether ``accelerate launch`` configured FSDP for this run.
-
-    Returns:
-        ``True`` when the ``ACCELERATE_USE_FSDP`` environment variable, which
-        ``accelerate`` sets for FSDP runs, is ``"true"`` (any case).
-    """
-    return os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true"
-
-
-def _device_map() -> str | dict[str, int] | None:
+def _device_map() -> str | dict[str, int]:
     """Choose where ``from_pretrained`` places the base model.
 
     Returns:
-        ``None`` under FSDP, which shards the model itself; the whole model
-        on this process's GPU (``{"": LOCAL_RANK}``) when ``WORLD_SIZE`` is
-        above 1 (DDP via torchrun or ``accelerate launch``), since every
-        rank trains a full copy; otherwise ``"auto"``, which uses one GPU or
-        splits a model too large for one across all visible GPUs.
+        The whole model on this process's GPU (``{"": LOCAL_RANK}``) when
+        ``WORLD_SIZE`` is above 1 (DDP via torchrun or ``accelerate
+        launch``), since every rank trains a full copy; otherwise
+        ``"auto"``, which uses one GPU or splits a model too large for one
+        across all visible GPUs.
     """
-    if _fsdp_enabled():
-        return None
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         return {"": int(os.environ.get("LOCAL_RANK", "0"))}
     return "auto"
 
 
 def _quantization_config(
-    *, load_in_4bit: bool, load_in_8bit: bool, fsdp: bool
+    *, load_in_4bit: bool, load_in_8bit: bool
 ) -> BitsAndBytesConfig | None:
     """Return the bitsandbytes config, or ``None`` for bf16 loading.
 
     Args:
         load_in_4bit: Quantize the base weights to 4 bits (NF4, QLoRA).
         load_in_8bit: Quantize the base weights to 8 bits (LLM.int8).
-        fsdp: Whether FSDP will shard the model.
 
     Returns:
         An 8-bit config; an NF4 double-quantized config computing in bf16;
@@ -127,15 +114,11 @@ def _quantization_config(
 
     if load_in_8bit:
         return BitsAndBytesConfig(load_in_8bit=True)
-    # FSDP flattens and shards parameters of one dtype, so the packed 4-bit
-    # weights must be stored as bf16 like the rest of the model.
-    quant_storage = torch.bfloat16 if fsdp else torch.uint8
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_storage=quant_storage,
     )
 
 
@@ -185,8 +168,7 @@ class PERLConfig:
         max_seq_length: Maximum sequence length (None = no limit)
         load_in_4bit: Load the base model in 4-bit (bitsandbytes NF4,
             QLoRA). Requires ``use_vllm=False``: TRL syncs merged weights
-            into vLLM, which corrupts a 4-bit vLLM copy. Under FSDP the
-            4-bit weights are stored as bf16 so FSDP can shard them.
+            into vLLM, which corrupts a 4-bit vLLM copy.
         load_in_8bit: Load the base model in 8-bit (bitsandbytes
             LLM.int8). Slower than 4-bit and saves less memory than the
             weight size suggests. Requires ``use_vllm=False`` (vLLM cannot
@@ -565,7 +547,6 @@ class PERL:
             "quantization_config": _quantization_config(
                 load_in_4bit=self.config.load_in_4bit,
                 load_in_8bit=self.config.load_in_8bit,
-                fsdp=_fsdp_enabled(),
             ),
         }
         # Try flash_attention_2, fall back to sdpa if not available
