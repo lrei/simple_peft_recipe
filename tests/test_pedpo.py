@@ -7,7 +7,11 @@
 
 from __future__ import annotations
 
+import json
 import math
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import trl
@@ -16,6 +20,8 @@ from datasets import Dataset
 from speftr.pedpo import PEDPO, PEDPOConfig, _device_map
 
 
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TINY_MODEL = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
 CLI_FIELDS = (
     "model_name_or_path",
@@ -242,11 +248,33 @@ def _tiny_trainer(tmp_path, **overrides) -> PEDPO:
     return PEDPO(config)
 
 
-def test_train_extracts_prompt_and_saves_only_trained_adapter(
-    cpu_dpo_config, tmp_path, load_fixture
-):
-    rows = Dataset.from_list(load_fixture("olmo2_1b_preference_rows.json"))
-    trainer = _tiny_trainer(tmp_path)
+def _fixture_rows() -> Dataset:
+    """Load the six real preference rows."""
+    fixture = FIXTURES_DIR / "olmo2_1b_preference_rows.json"
+    return Dataset.from_list(json.loads(fixture.read_text(encoding="utf-8")))
+
+
+def _allow_cpu_dpo_config() -> None:
+    """Default ``trl.DPOConfig`` to ``bf16=False`` in this process.
+
+    The same patch as the ``cpu_dpo_config`` fixture, for code that runs
+    in a child interpreter where fixtures do not apply.
+    """
+    real = trl.DPOConfig
+
+    def build(**kwargs: object) -> trl.DPOConfig:
+        kwargs.setdefault("bf16", False)
+        return real(**kwargs)
+
+    trl.DPOConfig = build
+
+
+def _train_and_check_adapter(output_dir: str) -> None:
+    """Train one step, check the prompt split and the saved adapter."""
+    _allow_cpu_dpo_config()
+    path = Path(output_dir)
+    rows = _fixture_rows()
+    trainer = _tiny_trainer(path)
     trainer.train(rows, eval_dataset=rows.select(range(2)))
 
     # Full conversations: TRL split off the shared prompt.
@@ -259,21 +287,52 @@ def test_train_extracts_prompt_and_saves_only_trained_adapter(
     # The reference is a frozen copy of the adapter; only one is saved.
     assert set(trainer.model.peft_config) == {"default", "ref"}
     trainer.save_model()
-    assert (tmp_path / "adapter_model.safetensors").is_file()
-    assert (tmp_path / "tokenizer_config.json").is_file()
-    assert not (tmp_path / "ref").exists()
+    assert (path / "adapter_model.safetensors").is_file()
+    assert (path / "tokenizer_config.json").is_file()
+    assert not (path / "ref").exists()
 
 
-def test_save_merged_drops_all_adapters(
-    cpu_dpo_config, tmp_path, load_fixture
-):
+def _train_and_check_merged(output_dir: str) -> None:
+    """Train one step, save merged weights and check no adapter remains."""
     from transformers import AutoModelForCausalLM
 
-    rows = Dataset.from_list(load_fixture("olmo2_1b_preference_rows.json"))
-    trainer = _tiny_trainer(tmp_path)
-    trainer.train(rows)
+    _allow_cpu_dpo_config()
+    path = Path(output_dir)
+    trainer = _tiny_trainer(path)
+    trainer.train(_fixture_rows())
     trainer.save_model("merged_16bit")
 
-    assert not (tmp_path / "adapter_config.json").exists()
-    reloaded = AutoModelForCausalLM.from_pretrained(tmp_path)
+    assert not (path / "adapter_config.json").exists()
+    reloaded = AutoModelForCausalLM.from_pretrained(path)
     assert not any("lora" in name for name, _ in reloaded.named_parameters())
+
+
+def _run_in_fresh_interpreter(function: str, output_dir: Path) -> None:
+    """Run ``function(output_dir)`` in a new Python process.
+
+    Importing Unsloth (other test modules do) patches TRL's trainers for
+    the whole process; PEDPO runs without Unsloth, so its training tests
+    run in a clean interpreter, as PEDPO does in real use.
+    """
+    code = (
+        f"from tests.test_pedpo import {function}; "
+        f"{function}({str(output_dir)!r})"
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        result.stdout[-4000:] + result.stderr[-4000:]
+    )
+
+
+def test_train_extracts_prompt_and_saves_only_trained_adapter(tmp_path):
+    _run_in_fresh_interpreter("_train_and_check_adapter", tmp_path)
+
+
+def test_save_merged_drops_all_adapters(tmp_path):
+    _run_in_fresh_interpreter("_train_and_check_merged", tmp_path)

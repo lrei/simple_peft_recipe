@@ -314,8 +314,11 @@ rl.train(rl_dataset, [exact_answer])
 rl.save_model()
 ```
 
-This path runs a Unsloth-patched model under TRL's GRPO trainer and has no
-GPU test in this repo. Keep `use_vllm=False` if the SFT model is 4-bit
+Importing Unsloth (which `PESFT` does) patches TRL's trainers for the
+whole Python process, so in this path `PERL` and `PEDPO` run
+Unsloth-modified trainer code; it has no GPU test in this repo. Prefer
+the recommended path above: separate processes, the merged SFT model
+passed by path. Keep `use_vllm=False` if the SFT model is 4-bit
 (same weight-sync problem as above). Set `stop_sequences` yourself: they
 are only filled from the tokenizer in `load_model()`.
 
@@ -837,7 +840,9 @@ gradients.
 - `save_model()` writes only the trained adapter, not `"ref"`.
 
 As with [SFT then RL](#4-sft-then-rl), the simplest path from SFT is to
-save the SFT model merged and set `model_name_or_path` to it.
+save the SFT model merged and set `model_name_or_path` to it, in a
+separate process: importing Unsloth (`PESFT`) patches TRL's
+`DPOTrainer` for the whole process.
 
 ### Precomputing reference log-probabilities
 

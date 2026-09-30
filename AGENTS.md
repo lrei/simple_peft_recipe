@@ -205,6 +205,10 @@ argparse parser (if exposed) and the call that forwards it to TRL.
   trainable: Unsloth has no MXFP4 backward and transformers marks MXFP4
   not trainable. Train on the Unsloth bnb-4bit conversion
   (`unsloth/gpt-oss-20b-unsloth-bnb-4bit`).
+- Importing Unsloth (PESFT) patches TRL's trainers for the whole process;
+  PERL and PEDPO then run Unsloth-modified code (e.g. `Dataset.map` with
+  forked workers). Run them in a process without PESFT; tests that train
+  with PEDPO run in a fresh interpreter (`tests/test_pedpo.py`).
 - PESFT disables HF telemetry process-wide, which makes the `kernels`
   package fail to fetch Hub kernels ("could not verify publisher trust
   status"). Only kernel-hub users are affected, e.g. native MXFP4 loading.
