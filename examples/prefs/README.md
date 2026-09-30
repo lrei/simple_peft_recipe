@@ -112,14 +112,6 @@ From the repository root:
 uv run python -m examples.prefs.prefs_train
 # 2. Evaluate SFT, adapter and AllenAI's DPO model
 uv run python -m examples.prefs.prefs_eval
-# Optional: the same training with precomputed reference log-probs
-uv run python -m examples.prefs.prefs_train --precompute_ref_log_probs \
-    --output_dir ./models/olmo2-1b-lora-dpo-precompute
-# Optional: length-normalized DPO, the loss of AllenAI's Tülu 3 recipe
-uv run python -m examples.prefs.prefs_train --loss_type sigmoid_norm \
-    --beta 5 --output_dir ./models/olmo2-1b-lora-dpo-norm
-uv run python -m examples.prefs.prefs_eval \
-    --adapter_dir ./models/olmo2-1b-lora-dpo-norm
 ```
 
 Main flags (`--help` lists all):
@@ -147,49 +139,27 @@ gradient checkpointing, `adamw_8bit`.
 One RTX 3090, bf16, the `PEDPO` defaults, 9,525 pairs, one epoch (596
 steps). `prefs_eval` on the same GPU.
 
-The length-normalized run ("norm" below) changes only the loss:
-`--loss_type sigmoid_norm --beta 5`. TRL's `sigmoid_norm` divides each
-response's summed log-ratio `log pi(y|x) - log pi_ref(y|x)` by its
-number of response tokens before the `beta`-scaled log-sigmoid, the
-objective and `beta` of AllenAI's Tülu 3 DPO recipe
-([arXiv 2411.15124](https://arxiv.org/abs/2411.15124), Table 20).
-
 ### Training
 
-| Run | Wall time | Reference pass | Training | s/step | Final eval | Peak memory (torch) |
-|-----|-----------|----------------|----------|--------|------------|---------------------|
-| precompute off (documented run) | 102 min | per step | 96.6 min | 9.73 | 4.5 min | 12.7 GB allocated, 15.0 GB reserved |
-| precompute on | 103 min | 25.2 min before training | 74.7 min | 7.52 | 2.3 min | 12.5 GB allocated, 15.0 GB reserved |
-| norm (precompute off) | 101 min | per step | 96.7 min | 9.74 | 4.4 min | 12.7 GB allocated, 15.0 GB reserved |
+| Wall time | Training | s/step | Final eval | Peak memory (torch) |
+|-----------|----------|--------|------------|---------------------|
+| 102 min | 96.6 min | 9.73 | 4.5 min | 12.7 GB allocated, 15.0 GB reserved |
 
-"Wall time" is the whole `PEDPO.train` call (tokenization, reference
-pass, training, final evaluation); `prefs_train_summary.json` records
-it. The reference pass ran at batch 4 (`precompute_ref_batch_size`
-unset): 23.0 min for the train pairs, 2.2 min for the eval pairs.
+"Wall time" is the whole `PEDPO.train` call (tokenization, training,
+final evaluation); `prefs_train_summary.json` records it.
 
-| Metric | off | on | norm |
-|--------|-----|-----|------|
-| Mean train loss (epoch) | 0.648 | 0.651 | 0.679 |
-| Last logged train loss (steps 581-590) | 0.616 | 0.635 | 0.709 |
-| Last logged train `rewards/accuracies` | 0.713 | 0.675 | 0.681 |
-| `eval_loss` (938 held-out pairs) | 0.638 | 0.638 | 0.658 |
-| `eval_rewards/accuracies` | 0.635 | 0.646 | 0.622 |
-| `eval_rewards/margins` | 0.270 | 0.278 | 24.9 |
+| Metric | Value |
+|--------|-------|
+| Mean train loss (epoch) | 0.648 |
+| Last logged train loss (steps 581-590) | 0.616 |
+| Last logged train `rewards/accuracies` | 0.713 |
+| `eval_loss` (938 held-out pairs) | 0.638 |
+| `eval_rewards/accuracies` | 0.635 |
+| `eval_rewards/margins` | 0.270 |
 
-TRL's reward metrics use the summed log-ratio times `beta` for every
-loss, so the norm run's margins are on another scale (`beta` 5, not
-0.1) and its losses are values of another objective.
-
-The two sigmoid runs reach the same result: equal eval loss, eval accuracy within
-0.011 (about 10 of 938 pairs). The loss starts at 0.693 (ln 2, policy =
-reference) and train `rewards/accuracies` rises from 0.44 in the first
-10 steps to 0.6-0.7 from about step 130 on.
-
-For this setup (one epoch) leave `precompute_ref_log_probs` off: the
-total time is the same, because the reference pass costs what it saves
-per step, and it adds a 25-minute wait before the first step and a cache
-in the `datasets` directory. It pays off when the same pairs are trained
-for several epochs: the pass runs once.
+The loss starts at 0.693 (ln 2, policy = reference) and train
+`rewards/accuracies` rises from 0.44 in the first 10 steps to 0.6-0.7
+from about step 130 on.
 
 ### Scores
 
@@ -201,7 +171,6 @@ Held-out preference accuracy (1,000 pairs, never trained on):
 |-------|------------------------|---------------------------|-------------------------|----------------------------|
 | `OLMo-2-0425-1B-SFT` | 0.514 | 0.617 | | |
 | SFT + DPO adapter (this example) | 0.515 | 0.621 | 0.635 | 0.653 |
-| SFT + norm adapter (`sigmoid_norm`, `beta` 5) | 0.520 | 0.626 | 0.611 | 0.650 |
 | `OLMo-2-0425-1B-DPO` (AllenAI, full model, whole mix) | 0.551 | 0.667 | 0.695 | 0.770 |
 
 RewardBench implicit-reward accuracy (`filtered`, 2,985 pairs; reference
@@ -210,10 +179,8 @@ RewardBench implicit-reward accuracy (`filtered`, 2,985 pairs; reference
 | Policy | Reward | Chat | Chat Hard | Safety | Reasoning | Overall |
 |--------|--------|------|-----------|--------|-----------|---------|
 | SFT + DPO adapter (this example) | summed | 0.791 | 0.557 | 0.691 | 0.767 | 0.701 |
-| SFT + norm adapter | summed | 0.628 | 0.583 | 0.646 | 0.790 | 0.662 |
 | `OLMo-2-0425-1B-DPO` (AllenAI) | summed | 0.494 | 0.695 | 0.695 | 0.776 | 0.665 |
 | SFT + DPO adapter (this example) | per token | 0.869 | 0.388 | 0.631 | 0.513 | 0.600 |
-| SFT + norm adapter | per token | 0.855 | 0.375 | 0.584 | 0.524 | 0.584 |
 | `OLMo-2-0425-1B-DPO` (AllenAI) | per token | 0.880 | 0.447 | 0.730 | 0.573 | 0.658 |
 
 - The adapter learns the preferences in DPO's own terms: its implicit
@@ -226,13 +193,6 @@ RewardBench implicit-reward accuracy (`filtered`, 2,985 pairs; reference
 - On RewardBench the adapter's reward is higher on Chat (0.791 vs
   0.494) and lower on Chat Hard (0.557 vs 0.695) than AllenAI's; Safety
   and Reasoning are within 0.01.
-- The loss does not explain the gap to AllenAI's model. The norm
-  adapter, trained with AllenAI's length-normalized loss and `beta`,
-  moves the log-likelihood accuracy by 0.006 summed and 0.009 per token
-  (default adapter 0.001 and 0.004, AllenAI 0.037 and 0.050), ranks
-  held-out pairs no better by the per-token reward it optimizes (0.650
-  vs 0.653; AllenAI 0.770) and scores lower on RewardBench (0.662 vs
-  0.701 summed, 0.584 vs 0.600 per token).
 
 ### Why the likelihood accuracy barely moves
 
@@ -258,6 +218,23 @@ with a rank-1 adapter shift the log-probabilities by a few nats, far
 less than the gaps that decide a likelihood comparison. AllenAI's model
 was trained on all 378k pairs with every weight free. The defaults stay
 as they are; to move likelihood rankings, train on more pairs.
+
+### Other settings measured
+
+Same data, split and seed; one setting changed each time.
+
+- Length-normalized DPO, the loss of AllenAI's Tülu 3 recipe
+  ([arXiv 2411.15124](https://arxiv.org/abs/2411.15124), Table 20):
+  `--loss_type sigmoid_norm --beta 5`. Held-out per-token
+  implicit-reward accuracy is 0.650 (default 0.653) and RewardBench
+  overall 0.662 (default 0.701). The loss does not explain the gap to
+  AllenAI's model, which trains all parameters on the whole mix
+  (~378k pairs, ~40x more); neither factor is tested here.
+- `--precompute_ref_log_probs`: 7.5 s/step (default 9.7) plus a
+  25-minute reference pass before training, so one epoch takes the same
+  total time (103 vs 102 min). It pays off when the same pairs are
+  trained for several epochs. Peak memory is unchanged (12.5 vs
+  12.7 GB).
 
 ## Evaluation
 
@@ -397,8 +374,7 @@ training](../../docs/guide.md#5-after-training).
   splits at the prompt's token count anyway; 96 of the 22,000
   sequences here are affected. `prefs_eval` splits the same way.
 - `precompute_ref_log_probs` caches the reference log-probs in the
-  `datasets` cache, keyed by the dataset fingerprint and a hash of the
-  model; a run that finds a matching cache file skips the pass, so time
-  it with a clean cache.
+  `datasets` cache; a run that finds a matching cache file skips the
+  pass, so time it with a clean cache.
 - Summed log-likelihood favours short responses; compare it with the
   per-token accuracy before reading a change as a preference change.
