@@ -15,6 +15,8 @@ Usage:
     uv run python -m examples.prefs.prefs_train
     uv run python -m examples.prefs.prefs_train --precompute_ref_log_probs \\
         --output_dir ./models/olmo2-1b-lora-dpo-precompute
+    uv run python -m examples.prefs.prefs_train --loss_type sigmoid_norm \\
+        --beta 5 --output_dir ./models/olmo2-1b-lora-dpo-norm
     uv run python -m examples.prefs.prefs_eval
 
 Data: ``allenai/olmo-2-0425-1b-preference-mix`` (ODC-BY). Model:
@@ -52,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments.
 
     Returns:
-        Namespace with the data sizes, reference option and output
-        directory.
+        Namespace with the data sizes, DPO loss options, reference
+        option and output directory.
     """
     parser = argparse.ArgumentParser(
         description="DPO of OLMo 2 1B SFT on its preference mix with PEDPO"
@@ -82,6 +84,19 @@ def parse_args() -> argparse.Namespace:
         help="Stop after N optimizer steps (default: -1, one epoch)",
     )
     parser.add_argument(
+        "--beta",
+        type=float,
+        default=PEDPOConfig.beta,
+        help=f"DPO temperature (default: {PEDPOConfig.beta})",
+    )
+    parser.add_argument(
+        "--loss_type",
+        nargs="+",
+        default=["sigmoid"],
+        help="TRL DPO loss name(s) (default: sigmoid; sigmoid_norm "
+        "divides each log-ratio by the response length)",
+    )
+    parser.add_argument(
         "--precompute_ref_log_probs",
         action="store_true",
         help="Compute reference log-probs once before training",
@@ -106,6 +121,8 @@ def build_config(args: argparse.Namespace) -> PEDPOConfig:
     return PEDPOConfig(
         model_name_or_path=args.model_name_or_path,
         max_steps=args.max_steps,
+        beta=args.beta,
+        loss_type=args.loss_type,
         precompute_ref_log_probs=args.precompute_ref_log_probs,
         output_dir=args.output_dir,
         logging_steps=10,

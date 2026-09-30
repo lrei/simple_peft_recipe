@@ -15,6 +15,10 @@ Two measurements, each for the SFT model, the DPO adapter trained by
    chosen response gets the higher reward. Scores are reported per
    RewardBench section and overall, weighted as RewardBench does.
 
+Both implicit-reward accuracies are also reported length-normalized:
+the log-ratio divided by the number of response tokens, the reward of
+the length-normalized DPO loss (TRL ``loss_type="sigmoid_norm"``).
+
 The adapter's reference is the same model with the adapter disabled.
 Prompts and responses are rendered with the chat template and split into
 prompt and response tokens as TRL's ``DPOTrainer`` does in training.
@@ -444,6 +448,19 @@ def implicit_rewards(
     return [beta * (p - r) for p, r in zip(policy, reference, strict=True)]
 
 
+def per_token(sums: Sequence[float], counts: Sequence[int]) -> list[float]:
+    """Divide summed scores by their response token counts.
+
+    Args:
+        sums: Summed score of each response.
+        counts: Response tokens of each response, same order.
+
+    Returns:
+        Mean score per token; a response without tokens keeps its sum.
+    """
+    return [total / max(n, 1) for total, n in zip(sums, counts, strict=True)]
+
+
 def rewardbench_scores(
     subsets: Sequence[str], correct: Sequence[bool]
 ) -> dict[str, float]:
@@ -589,7 +606,8 @@ def held_out_report(
     Returns:
         Per model: ``summed`` and ``normalized`` log-likelihood accuracy,
         ``reward`` (implicit reward vs the SFT model; not for the SFT
-        model itself) and ``pairs`` scored.
+        model itself), ``reward_normalized`` (the same reward divided by
+        the response length) and ``pairs`` scored.
     """
     sft_sums = scores["sft"]["held_out"][0]
     report = {}
@@ -598,29 +616,32 @@ def held_out_report(
         keep = [
             i for i in range(0, len(sums), 2) if counts[i] and counts[i + 1]
         ]
-        per_token = [
-            total / max(n, 1) for total, n in zip(sums, counts, strict=True)
-        ]
         report[name] = {
             "pairs": float(len(keep)),
             "summed": kept_pair_accuracy(sums, keep),
-            "normalized": kept_pair_accuracy(per_token, keep),
+            "normalized": kept_pair_accuracy(per_token(sums, counts), keep),
         }
         if name != "sft":
             rewards = implicit_rewards(sums, sft_sums)
             report[name]["reward"] = kept_pair_accuracy(rewards, keep)
+            report[name]["reward_normalized"] = kept_pair_accuracy(
+                per_token(rewards, counts), keep
+            )
     return report
 
 
 def rewardbench_report(
     scores: dict[str, dict[str, tuple[list[float], list[int]]]],
     subsets: Sequence[str],
+    *,
+    normalize: bool = False,
 ) -> dict[str, dict[str, float]]:
     """RewardBench implicit-reward scores per policy, SFT as reference.
 
     Args:
         scores: Output of ``score_models``.
         subsets: RewardBench subset of each pair.
+        normalize: Divide each reward by its response token count.
 
     Returns:
         Section and overall accuracy per policy (all models but ``sft``).
@@ -630,7 +651,10 @@ def rewardbench_report(
     for name, by_dataset in scores.items():
         if name == "sft":
             continue
-        rewards = implicit_rewards(by_dataset["rewardbench"][0], reference)
+        sums, counts = by_dataset["rewardbench"]
+        rewards = implicit_rewards(sums, reference)
+        if normalize:
+            rewards = per_token(rewards, counts)
         correct = pair_accuracy(rewards[0::2], rewards[1::2])
         report[name] = rewardbench_scores(subsets, correct)
     return report
@@ -686,32 +710,40 @@ def parse_args() -> argparse.Namespace:
 
 def print_reports(
     held_out: dict[str, dict[str, float]],
-    rewardbench: dict[str, dict[str, float]],
+    rewardbench: dict[str, dict[str, dict[str, float]]],
 ) -> None:
-    """Print both result tables.
+    """Print the result tables.
 
     Args:
         held_out: Output of ``held_out_report``.
-        rewardbench: Output of ``rewardbench_report``.
+        rewardbench: ``rewardbench_report`` outputs by reward kind
+            (``summed``, ``normalized``).
 
     Returns:
         None.
     """
     print("\nHeld-out preference accuracy")
-    header = ["pairs", "summed", "per-tok", "reward"]
+    header = ["pairs", "summed", "per-tok", "reward", "rew/tok"]
     print(f"{'model':<12} " + " ".join(f"{c:>7}" for c in header))
     for name, entry in held_out.items():
-        reward = f"{entry['reward']:.3f}" if "reward" in entry else "-"
+        rewards = [
+            f"{entry[key]:.3f}" if key in entry else "-"
+            for key in ("reward", "reward_normalized")
+        ]
         print(
             f"{name:<12} {entry['pairs']:>7.0f} {entry['summed']:>7.3f} "
-            f"{entry['normalized']:>7.3f} {reward:>7}"
+            f"{entry['normalized']:>7.3f} {rewards[0]:>7} {rewards[1]:>7}"
         )
-    print("\nRewardBench implicit-reward accuracy (reference: SFT model)")
     columns = [*SECTIONS, "Overall"]
-    print(f"{'model':<12} " + " ".join(f"{c:>9}" for c in columns))
-    for name, sections in rewardbench.items():
-        values = " ".join(f"{sections[c]:>9.3f}" for c in columns)
-        print(f"{name:<12} {values}")
+    for kind, report in rewardbench.items():
+        print(
+            f"\nRewardBench implicit-reward accuracy, {kind} "
+            "(reference: SFT model)"
+        )
+        print(f"{'model':<12} " + " ".join(f"{c:>9}" for c in columns))
+        for name, sections in report.items():
+            values = " ".join(f"{sections[c]:>9.3f}" for c in columns)
+            print(f"{name:<12} {values}")
 
 
 def main() -> None:
@@ -748,9 +780,18 @@ def main() -> None:
     results = {
         "held_out": held_out_report(scores),
         "rewardbench": rewardbench_report(scores, rewardbench["subset"]),
+        "rewardbench_normalized": rewardbench_report(
+            scores, rewardbench["subset"], normalize=True
+        ),
         "peak_gpu_gb": torch.cuda.max_memory_allocated() / 1024**3,
     }
-    print_reports(results["held_out"], results["rewardbench"])
+    print_reports(
+        results["held_out"],
+        {
+            "summed": results["rewardbench"],
+            "normalized": results["rewardbench_normalized"],
+        },
+    )
     print(f"\nPeak GPU memory (torch): {results['peak_gpu_gb']:.1f} GB")
     output = Path(args.adapter_dir) / "prefs_eval.json"
     output.write_text(json.dumps(results, indent=2))

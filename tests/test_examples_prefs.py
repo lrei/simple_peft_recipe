@@ -161,6 +161,22 @@ def test_pair_accuracy_and_implicit_rewards():
     ]
 
 
+def test_held_out_report_normalizes_rewards_by_response_length():
+    # One pair: chosen gains 2 nats over 10 tokens, rejected 1 nat over 2.
+    counts = [10, 2]
+    scores = {
+        "sft": {"held_out": ([-20.0, -4.0], counts)},
+        "adapter": {"held_out": ([-18.0, -3.0], counts)},
+    }
+
+    report = prefs_eval.held_out_report(scores)["adapter"]
+
+    assert report["reward"] == 1.0
+    assert report["reward_normalized"] == 0.0
+    assert report["summed"] == 0.0
+    assert report["normalized"] == 0.0
+
+
 def test_rewardbench_scores_weight_subsets_as_rewardbench():
     right = {"alpacaeval-easy", "math-prm"}
     subsets = [
