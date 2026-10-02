@@ -28,10 +28,12 @@ method; in our opinion, the simplest one for fine-tuning a language model.
 In its simplest form it needs no frozen reference model or KL term, which
 suits PEFT.
 
-The library defaults target a single 24 GB consumer GPU (RTX 3090).
-Multi-GPU training (data parallel and model splitting) is validated on
-2× A100 40GB; it uses the same defaults plus launch flags, which the
-examples document with measured settings.
+The defaults are sized for a 24 GB GPU and run unchanged on larger
+ones. The library and examples are tested on RTX 3090 (24 GB) and A100
+(40 GB), single and multi-GPU (data parallel and model splitting). The
+guide covers [what fits where](docs/guide.md#10-fitting-in-memory) and
+[several GPUs](docs/guide.md#11-multiple-gpus); each example records
+the hardware and settings of its measured runs.
 
 ### Sources
 
@@ -65,7 +67,8 @@ recipe deviates slightly from any one source.
 - Train on responses only when training with assistant templates.
 - **SFT attention**: SDPA with padded, length-grouped batches. Unsloth's
   own defaults (flex attention, padding-free batches) assume
-  FlashAttention-class kernels and are several times slower on a 3090.
+  FlashAttention-class kernels and are several times slower without
+  them.
 
 For GRPO, we default to colocated vLLM with GPU memory utilization limited to
 0.5. The examples use vLLM sleep mode.
@@ -87,7 +90,7 @@ parameters.
 - Defaults: rank 8 for SFT, a safe over-provisioned choice (the smallest
   rank Unsloth's hyperparameter guide suggests); rank 1 for RL and DPO.
 
-The examples use rank 1 (gptoss, rgym, text2sql) and rank 8 (guard,
+The examples use rank 1 (gptoss, prefs, rgym, text2sql) and rank 8 (guard,
 intent, instruct, big); each README gives its budget.
 
 #### Checking a rank against a dataset
@@ -106,8 +109,8 @@ model not pretrained on them.
 
 ### Prerequisites
 
-- Linux with an NVIDIA GPU (tuned for a single RTX 3090, 24 GB) and driver
-  ≥ 580 (PyTorch is installed from the CUDA 13 index)
+- Linux with an NVIDIA GPU (24 GB or more; tested on RTX 3090 and A100)
+  and driver ≥ 580 (PyTorch is installed from the CUDA 13 index)
 - Python 3.13 or 3.14
 - [uv](https://docs.astral.sh/uv/) package manager
 
@@ -167,7 +170,7 @@ commands, data format, hardware and measured results:
 | [text2sql](examples/text2sql/README.md) | 4-bit SFT then GRPO with a SQLite execution reward (SmolLM3-3B) |
 | [rgym](examples/rgym/README.md) | GRPO with verifiable rewards on Reasoning Gym (Qwen3 1.7B, vLLM) |
 | [prefs](examples/prefs/README.md) | DPO on a preference mix with held-out and RewardBench accuracy (OLMo 2 1B) |
-| [big](examples/big/README.md) | 4-bit SFT of a 31B model on one 24 GB GPU; multi-GPU and Slurm (Gemma 4 31B) |
+| [big](examples/big/README.md) | 4-bit SFT of a 31B model on one GPU; multi-GPU and Slurm (Gemma 4 31B) |
 | [gptoss](examples/gptoss/README.md) | 4-bit SFT of an MoE reasoning model to reason in a requested language; 20b on one GPU, 120b split over GPUs (gpt-oss) |
 
 Each training example also has an `<example>_inference.py` that runs
@@ -255,3 +258,8 @@ note={Featured Certification}
 This was developed as part of [DataPACT](https://datapact.eu/).
 This project has received funding from the European Union's Horizon Europe
 research and innovation programme under grant agreement No 101189771
+
+The authors gratefully acknowledge the HPC RIVR consortium and the Institute
+of Information Science (IZUM) for providing computing resources on the HPC
+system Vega. We also thank the Slovenian National Supercomputing Network
+(SLING) for facilitating access and providing technical support.

@@ -5,7 +5,8 @@ supervised fine-tuning (`PESFT`), GRPO reinforcement learning (`PERL`),
 DPO preference optimization
 ([`PEDPO`](#12-preference-optimization-pedpo-dpo)) and what to do with the
 result. Defaults follow the recipe in the
-[README](../README.md#the-recipe) and target one 24 GB GPU (RTX 3090).
+[README](../README.md#the-recipe), are sized for a 24 GB GPU and run
+unchanged on larger ones.
 
 ## 1. Install and import
 
@@ -720,11 +721,11 @@ Limits:
 
 ## 11. Multiple GPUs
 
-`PESFT` DDP is validated on two A100 40GB with Gemma 4 31B (4-bit) and
-model splitting with gpt-oss-120b; the `PERL` modes below are
-implemented but not validated on multi-GPU hardware.
-`examples/big` and `examples/gptoss`
-have Slurm templates ([big](../examples/big/big.sbatch),
+Validated on two A100 40GB: `PESFT` DDP with Gemma 4 31B (4-bit),
+model splitting with gpt-oss-120b and `PERL` DDP with Qwen3 1.7B
+(`examples/rgym`). `PERL` with a separate vLLM server is implemented
+but not validated. `examples/big` and `examples/gptoss` have Slurm
+templates ([big](../examples/big/big.sbatch),
 [gptoss](../examples/gptoss/gptoss.sbatch)).
 
 **`PESFT`, data parallel (DDP).** One process per GPU, each with a full

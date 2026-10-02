@@ -8,7 +8,8 @@ should look like, see the other guides listed at the end.
 - **uv**, the package manager: <https://astral.sh/uv>.
 - **Python 3.13 or 3.14** (`requires-python` in `pyproject.toml`).
 - **Linux with an NVIDIA GPU** for anything that trains or runs a model. The
-  defaults target a single RTX 3090 (24 GB). Unit tests run on CPU.
+  defaults are sized for a 24 GB GPU; tested on RTX 3090 and A100.
+  Unit tests run on CPU.
 - `HF_TOKEN` in the environment for gated Hugging Face models and datasets
   (for example WildGuardMix in `examples/guard/`).
 
