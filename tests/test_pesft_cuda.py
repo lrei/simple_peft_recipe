@@ -29,6 +29,7 @@ ADAPTER_FILES = (
     "adapter_config.json",
     "speftr.json",
     "training_args.json",
+    "train_metrics.json",
 )
 
 

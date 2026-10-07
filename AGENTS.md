@@ -219,5 +219,11 @@ argparse parser (if exposed) and the call that forwards it to TRL.
   loading (see `examples/gptoss/`).
 - Unsloth's gpt-oss bnb-4bit checkpoints store experts as separate 4-bit
   layers that plain transformers cannot load; load them with Unsloth.
+- Qwen 3.5 checkpoints (2B, 4B, 9B) have no `generation_config.json`
+  and declare only `<|endoftext|>` as end of sequence; a fine-tuned
+  adapter emits the turn-ending `<|im_end|>` only, so transformers'
+  `generate` runs on into a new turn. Pass `tokenizer.eos_token_id` in
+  `eos_token_id` (`stop_token_ids` in `examples/intent` and
+  `examples/tldr`); vLLM is unaffected.
 
 Remove entries as they get fixed.

@@ -20,7 +20,9 @@ without one.
 | `instruct/` | `PESFT` chat instruction tuning from instruction/context/response columns with a system prompt (Dolly pirate) | Qwen3 0.6B, 4-bit | small; any 24 GB GPU | [README](instruct/README.md) |
 | `chat.py` | Console chat with an adapter or merged model saved by `PESFT` (Unsloth inference) | any | GPU | [instruct README](instruct/README.md#run) |
 | `export_gguf.sh` | Converts a merged model to GGUF and quantizes it for llama.cpp / Ollama (needs a llama.cpp checkout) | any merged model | CPU | [guide](../docs/guide.md#export-to-gguf-llamacpp-ollama) |
-| `intent/` | `PESFT` multi-class classification (77 intents) with before/after evaluation on Banking77 | Granite 3.3 2B, bf16 | 11 GB | [README](intent/README.md) |
+| `intent/` | `PESFT` multi-class classification (77 intents) with before/after evaluation on Banking77; any model family (markers inferred from the chat template); training speed across the recipe's knobs on an RTX 3090 and an A100 | Granite 3.3 2B, Qwen 3.5 4B, Gemma 4 E4B; bf16 | 9.0 GiB (Granite), 19 to 20 GiB (4B models) | [README](intent/README.md) |
+| `tldr/` | `PESFT` summarization of Reddit posts (TL;DR), response-only loss, thinking off at generation; ROUGE before/after | Qwen 3.5 4B, Gemma 4 E4B, Granite 3.3 2B; bf16 | 8.9 to 22.2 GiB | [README](tldr/README.md) |
+| `speed.py` | Runs an SFT example under the recipe's speed settings (accumulation, checkpointing, attention, padding-free, packing, 4-bit) and tables s/step, samples/s and peak memory from `train_metrics.json` | any example on `PESFTConfig`'s parser | GPU | [intent README](intent/README.md#speed) |
 | `text2sql/` | `PESFT` 4-bit SFT then `PERL` GRPO on the same adapters with a SQLite execution reward | SmolLM3-3B, 4-bit | ≤ 9 GB | [README](text2sql/README.md) |
 | `rgym/` | `PERL` GRPO with verifiable rewards on Reasoning Gym tasks, colocated vLLM, before/after accuracy | Qwen3 1.7B, bf16 | RTX 3090 24 GB (`gym` extra) | [README](rgym/README.md) |
 | `prefs/` | `PEDPO` rank-1 LoRA DPO of an SFT model on its preference mix; held-out preference accuracy and RewardBench implicit-reward accuracy vs AllenAI's full DPO model, no judge | OLMo 2 1B SFT, bf16 | 12.7 GB | [README](prefs/README.md) |
@@ -55,11 +57,13 @@ Every training script has the same shape:
 4. **Lifecycle**: `load_model()` → `train(...)` → `save_model()`.
 
 To adapt one, pick the example closest to your task (classification:
-`guard` or `intent`; free-form answers: `instruct`; verifiable outputs:
-`text2sql` or `rgym`; preference pairs: `prefs`), then change the
-loader, the formatting or reward function and the model's chat-template
-markers. Print one formatted row before training to catch wrong
-markers. Each README ends with the concrete steps and pitfalls for that example.
+`guard` or `intent`; free-form answers: `instruct`; summaries:
+`tldr`; verifiable outputs: `text2sql` or `rgym`; preference pairs:
+`prefs`), then change the loader, the formatting or reward function and
+the model's chat-template markers (`intent` and `tldr` leave the markers
+empty and let `PESFT` infer them from the model's template). Print one
+formatted row before training to catch wrong markers. Each README ends
+with the concrete steps and pitfalls for that example.
 
 The LoRA rank is chosen with
 [`speftr.lora_budget`](../docs/guide.md#7-checking-the-rank), which

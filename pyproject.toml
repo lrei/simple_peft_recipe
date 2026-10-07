@@ -23,6 +23,7 @@ dependencies = [
     "datasets>=4.8.0",
     "scikit-learn>=1.9.1",
     "bitsandbytes>=0.50.2",
+    "rouge-score>=0.1.2",
 ]
 
 [project.optional-dependencies]

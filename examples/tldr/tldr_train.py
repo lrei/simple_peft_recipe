@@ -1,30 +1,28 @@
-r"""Fine-tune a chat model as a banking intent classifier with PESFT.
+r"""Fine-tune a chat model to write Reddit TL;DRs with PESFT.
 
-A support team routes each customer message to one of the 77 Banking77
-intents. The model reads the message and the list of intent names and
-answers with the intent name; the loss covers only that answer
-(``train_on_responses``). The task (prompt, dataset) is defined in
-``intent_eval.py``, which also scores the base and fine-tuned models.
+Each training text is the post in a user turn and the author's TL;DR as
+the assistant turn; the loss covers only the TL;DR
+(``train_on_responses``). The task (prompt, dataset, scoring) is defined
+in ``tldr_eval.py``, which also scores the base and fine-tuned models.
 
 The model keeps its own chat template (``chat_template=None``) and the
 instruction/response markers are inferred from it (empty
 ``instruction_part`` / ``response_part``), so ``--model_name_or_path``
 accepts any model family ``speftr.chat_markers`` knows. The parser is
 ``PESFTConfig``'s with this example's defaults (``EXAMPLE_DEFAULTS``)
-plus ``--eval_rows``.
+plus ``--train_rows`` and ``--eval_rows``.
 
 Usage:
-    uv run python -m examples.intent.intent_train
-    uv run python -m examples.intent.intent_train --max_steps 300
-    uv run python -m examples.intent.intent_train \
-        --model_name_or_path Qwen/Qwen3.5-4B \
-        --output_dir ./models/qwen3.5-4b-lora-banking77
-    uv run python -m examples.intent.intent_eval \
-        --model_path ./models/granite-3.3-2b-lora-banking77
+    uv run python -m examples.tldr.tldr_train --max_steps 300
+    uv run python -m examples.tldr.tldr_train --max_steps 300 \\
+        --model_name_or_path google/gemma-4-E4B-it \\
+        --output_dir ./models/gemma-4-e4b-lora-tldr
+    uv run python -m examples.tldr.tldr_eval \\
+        --model_path ./models/qwen3.5-4b-lora-tldr
 
-Dataset: ``legacy-datasets/banking77`` (CC-BY-4.0). Default model:
-``ibm-granite/granite-3.3-2b-instruct`` (Apache-2.0).
-Results and adaptation steps: ``examples/intent/README.md``.
+Dataset: ``trl-lib/tldr`` (from ``webis/tldr-17``, CC-BY-4.0). Default
+model: ``Qwen/Qwen3.5-4B`` (Apache-2.0).
+Results and adaptation steps: ``examples/tldr/README.md``.
 """
 
 from __future__ import annotations
@@ -34,11 +32,11 @@ from typing import TYPE_CHECKING, Any, Final
 
 import unsloth  # noqa: F401  # patches transformers/trl; must come first
 
-from examples.intent.intent_eval import (
+from examples.tldr.tldr_eval import (
     DEFAULT_MODEL_PATH,
     MAX_SEQ_LENGTH,
     build_messages,
-    load_banking77,
+    load_tldr,
 )
 from speftr import PESFT, PESFTConfig
 
@@ -49,7 +47,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 
-DEFAULT_MODEL = "ibm-granite/granite-3.3-2b-instruct"
+DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
+DEFAULT_TRAIN_ROWS = -1
 DEFAULT_EVAL_ROWS = 500
 
 EXAMPLE_DEFAULTS: Final[dict[str, object]] = {
@@ -59,7 +58,7 @@ EXAMPLE_DEFAULTS: Final[dict[str, object]] = {
     "train_on_responses": True,
     "instruction_part": "",
     "response_part": "",
-    "lora_r": 1,
+    "lora_r": 2,
     "learning_rate": 2e-4,
     "per_device_train_batch_size": 16,
     "per_device_eval_batch_size": 16,
@@ -74,23 +73,29 @@ def build_parser() -> argparse.ArgumentParser:
     """Return ``PESFTConfig``'s parser with this example's defaults.
 
     Returns:
-        The parser, extended with ``--eval_rows``. ``--help`` lists the
-        example defaults in its epilog, since the per-flag help shows the
-        ``PESFTConfig`` ones.
+        The parser, extended with ``--train_rows`` and ``--eval_rows``.
+        ``--help`` lists the example defaults in its epilog, since the
+        per-flag help shows the ``PESFTConfig`` ones.
     """
     parser: argparse.ArgumentParser = PESFTConfig.get_argument_parser()
-    parser.description = "Train a Banking77 intent classifier with PESFT"
+    parser.description = "Train a Reddit TL;DR summarizer with PESFT"
     parser.set_defaults(**EXAMPLE_DEFAULTS)
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     parser.epilog = "example defaults:\n" + "\n".join(
         f"  --{name} {value!r}" for name, value in EXAMPLE_DEFAULTS.items()
     )
     parser.add_argument(
+        "--train_rows",
+        type=int,
+        default=DEFAULT_TRAIN_ROWS,
+        help="Use only the first N train rows (default: -1, all 116,722)",
+    )
+    parser.add_argument(
         "--eval_rows",
         type=int,
         default=DEFAULT_EVAL_ROWS,
         help=(
-            "Train rows held out for the eval loss "
+            "Validation rows used for the eval loss "
             f"(default: {DEFAULT_EVAL_ROWS})"
         ),
     )
@@ -98,35 +103,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_formatting_func(
-    tokenizer: PreTrainedTokenizerBase, label_names: list[str]
+    tokenizer: PreTrainedTokenizerBase,
 ) -> Callable[[Mapping[str, Any]], list[str]]:
     """Create the batched formatting function passed to ``PESFT.train``.
 
     Args:
         tokenizer: Tokenizer whose chat template renders the conversation.
-        label_names: Intent names in label-index order.
 
     Returns:
-        Function turning a batch of Banking77 rows (``message``,
-        ``label``) into one chat-formatted training text per row.
+        Function turning a batch of rows (``post``, ``summary``) into one
+        chat-formatted training text per row.
     """
 
     def format_batch(batch: Mapping[str, Any]) -> list[str]:
-        """Render a batch of rows as user prompt + intent answer.
+        """Render a batch of rows as user post + assistant TL;DR.
 
         Args:
-            batch: Columns ``message`` and ``label`` (integer index).
+            batch: Columns ``post`` and ``summary``.
 
         Returns:
             One training text per row.
         """
-        messages, labels = batch["message"], batch["label"]
+        posts, summaries = batch["post"], batch["summary"]
         # Unsloth also calls this with one unbatched row (column -> value).
-        if isinstance(messages, str):
-            messages, labels = [messages], [labels]
+        if isinstance(posts, str):
+            posts, summaries = [posts], [summaries]
         texts = []
-        for message, label in zip(messages, labels, strict=True):
-            chat = build_messages(message, label_names, label_names[label])
+        for post, summary in zip(posts, summaries, strict=True):
+            chat = build_messages(post, summary)
             rendered = tokenizer.apply_chat_template(chat, tokenize=False)
             texts.append(rendered)
         return texts
@@ -135,7 +139,7 @@ def build_formatting_func(
 
 
 def main() -> None:
-    """Train LoRA adapters on Banking77 and save them.
+    """Train LoRA adapters on TL;DR and save them.
 
     Returns:
         None. Adapters, tokenizer and run parameters are written to
@@ -145,14 +149,15 @@ def main() -> None:
     trainer = PESFT(PESFTConfig.from_args(args))
     _model, tokenizer = trainer.load_model()
 
-    dataset, label_names = load_banking77()
-    split = dataset["train"].train_test_split(
-        test_size=args.eval_rows, seed=trainer.config.random_state
-    )
-    format_batch = build_formatting_func(tokenizer, label_names)
-    print(format_batch(split["train"][:1])[0])
+    dataset = load_tldr()
+    train_split = dataset["train"]
+    if args.train_rows > 0:
+        train_split = train_split.select(range(args.train_rows))
+    eval_split = dataset["validation"].select(range(args.eval_rows))
+    format_batch = build_formatting_func(tokenizer)
+    print(format_batch(train_split[:1])[0])
 
-    trainer.train(split["train"], split["test"], format_batch)
+    trainer.train(train_split, eval_split, format_batch)
     trainer.save_model()
 
 

@@ -178,8 +178,35 @@ def load_for_generation(
         attn_implementation="sdpa",
     )
     FastLanguageModel.for_inference(model)
+    # Multimodal checkpoints (Qwen 3.5, Gemma 4) come with a processor; the
+    # text tokenizer inside it renders and pads the chats.
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
     tokenizer.padding_side = "left"
     return model, tokenizer
+
+
+def stop_token_ids(
+    model: GenerationMixin, tokenizer: PreTrainedTokenizerBase
+) -> list[int]:
+    """Token ids that end generation: the model's and the tokenizer's.
+
+    Some checkpoints (Qwen 3.5) declare only the end-of-text token as
+    end of sequence, while the chat template closes a turn with the
+    tokenizer's EOS; a fine-tuned adapter emits only the latter and
+    would otherwise run on into another turn.
+
+    Args:
+        model: The generating model.
+        tokenizer: Its tokenizer.
+
+    Returns:
+        Sorted, de-duplicated ids: the generation config's
+        ``eos_token_id`` (an id, a list or None) plus the tokenizer's.
+    """
+    configured = model.generation_config.eos_token_id
+    ids = set(configured if isinstance(configured, list) else [configured])
+    ids.add(tokenizer.eos_token_id)
+    return sorted(i for i in ids if i is not None)
 
 
 def generate_replies(
@@ -218,6 +245,7 @@ def generate_replies(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=stop_token_ids(model, tokenizer),
         )
     # Left padding: every prompt ends at the same position.
     replies = outputs[:, inputs["input_ids"].shape[1] :]
@@ -252,8 +280,14 @@ def predict_intents(
     for start in range(0, len(texts), args.batch_size):
         batch = texts[start : start + args.batch_size]
         chats = [build_messages(text, label_names) for text in batch]
+        # Qwen 3.5 renders an empty think block in the generation prompt,
+        # as in its training texts; other templates ignore the flag.
         replies = generate_replies(
-            model, tokenizer, chats, max_new_tokens=args.max_new_tokens
+            model,
+            tokenizer,
+            chats,
+            max_new_tokens=args.max_new_tokens,
+            enable_thinking=False,
         )
         y_pred.extend(
             extract_intent(reply, label_names) or INVALID_PREDICTION

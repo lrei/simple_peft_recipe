@@ -1,7 +1,7 @@
-r"""Classify banking messages with the intent adapter without speftr.
+r"""Summarize Reddit posts with the TL;DR adapter without speftr.
 
-Runs the adapter saved by ``intent_train`` two ways and prints both
-intents for every customer message, which should agree:
+Runs the adapter saved by ``tldr_train`` two ways and prints both TL;DRs
+for every post, which should agree:
 
 1. Adapter route (``run_adapter_route``): the base model plus the LoRA
    adapter, attached with peft (``--engine transformers``) or passed to
@@ -14,11 +14,11 @@ intents for every customer message, which should agree:
 Only torch, transformers, peft and, for ``--engine vllm``, vllm are needed.
 
 Usage:
-    uv run python -m examples.intent.intent_inference
-    uv run python -m examples.intent.intent_inference --engine vllm \\
-        --prompt "I still have not received my new card."
+    uv run python -m examples.tldr.tldr_inference
+    uv run python -m examples.tldr.tldr_inference --engine vllm \\
+        --prompt "$(cat my_post.txt)"
 
-See "Use the trained model without speftr" in ``examples/intent/README.md``.
+See "Use the trained model without speftr" in ``examples/tldr/README.md``.
 """
 
 from __future__ import annotations
@@ -44,52 +44,72 @@ if TYPE_CHECKING:
 
 type Message = dict[str, str]
 
-DEFAULT_ADAPTER_DIR = "./models/granite-3.3-2b-lora-banking77"
-# Prompt as in intent_eval.py: instruction, every intent name, message.
+DEFAULT_ADAPTER_DIR = "./models/qwen3.5-4b-lora-tldr"
+# Prompt as in tldr_eval.py: instruction, then the post without its cue.
 INSTRUCTION = (
-    "Classify the customer message into exactly one banking intent. "
-    "Answer with the intent name only."
+    "Write a TL;DR of the Reddit post below in one or two sentences. "
+    "Answer with the TL;DR only."
 )
-# The 77 Banking77 intent names in label-index order, as listed in the
-# prompt.
-INTENTS = (
-    "activate_my_card, age_limit, apple_pay_or_google_pay, atm_support, "
-    "automatic_top_up, balance_not_updated_after_bank_transfer, "
-    "balance_not_updated_after_cheque_or_cash_deposit, "
-    "beneficiary_not_allowed, cancel_transfer, card_about_to_expire, "
-    "card_acceptance, card_arrival, card_delivery_estimate, card_linking, "
-    "card_not_working, card_payment_fee_charged, "
-    "card_payment_not_recognised, card_payment_wrong_exchange_rate, "
-    "card_swallowed, cash_withdrawal_charge, "
-    "cash_withdrawal_not_recognised, change_pin, compromised_card, "
-    "contactless_not_working, country_support, declined_card_payment, "
-    "declined_cash_withdrawal, declined_transfer, "
-    "direct_debit_payment_not_recognised, disposable_card_limits, "
-    "edit_personal_details, exchange_charge, exchange_rate, "
-    "exchange_via_app, extra_charge_on_statement, failed_transfer, "
-    "fiat_currency_support, get_disposable_virtual_card, "
-    "get_physical_card, getting_spare_card, getting_virtual_card, "
-    "lost_or_stolen_card, lost_or_stolen_phone, order_physical_card, "
-    "passcode_forgotten, pending_card_payment, pending_cash_withdrawal, "
-    "pending_top_up, pending_transfer, pin_blocked, receiving_money, "
-    "Refund_not_showing_up, request_refund, reverted_card_payment?, "
-    "supported_cards_and_currencies, terminate_account, "
-    "top_up_by_bank_transfer_charge, top_up_by_card_charge, "
-    "top_up_by_cash_or_cheque, top_up_failed, top_up_limits, "
-    "top_up_reverted, topping_up_by_card, transaction_charged_twice, "
-    "transfer_fee_charged, transfer_into_account, "
-    "transfer_not_received_by_recipient, transfer_timing, "
-    "unable_to_verify_identity, verify_my_identity, "
-    "verify_source_of_funds, verify_top_up, virtual_card_not_working, "
-    "visa_or_mastercard, why_verify_identity, "
-    "wrong_amount_of_cash_received, wrong_exchange_rate_for_cash_withdrawal"
-)
+# The dataset's prompts end with the cue the author's TL;DR followed.
+PROMPT_SUFFIX = "TL;DR:"
+# Two trl-lib/tldr test rows, as the dataset gives them.
 DEFAULT_PROMPTS = (
-    "Why won't my card show up on the app?",
-    "May I exchange currencies with this?",
+    (
+        "SUBREDDIT: r/relationships\n\nTITLE: I (f/22) have to figure out if "
+        "I want to still know these girls or not and would hate to sound "
+        "insulting\n\nPOST: Not sure if this belongs here but it's worth a "
+        "try. \n\nBackstory:\nWhen I (f/22) went through my first real "
+        "breakup 2 years ago because he needed space after a year of dating "
+        "roand  it effected me more than I thought. It was a horrible time in "
+        "my life due to living with my mother and finally having the chance "
+        "to cut her out of my life. I can admit because of it was an "
+        "emotional wreck and this guy was stable and didn't know how to deal "
+        "with me. We ended by him avoiding for a month or so after going to a "
+        "festival with my friends. When I think back I wish he just ended. So "
+        "after he ended it added my depression I suffered but my friends "
+        "helped me through it and I got rid of everything from him along with "
+        "cutting contact. \n\nNow: Its been almost 3 years now and I've "
+        "gotten better after counselling and mild anti depressants. My mother "
+        "has been out of my life since then so there's been alot of progress. "
+        "Being stronger after learning some lessons there been more insight "
+        "about that time of my life but when I see him or a picture "
+        "everything comes back. The emotions and memories bring me back down. "
+        "\n\nHis friends (both girls) are on my facebook because we get along "
+        "well which is hard to find and I know they'll always have his back. "
+        "But seeing him in a picture or talking to him at a convention having "
+        "a conversation is tough. Crying confront of my current boyfriend is "
+        "something I want to avoid. \n\nSo I've been thinking that I have to "
+        "cut contact with these girls because it's time to move on because "
+        "it's healthier. It's best to avoid him as well. But will they be "
+        "insulted? Will they accept it? Is there going to be awkwardness? I'm "
+        "not sure if it's the right to do and could use some outside "
+        "opinions.\n\nTL;DR:"
+    ),
+    (
+        "SUBREDDIT: r/loseit\n\nTITLE: SV & NSV! Keeping on keeping on.\n\n"
+        "POST: 30F, 5'6\". SW: 236 GW: 150 CW: 219\n\nI weigh myself weekly "
+        "and measure myself monthly. I'd hit a plateau the last four weeks or "
+        "so where I was stuck at 222. Felt like kind of a bummer, but knew "
+        "it's because I haven't been as strict as I should with my diet, and "
+        "the last week and a half have been crazy with life things, so I "
+        "haven't been exercising as frequently as I've gotten used to. When I "
+        "weighed myself as normal on Monday, I was kind of disappointed to "
+        "see the scale not budging and figured it was time to buckle down "
+        "again and really watch my diet. Today was my measure-in day, and "
+        "I've felt cruddy in general since Monday because I caught some chest "
+        "congestion/cold bug over the weekend. I get on the scale...it says "
+        "219. Whaaaaat? I take my measurements, which are down slightly from "
+        "last month, and with an total-body loss of 8 inches from my starting "
+        "point on 12/23/14! Some of my clothes have been feeling a bit looser "
+        "as of late and now I know it's just not in my head. I'm now the "
+        "lightest and smallest I've been since right around high school!\n\n"
+        "TL;DR:"
+    ),
 )
-DEFAULT_MAX_NEW_TOKENS = 16
-CHAT_TEMPLATE_KWARGS: dict[str, Any] = {}
+DEFAULT_MAX_NEW_TOKENS = 96
+# Thinking off: Qwen 3.5 then renders the empty think block the adapter
+# was trained with; templates without the switch ignore the kwarg.
+CHAT_TEMPLATE_KWARGS: dict[str, Any] = {"enable_thinking": False}
 MAX_MODEL_LEN = 2048
 # vLLM reserves this share of GPU memory whatever the model size.
 GPU_MEMORY_UTILIZATION = 0.8
@@ -97,25 +117,25 @@ GPU_MEMORY_UTILIZATION = 0.8
 VLLM_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
 
 
-def build_chats(messages: list[str]) -> list[list[Message]]:
-    """Wrap each customer message in the user turn used in training.
+def build_chats(posts: list[str]) -> list[list[Message]]:
+    """Wrap each post in the user turn used in training.
 
     Args:
-        messages: Customer messages to classify.
+        posts: Reddit posts to summarize, with or without the trailing
+            ``TL;DR:`` cue of the dataset.
 
     Returns:
-        One single-turn chat per message: ``INSTRUCTION``, the intent
-        names and the message.
+        One single-turn chat per post: ``INSTRUCTION`` and the post.
     """
     return [
         [
             {
                 "role": "user",
-                "content": f"{INSTRUCTION}\n\nIntents: {INTENTS}\n\n"
-                f"Message: {message.strip()}",
+                "content": f"{INSTRUCTION}\n\n"
+                f"{post.strip().removesuffix(PROMPT_SUFFIX).strip()}",
             }
         ]
-        for message in messages
+        for post in posts
     ]
 
 
@@ -141,7 +161,8 @@ def model_architecture(model_id: str) -> str:
         model_id: Hub id or local directory.
 
     Returns:
-        The first entry of ``architectures``, e.g. ``Gemma3ForCausalLM``.
+        The first entry of ``architectures``, e.g.
+        ``Qwen3_5ForConditionalGeneration``.
     """
     from transformers import AutoConfig  # noqa: PLC0415
 
@@ -473,7 +494,7 @@ def parse_args() -> argparse.Namespace:
         prompts and generation budget.
     """
     parser = argparse.ArgumentParser(
-        description="Classify banking messages with the intent adapter, "
+        description="Summarize Reddit posts with the TL;DR adapter, "
         "separately and merged, without speftr."
     )
     parser.add_argument("--adapter_dir", default=DEFAULT_ADAPTER_DIR)
@@ -494,8 +515,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt",
         action="append",
-        help="Customer message; repeat for a batch (default: two Banking77 "
-        "test messages).",
+        help="Reddit post; repeat for a batch (default: two trl-lib/tldr "
+        "rows).",
     )
     parser.add_argument(
         "--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS
@@ -504,10 +525,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Classify the messages through both routes and print the intents.
+    """Summarize the posts through both routes and print the TL;DRs.
 
     Returns:
-        None. Intents are printed to stdout; the merged model is written to
+        None. TL;DRs are printed to stdout; the merged model is written to
         ``--merged_dir``.
     """
     args = parse_args()

@@ -169,6 +169,28 @@ def _disable_thinking_mode(model: object) -> None:
         generation_config.enable_thinking = False
 
 
+def _stop_token_ids(model: object, tokenizer: object) -> list[int]:
+    """Token ids that end a reply: the model's and the tokenizer's EOS.
+
+    Qwen 3.5 checkpoints declare only ``<|endoftext|>`` as end of
+    sequence while their chat turns end with the tokenizer's EOS,
+    ``<|im_end|>``; a fine-tuned adapter emits only the latter.
+
+    Args:
+        model: Loaded model with a ``generation_config``.
+        tokenizer: Its tokenizer.
+
+    Returns:
+        Sorted, de-duplicated ids.
+    """
+    configured = getattr(
+        getattr(model, "generation_config", None), "eos_token_id", None
+    )
+    ids = set(configured if isinstance(configured, list) else [configured])
+    ids.add(getattr(tokenizer, "eos_token_id", None))
+    return sorted(i for i in ids if isinstance(i, int))
+
+
 def main() -> None:
     """Load the model and run the interactive chat loop until exit.
 
@@ -258,6 +280,7 @@ def main() -> None:
                 top_p=args.top_p,
                 do_sample=args.temperature > 0,
                 pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=_stop_token_ids(model, tokenizer),
             )
 
             generated_tokens = outputs[0][input_ids.shape[1] :]

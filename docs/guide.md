@@ -66,12 +66,16 @@ Chat template and response-only loss:
 |-------|---------|
 | `chat_template` | Unsloth template name applied to the tokenizer (`"gemma-4"`, `"qwen3"`, `"chatml"`, `"llama-3.1"`, ...). `None` keeps the model's own template. The default is `"qwen2.5"`, so set it for any other model |
 | `train_on_responses` | Mask everything except assistant turns (loss on responses only). Default `False`; the recipe recommends `True` for chat data |
-| `instruction_part` | Text that starts a user turn in the formatted string |
-| `response_part` | Text that starts an assistant turn |
+| `instruction_part` | Text that starts a user turn in the formatted string. Empty: inferred from the tokenizer's template when training starts |
+| `response_part` | Text that starts an assistant turn. Empty: inferred like `instruction_part` |
 
 With `train_on_responses=True`, tokens after each `response_part` up to
 the next `instruction_part` are trained. Both markers must match the
 rendered text exactly (see the [marker table](#chat-templates-and-markers)).
+Leave both empty and `speftr.infer_chat_markers` picks the pair of the
+template family it recognises (ChatML, Gemma 4, Gemma 2/3, Llama 3,
+gpt-oss, Granite 3); it raises, printing the rendered conversation, for
+any other template.
 
 Multimodal checkpoints (Gemma 4, Qwen 3.5, Qwen 3.8) work for text SFT:
 `load_model()` then returns a processor; its text tokenizer is
@@ -332,7 +336,15 @@ are only filled from the tokenizer in `load_model()`.
 | `"lora"` (default) | `adapter_model.safetensors`, `adapter_config.json` (records the base model id), tokenizer/processor files |
 | `"merged_16bit"` | A full 16-bit model with the adapter merged in, plus tokenizer; loads like any Hub checkpoint |
 
-`PESFT` also writes `speftr.json` (its config) and `training_args.json`.
+`PESFT` also writes `speftr.json` (its config), `training_args.json`
+and `train_metrics.json`: TRL's training metrics (`train_runtime`,
+`train_samples_per_second`, `train_steps_per_second`, `train_loss`), the
+final evaluation metrics, the step times (`warmup_seconds`, what the
+first 5 optimizer steps took, which includes kernel compilation, and
+`steady_seconds_per_step`, the median of the later steps), `gpu_name`
+and the process's peak GPU memory (`peak_memory_allocated_gib`,
+`peak_memory_reserved_gib`, measured since the process started, so
+model loading counts).
 `PESFT` merges through Unsloth; `PERL` merges with peft's
 `merge_and_unload` and supports only these two methods. Checkpoints
 (`checkpoint-*`) follow `save_strategy`.
@@ -575,12 +587,23 @@ Rendered by each model's own tokenizer:
 - Qwen 3.5/3.8 templates insert an empty `<think>\n\n</think>\n\n` block
   in assistant turns; it is trained as part of the response. Qwen 3.8
   also prepends a reasoning-effort system prompt.
+- Qwen 3.5 (2B, 4B, 9B) ships no `generation_config.json`, and its
+  model config's end-of-sequence token is `<|endoftext|>` while the
+  template closes a turn with the tokenizer's EOS, `<|im_end|>`. The
+  base model emits both; an adapter trained on chat data learns to
+  emit only `<|im_end|>`, so transformers' `generate` runs on into a
+  new turn unless `eos_token_id` includes `tokenizer.eos_token_id`
+  (the `intent` and `tldr` examples pass both ids; vLLM stops at the
+  tokenizer's EOS by itself). Qwen 2.5, Qwen 3 and Qwen 3.8 ship a
+  generation config listing both tokens and are not affected.
 - gpt-oss renders the system message as developer instructions and an
   assistant `thinking` field as the analysis channel; its markers train
   both the analysis and the final channel
   ([examples/gptoss](../examples/gptoss/README.md)).
 - Gemma 3 has no system role: the template folds the system message into
   the first user turn.
+- Every family in the table is recognised by `speftr.infer_chat_markers`
+  (used when `instruction_part` and `response_part` are empty).
 - Check yours: `print(tokenizer.apply_chat_template(messages,
   tokenize=False))` and copy the markers from the output.
 
@@ -669,6 +692,7 @@ Download once and run without Hub access: see
 | Chat-template error formatting conversations | The tokenizer has no chat template (base model): set `chat_template` to a named template, or format plain text yourself |
 | Formatting function never called | Dataset has a `text` column or `prompt` + `completion` columns; rename them |
 | Response-only loss trains nothing / everything | `instruction_part` / `response_part` don't match the rendered template; print one formatted row |
+| Fine-tuned model's replies run on into `assistant` / `<think>` text (Qwen 3.5) | The model's `eos_token_id` is `<|endoftext|>`, not the turn's `<|im_end|>`; pass `eos_token_id=[..., tokenizer.eos_token_id]` to `generate` ([markers](#chat-templates-and-markers)) |
 | Adapter loads but outputs look like the base model | Loaded with `AutoModelForCausalLM` on a multimodal checkpoint; use the `architectures` class ([above](#load-an-adapter-for-inference-transformers--peft)) |
 | SFT hangs before the first step (forked dataset worker stuck) | `PESFT` avoids it by disabling huggingface_hub telemetry; in your own SFT scripts export `HF_HUB_DISABLE_TELEMETRY=1` |
 | 401 / gated repo errors | Accept the terms on the Hub page, then `hf auth login` or set `HF_TOKEN` |
@@ -718,6 +742,52 @@ Limits:
   pass. ModelOpt NVFP4 checkpoints (e.g. `nvidia/Gemma-4-31B-IT-NVFP4`)
   cannot be loaded by transformers. Use the bf16 original with
   `load_in_4bit`.
+
+### Bigger or newer GPUs
+
+Measured with `examples/speed.py` on the
+[intent](../examples/intent/README.md#speed) and
+[tldr](../examples/tldr/README.md#speed) examples (Granite 3.3 2B,
+Qwen 3.5 4B and Gemma 4 E4B, bf16, batch 16, 40-step runs plus
+300-step runs) on one RTX 3090 (24 GB) and one A100 40GB (PCIe). What
+holds across the three models and both examples:
+
+- **Same settings, shorter steps.** The A100 runs the recipe defaults
+  2.2 to 2.5 times faster per step than the 3090 (intent: 3.49 → 1.60,
+  3.55 → 1.52, 5.97 → 2.69 s/step; tldr: 2.67 → 1.14, 3.40 → 1.45,
+  3.73 → 1.53), at the same peak memory, loss and score. The 300-step
+  intent runs went from 18.7, 18.8 and 29.6 minutes to 8.7, 9.1 and
+  14.2.
+- **Keep the batch.** Batch 32 doubles the step time and gives the same
+  samples per second as batch 16 on both GPUs; the recipe stops at 32
+  for LoRA's sake anyway ([README](../README.md#the-recipe)). Gradient
+  accumulation is a cost, not a lever: 8 × 2 adds up to 7% per step and
+  4 × 4 8 to 43%, so run the largest per-device batch that fits and
+  accumulate only for the remainder.
+- **Gradient checkpointing stays on** at batch 16: without it these
+  2B to 8B models run out of memory at 600-token prompts even on 40 GB
+  (turning it off pays at batch 1, see the table above).
+- **4-bit costs no speed.** `load_in_4bit` trains within 8% of the
+  bf16 step time on both GPUs with 23 to 38% less memory, so on a
+  larger GPU bf16 buys exactness, not time, for models of this size.
+- **Attention and batching kernels are model-specific.** Flex
+  attention is 6 to 8% faster than SDPA for Granite on both GPUs at
+  steady state (and recompiles for new sequence lengths, which eats
+  most of it over 40 steps), no faster for Gemma and unsupported for
+  Qwen 3.5. Padding-free and packing break Granite's training (eval
+  loss 1.9 to 4.5 instead of 0.2 to 1.75), leave Qwen 3.5 unchanged,
+  and slow Gemma down. Measure before switching either on.
+- **Warm-up is the same on both GPUs.** The first steps compile
+  kernels: 14 to 90 s with a warm compile cache, up to 2 minutes (12
+  with flex attention plus padding-free on Gemma) with a cold one.
+  `train_metrics.json` separates it (`warmup_seconds`,
+  `steady_seconds_per_step`).
+- **Precision.** bf16 is the training dtype on every GPU tested (both
+  are Ampere). FP8 and NVFP4 checkpoints are inference formats here
+  (Limits above); Hopper and Blackwell GPUs are not measured.
+- **Larger models or more throughput** come from more memory or more
+  GPUs, not from different hyperparameters: the combinations table
+  above and [Multiple GPUs](#11-multiple-gpus).
 
 ## 11. Multiple GPUs
 

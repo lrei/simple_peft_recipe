@@ -41,6 +41,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
+import time
 import warnings
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
@@ -51,11 +53,14 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from speftr.chat_markers import ChatMarkers, infer_chat_markers
+
 
 if TYPE_CHECKING:
     from datasets import Dataset
     from peft import PeftModel
-    from transformers import PreTrainedTokenizerBase
+    from transformers import PreTrainedTokenizerBase, TrainerCallback
+    from transformers.trainer_utils import TrainOutput
     from trl import SFTConfig, SFTTrainer
 
 
@@ -103,7 +108,9 @@ class PESFTConfig:
             on one GPU. Not for torchrun/DDP, where Unsloth puts each
             process on its own GPU (``cuda:LOCAL_RANK``). None keeps
             Unsloth's placement.
-        attn_implementation: Attention backend passed to the model loader.
+        attn_implementation: Attention backend passed to the model loader:
+            ``"sdpa"``, ``"flex_attention"``, ``"eager"`` or
+            ``"flash_attention_2"`` (needs the ``flash-attn`` package).
             ``"sdpa"`` is fastest on a 3090; Unsloth's own default (flex
             attention) recompiles its block masks for every new sequence
             length there.
@@ -111,8 +118,11 @@ class PESFTConfig:
             tokenizer's own template (needed for models Unsloth has no
             named template for)
         train_on_responses: Only train on response tokens, not instructions
-        instruction_part: Chat template marker for instruction/user turn
-        response_part: Chat template marker for response/assistant turn
+        instruction_part: Chat template marker for instruction/user turn.
+            Empty: inferred from the tokenizer's chat template
+            (``speftr.chat_markers``) when training starts.
+        response_part: Chat template marker for response/assistant turn.
+            Empty: inferred like ``instruction_part``.
         lora_r: LoRA rank (adapter dimension)
         lora_alpha: LoRA scaling factor
         lora_layers: Layer preset used to derive target_modules on the CLI
@@ -368,7 +378,8 @@ class PESFTConfig:
             type=str,
             default="<|im_start|>user\n",
             help=(
-                "Chat template marker for instruction/user turn. "
+                "Chat template marker for instruction/user turn; empty "
+                "infers it from the model's chat template. "
                 "For Qwen ChatML models: '<|im_start|>user\\n'. "
                 "For Gemma models: '<start_of_turn>user\\n'. "
                 "For Llama models: "
@@ -383,7 +394,8 @@ class PESFTConfig:
             type=str,
             default="<|im_start|>assistant\n",
             help=(
-                "Chat template marker for response/assistant turn. "
+                "Chat template marker for response/assistant turn; empty "
+                "infers it from the model's chat template. "
                 "For Qwen ChatML models: '<|im_start|>assistant\\n'. "
                 "For Gemma models: '<start_of_turn>model\\n'. "
                 "For Llama models: "
@@ -509,6 +521,23 @@ class PESFTConfig:
             "--packing",
             action="store_true",
             help="Enable sequence packing during training (default: disabled)",
+        )
+        train_group.add_argument(
+            "--padding_free",
+            action="store_true",
+            help=(
+                "Concatenate each batch into one unpadded sequence "
+                "(default: padded batches; see PESFTConfig.padding_free)"
+            ),
+        )
+        model_group.add_argument(
+            "--attn_implementation",
+            type=str,
+            choices=["sdpa", "flex_attention", "eager", "flash_attention_2"],
+            default="sdpa",
+            help=(
+                "Attention backend passed to the model loader (default: sdpa)"
+            ),
         )
         train_group.add_argument(
             "--router_aux_loss_coef",
@@ -762,6 +791,143 @@ def save_parameters_to_json(
     return output_path
 
 
+def _resolve_chat_markers(
+    config: PESFTConfig, tokenizer: PreTrainedTokenizerBase
+) -> ChatMarkers:
+    """Return the response-only markers, inferring empty ones.
+
+    Args:
+        config: Training configuration; its ``instruction_part`` and
+            ``response_part`` are used when both are set.
+        tokenizer: Tokenizer whose chat template is probed otherwise.
+
+    Returns:
+        The markers to pass to Unsloth's ``train_on_responses_only``.
+    """
+    if config.instruction_part and config.response_part:
+        return ChatMarkers(
+            "configured", config.instruction_part, config.response_part
+        )
+    return infer_chat_markers(tokenizer)
+
+
+WARMUP_STEPS_EXCLUDED = 5
+"""Optimizer steps left out of the steady-state step time."""
+
+
+def _make_step_timer() -> tuple[TrainerCallback, list[float]]:
+    """Create a trainer callback that records the wall time of each step.
+
+    The first steps of a run include kernel compilation and autotuning,
+    which can take minutes on a cold cache; the recorded times let the
+    metrics separate that warm-up from the steady-state step time.
+
+    Returns:
+        The callback to pass to ``trainer.add_callback`` and the list it
+        appends each optimizer step's duration in seconds to.
+    """
+    from transformers import TrainerCallback  # noqa: PLC0415
+
+    step_seconds: list[float] = []
+
+    class StepTimer(TrainerCallback):
+        """Append the duration of every optimizer step to a list."""
+
+        def __init__(self) -> None:
+            """Start with no step in progress."""
+            self._started: float | None = None
+
+        def on_step_begin(self, *_args: object, **_kwargs: object) -> None:
+            """Note the time an optimizer step starts.
+
+            Args:
+                *_args: Unused; trainer callback signature.
+                **_kwargs: Unused; trainer callback signature.
+
+            Returns:
+                None.
+            """
+            self._started = time.perf_counter()
+
+        def on_step_end(self, *_args: object, **_kwargs: object) -> None:
+            """Record the duration of the step that just ended.
+
+            Args:
+                *_args: Unused; trainer callback signature.
+                **_kwargs: Unused; trainer callback signature.
+
+            Returns:
+                None.
+            """
+            if self._started is not None:
+                step_seconds.append(time.perf_counter() - self._started)
+                self._started = None
+
+    return StepTimer(), step_seconds
+
+
+def _step_time_metrics(step_seconds: list[float]) -> dict[str, float]:
+    """Summarize per-step durations into warm-up and steady-state times.
+
+    Args:
+        step_seconds: Duration of each optimizer step, in order.
+
+    Returns:
+        ``warmup_seconds``, the total of the first
+        ``WARMUP_STEPS_EXCLUDED`` steps, and ``steady_seconds_per_step``,
+        the median of the remaining steps; empty when the run had no
+        step after the warm-up.
+    """
+    steady = step_seconds[WARMUP_STEPS_EXCLUDED:]
+    if not steady:
+        return {}
+    return {
+        "warmup_seconds": sum(step_seconds[:WARMUP_STEPS_EXCLUDED]),
+        "steady_seconds_per_step": statistics.median(steady),
+    }
+
+
+def _collect_train_metrics(
+    train_output: TrainOutput,
+    eval_metrics: Mapping[str, float] | None,
+    step_seconds: list[float] | None = None,
+) -> dict[str, object]:
+    """Gather what a training run cost: time, throughput, memory, loss.
+
+    Args:
+        train_output: Return value of ``trainer.train()``; its ``metrics``
+            hold TRL's ``train_runtime``, ``train_samples_per_second``,
+            ``train_steps_per_second`` and ``train_loss``.
+        eval_metrics: Return value of the final ``trainer.evaluate()``,
+            or None when there was no evaluation dataset.
+        step_seconds: Duration of each optimizer step, from the step
+            timer; None when none was recorded.
+
+    Returns:
+        TRL's training metrics plus ``global_step``, the evaluation
+        metrics, the step times (``warmup_seconds`` and
+        ``steady_seconds_per_step``, see ``_step_time_metrics``),
+        ``gpu_name`` and this process's peak GPU memory in GiB
+        (``peak_memory_allocated_gib``, ``peak_memory_reserved_gib``),
+        measured since the process started, so model loading counts.
+    """
+    metrics: dict[str, object] = dict(train_output.metrics)
+    metrics["global_step"] = train_output.global_step
+    if eval_metrics is not None:
+        metrics.update(eval_metrics)
+    if step_seconds:
+        metrics.update(_step_time_metrics(step_seconds))
+    if torch.cuda.is_available():
+        metrics["gpu_name"] = torch.cuda.get_device_name()
+        metrics["peak_memory_allocated_gib"] = (
+            torch.cuda.max_memory_allocated() / 1024**3
+        )
+        metrics["peak_memory_reserved_gib"] = (
+            torch.cuda.max_memory_reserved() / 1024**3
+        )
+    return metrics
+
+
 class PESFT:
     """Parameter-Efficient Supervised Fine-Tuning trainer.
 
@@ -820,6 +986,7 @@ class PESFT:
         self.model: PeftModel | None = None
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.trainer: SFTTrainer | None = None
+        self.train_metrics: dict[str, object] | None = None
         self.training_args: SFTConfig | None = None
 
         self._unsloth_version = unsloth.__version__
@@ -1098,20 +1265,23 @@ class PESFT:
         # never casts, so turning it off makes both evaluations agree.
         trainer.args.bf16_full_eval = False
         trainer.args.fp16_full_eval = False
+        step_timer, step_seconds = _make_step_timer()
+        trainer.add_callback(step_timer)
         self.trainer = trainer
 
         # Apply train_on_responses_only if enabled
         if self.config.train_on_responses:
+            markers = _resolve_chat_markers(self.config, tokenizer)
             print(
                 "\nApplying train_on_responses_only "
-                "(masking instruction tokens)..."
+                f"(masking instruction tokens; {markers.family} markers)..."
             )
             trainer = cast(
                 "SFTTrainer",
                 train_on_responses_only(
                     trainer,
-                    instruction_part=self.config.instruction_part,
-                    response_part=self.config.response_part,
+                    instruction_part=markers.instruction_part,
+                    response_part=markers.response_part,
                 ),
             )
             self.trainer = trainer
@@ -1123,16 +1293,21 @@ class PESFT:
             )
 
         with _modules_in_training_mode(model, self.config.eval_in_train_mode):
-            self._run_training(
+            train_output = self._run_training(
                 trainer, resume_from_checkpoint=resume_from_checkpoint
             )
+            eval_metrics = None
             if eval_dataset is not None:
-                self._run_final_evaluation(trainer)
+                eval_metrics = self._run_final_evaluation(trainer)
+        self.train_metrics = _collect_train_metrics(
+            train_output, eval_metrics, step_seconds
+        )
+        print(f"\nTraining metrics: {self.train_metrics}")
 
     @staticmethod
     def _run_training(
         trainer: SFTTrainer, *, resume_from_checkpoint: str | bool | None
-    ) -> None:
+    ) -> TrainOutput:
         """Run ``trainer.train``, resuming when asked.
 
         Args:
@@ -1140,28 +1315,28 @@ class PESFT:
             resume_from_checkpoint: See ``train``.
 
         Returns:
-            None. The model is trained in place.
+            The trainer's output (final step and TRL's training metrics).
+            The model is trained in place.
         """
         print("\nStarting training...")
         if resume_from_checkpoint:
             if isinstance(resume_from_checkpoint, bool):
                 print("Resuming from latest checkpoint (auto-detect)...")
-                trainer.train(resume_from_checkpoint=True)
-            else:
-                print(f"Resuming from checkpoint: {resume_from_checkpoint}")
-                trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        else:
-            trainer.train()
+                return trainer.train(resume_from_checkpoint=True)
+            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+            return trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        return trainer.train()
 
     @staticmethod
-    def _run_final_evaluation(trainer: SFTTrainer) -> None:
+    def _run_final_evaluation(trainer: SFTTrainer) -> dict[str, float] | None:
         """Evaluate the trained model and print the metrics.
 
         Args:
             trainer: The trainer, after ``train``.
 
         Returns:
-            None. The metrics, or the out-of-memory error, are printed.
+            The evaluation metrics, or None when evaluation ran out of
+            GPU memory (the error is printed).
         """
         print("\nEvaluating on test set...")
         try:
@@ -1176,13 +1351,17 @@ class PESFT:
                 "  The model is trained; save it, then evaluate with a "
                 "smaller per_device_eval_batch_size."
             )
+            return None
+        return cast("dict[str, float]", eval_results)
 
     def _save_training_metadata(self) -> None:
         """Persist configuration and training arguments alongside artifacts.
 
-        Writes ``speftr.json`` (the PESFT config) and ``training_args.json``
-        (the SFTConfig) next to the saved model, to reproduce or inspect the
-        run.
+        Writes ``speftr.json`` (the PESFT config), ``training_args.json``
+        (the SFTConfig) and, after ``train``, ``train_metrics.json``
+        (runtime, throughput, peak GPU memory, losses; see
+        ``_collect_train_metrics``) next to the saved model, to reproduce
+        or inspect the run.
 
         Returns:
             None. Files are written to ``config.output_dir``.
@@ -1207,6 +1386,12 @@ class PESFT:
         with args_path.open("w", encoding="utf-8") as handle:
             json.dump(serializable_args, handle, indent=2, sort_keys=True)
         print(f"Training arguments saved to {args_path}")
+
+        if self.train_metrics is not None:
+            metrics_path = output_path / "train_metrics.json"
+            with metrics_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.train_metrics, handle, indent=2, sort_keys=True)
+            print(f"Training metrics saved to {metrics_path}")
 
     def save_model(
         self,

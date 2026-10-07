@@ -20,8 +20,10 @@ def test_all_contents():
             "PEDPOConfig",
             "PERLConfig",
             "PESFTConfig",
+            "ChatMarkers",
             "__version__",
             "display_parameters",
+            "infer_chat_markers",
             "save_parameters_to_json",
         ]
     )

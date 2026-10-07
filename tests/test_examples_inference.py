@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess  # nosec B404
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from examples.intent import intent_inference
 from examples.prefs import prefs_inference
 from examples.rgym import rgym_inference
 from examples.text2sql import text2sql_inference
+from examples.tldr import tldr_inference
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +57,7 @@ SCRIPTS = [
     intent_inference,
     prefs_inference,
     text2sql_inference,
+    tldr_inference,
     rgym_inference,
 ]
 SCRIPT_IDS = [script.__name__.rsplit(".", 1)[-1] for script in SCRIPTS]
@@ -271,6 +274,24 @@ def test_text2sql_chats_match_training_prompt(load_fixture):
     assert text2sql_inference.CHAT_TEMPLATE_KWARGS == CHAT_TEMPLATE_KWARGS
 
 
+def test_tldr_chats_drop_the_cue_and_use_training_instruction(load_fixture):
+    rows = load_fixture("tldr_rows.json")
+    posts = [row["prompt"] for row in rows]
+    chats = tldr_inference.build_chats(posts)
+
+    assert tuple(posts[:2]) == tldr_inference.DEFAULT_PROMPTS
+    assert posts[0].endswith("TL;DR:")
+    body = posts[0].removesuffix("TL;DR:").strip()
+    assert chats[0] == [
+        {
+            "role": "user",
+            "content": f"{tldr_inference.INSTRUCTION}\n\n{body}",
+        }
+    ]
+    assert [chat[0]["role"] for chat in chats] == ["user"] * len(posts)
+    assert tldr_inference.CHAT_TEMPLATE_KWARGS == {"enable_thinking": False}
+
+
 def test_instruct_chats_start_with_pirate_system_prompt(load_fixture):
     rows = load_fixture("dolly_pirate_rows.json")
     instructions = [row["instruction"] for row in rows if not row["context"]]
@@ -361,3 +382,25 @@ def test_vllm_applies_adapter_in_both_routes(tmp_path):
     assert "VLLM_ADAPTER_OK" in result.stdout, (
         result.stdout[-4000:] + result.stderr[-4000:]
     )
+
+
+@pytest.mark.parametrize(
+    "stop_script", [intent_inference, tldr_inference], ids=["intent", "tldr"]
+)
+@pytest.mark.parametrize(
+    "configured", [None, 248044, [248044], [248046, 248044]]
+)
+def test_stop_token_ids_add_the_tokenizer_eos(stop_script, configured):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
+    model = types.SimpleNamespace(
+        generation_config=types.SimpleNamespace(eos_token_id=configured)
+    )
+    ids = stop_script.stop_token_ids(model, tokenizer)
+    assert tokenizer.eos_token_id in ids
+    assert ids == sorted(set(ids))
+    if isinstance(configured, int):
+        assert configured in ids
+    elif configured:
+        assert set(configured) <= set(ids)

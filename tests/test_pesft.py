@@ -13,8 +13,12 @@ import torch
 from speftr.pesft import (
     PESFT,
     PESFTConfig,
+    _collect_train_metrics,
+    _make_step_timer,
     _modules_in_training_mode,
     _normalize_parameters,
+    _resolve_chat_markers,
+    _step_time_metrics,
     display_parameters,
     save_parameters_to_json,
 )
@@ -510,3 +514,114 @@ def test_final_evaluation_other_errors_propagate():
     trainer = _EvaluateRaises(RuntimeError("shape mismatch"))
     with pytest.raises(RuntimeError, match="shape mismatch"):
         PESFT._run_final_evaluation(cast("SFTTrainer", trainer))
+
+
+# --- training metrics and chat markers --------------------------------------
+
+
+def _fake_cuda(monkeypatch, *, available: bool) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "Fake GPU")
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_allocated", lambda: 3 * 1024**3
+    )
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 4 * 1024**3)
+
+
+def test_collect_train_metrics_merges_trl_eval_and_gpu(monkeypatch):
+    _fake_cuda(monkeypatch, available=True)
+    train_output = types.SimpleNamespace(
+        global_step=20,
+        metrics={"train_runtime": 12.5, "train_samples_per_second": 25.6},
+    )
+    metrics = _collect_train_metrics(train_output, {"eval_loss": 0.5})  # type: ignore[arg-type]
+    assert metrics == {
+        "train_runtime": 12.5,
+        "train_samples_per_second": 25.6,
+        "global_step": 20,
+        "eval_loss": 0.5,
+        "gpu_name": "Fake GPU",
+        "peak_memory_allocated_gib": 3.0,
+        "peak_memory_reserved_gib": 4.0,
+    }
+
+
+def test_collect_train_metrics_without_gpu_or_evaluation(monkeypatch):
+    _fake_cuda(monkeypatch, available=False)
+    train_output = types.SimpleNamespace(
+        global_step=3, metrics={"train_runtime": 1.0}
+    )
+    metrics = _collect_train_metrics(train_output, None)  # type: ignore[arg-type]
+    assert metrics == {"train_runtime": 1.0, "global_step": 3}
+
+
+def test_training_metadata_includes_metrics_after_training(tmp_path):
+    holder = types.SimpleNamespace(
+        config=PESFTConfig(output_dir=str(tmp_path / "out")),
+        training_args=_sft_config(tmp_path / "out"),
+        trainer=None,
+        train_metrics={"train_runtime": 1.0, "global_step": 3},
+    )
+    PESFT._save_training_metadata(cast("PESFT", holder))
+    written = json.loads((tmp_path / "out" / "train_metrics.json").read_text())
+    assert written == {"train_runtime": 1.0, "global_step": 3}
+
+
+def test_training_metadata_has_no_metrics_before_training(tmp_path):
+    holder = types.SimpleNamespace(
+        config=PESFTConfig(output_dir=str(tmp_path / "out")),
+        training_args=_sft_config(tmp_path / "out"),
+        trainer=None,
+        train_metrics=None,
+    )
+    PESFT._save_training_metadata(cast("PESFT", holder))
+    assert (tmp_path / "out" / "speftr.json").exists()
+    assert not (tmp_path / "out" / "train_metrics.json").exists()
+
+
+def test_configured_markers_are_used_as_given(qwen_tokenizer):
+    config = PESFTConfig(instruction_part="<u>", response_part="<a>")
+    markers = _resolve_chat_markers(config, qwen_tokenizer)
+    assert (markers.instruction_part, markers.response_part) == ("<u>", "<a>")
+
+
+def test_empty_markers_are_inferred_from_the_template(qwen_tokenizer):
+    config = PESFTConfig(instruction_part="", response_part="")
+    markers = _resolve_chat_markers(config, qwen_tokenizer)
+    assert markers.instruction_part == "<|im_start|>user\n"
+    assert markers.response_part == "<|im_start|>assistant\n"
+
+
+def test_step_time_metrics_separate_warmup_from_steady_state():
+    step_seconds = [60.0, 30.0, 5.0, 2.0, 1.6, 1.5, 1.7, 1.5, 1.6, 9.0]
+    metrics = _step_time_metrics(step_seconds)
+    assert metrics == {"warmup_seconds": 98.6, "steady_seconds_per_step": 1.6}
+
+
+def test_step_time_metrics_empty_without_steady_steps():
+    assert _step_time_metrics([1.0, 2.0, 3.0]) == {}
+
+
+def test_step_timer_records_each_step():
+    timer, step_seconds = _make_step_timer()
+    for _ in range(3):
+        timer.on_step_begin(None, None, None)
+        timer.on_step_end(None, None, None)
+    timer.on_step_end(None, None, None)
+    assert len(step_seconds) == 3
+    assert all(duration >= 0 for duration in step_seconds)
+
+
+def test_collect_train_metrics_includes_step_times(monkeypatch):
+    _fake_cuda(monkeypatch, available=False)
+    train_output = types.SimpleNamespace(global_step=7, metrics={})
+    metrics = _collect_train_metrics(
+        train_output,  # type: ignore[arg-type]
+        None,
+        [10.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0],
+    )
+    assert metrics == {
+        "global_step": 7,
+        "warmup_seconds": 14.0,
+        "steady_seconds_per_step": 2.0,
+    }

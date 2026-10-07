@@ -103,3 +103,25 @@ def test_formatting_func_handles_batches_and_single_rows(
 
     single = {"message": batch["message"][0], "label": batch["label"][0]}
     assert format_batch(single) == texts[:1]
+
+
+def test_parser_defaults_leave_markers_to_inference():
+    from examples.intent.intent_train import build_parser
+    from speftr import PESFTConfig
+
+    config = PESFTConfig.from_args(build_parser().parse_args([]))
+    assert config.model_name_or_path == "ibm-granite/granite-3.3-2b-instruct"
+    assert config.chat_template is None
+    assert config.train_on_responses is True
+    assert (config.instruction_part, config.response_part) == ("", "")
+    assert config.per_device_train_batch_size == 16
+
+
+def test_parser_accepts_pesft_flags_and_eval_rows():
+    from examples.intent.intent_train import build_parser
+
+    args = build_parser().parse_args(
+        ["--gradient_accumulation_steps", "2", "--eval_rows", "50"]
+    )
+    assert args.gradient_accumulation_steps == 2
+    assert args.eval_rows == 50

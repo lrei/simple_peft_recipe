@@ -16,6 +16,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
 # PESFT is imported lazily (below) so these never import unsloth.
+from .chat_markers import ChatMarkers, infer_chat_markers
 from .pedpo import PEDPO, PEDPOConfig
 from .perl import PERL, PERLConfig
 
@@ -62,10 +63,12 @@ __all__ = [
     "PEDPO",
     "PERL",
     "PESFT",
+    "ChatMarkers",
     "PEDPOConfig",
     "PERLConfig",
     "PESFTConfig",
     "__version__",
     "display_parameters",
+    "infer_chat_markers",
     "save_parameters_to_json",
 ]

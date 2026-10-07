@@ -31,7 +31,9 @@ suits PEFT.
 The defaults are sized for a 24 GB GPU and run unchanged on larger
 ones. The library and examples are tested on RTX 3090 (24 GB) and A100
 (40 GB), single and multi-GPU (data parallel and model splitting). The
-guide covers [what fits where](docs/guide.md#10-fitting-in-memory) and
+guide covers [what fits where](docs/guide.md#10-fitting-in-memory),
+[what a bigger GPU changes](docs/guide.md#bigger-or-newer-gpus) (the
+same settings, 2.2 to 2.5 times faster per step on the A100) and
 [several GPUs](docs/guide.md#11-multiple-gpus); each example records
 the hardware and settings of its measured runs.
 
@@ -90,8 +92,8 @@ parameters.
 - Defaults: rank 8 for SFT, a safe over-provisioned choice (the smallest
   rank Unsloth's hyperparameter guide suggests); rank 1 for RL and DPO.
 
-The examples use rank 1 (gptoss, prefs, rgym, text2sql) and rank 8 (guard,
-intent, instruct, big); each README gives its budget.
+The examples use rank 1 (gptoss, intent, prefs, rgym, text2sql), rank 2
+(tldr) and rank 8 (guard, instruct, big); each README gives its budget.
 
 #### Checking a rank against a dataset
 

@@ -1,0 +1,16 @@
+{
+  "epoch": 0.3,
+  "eval_loss": 3.030945062637329,
+  "eval_runtime": 0.1936,
+  "eval_samples_per_second": 41.316,
+  "eval_steps_per_second": 10.329,
+  "global_step": 3,
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "peak_memory_allocated_gib": 2.4018874168395996,
+  "peak_memory_reserved_gib": 2.46875,
+  "total_flos": 18207608887296.0,
+  "train_loss": 2.870738903681437,
+  "train_runtime": 4.9224,
+  "train_samples_per_second": 2.438,
+  "train_steps_per_second": 0.609
+}
