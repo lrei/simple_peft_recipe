@@ -208,9 +208,6 @@ runs use rank 1 at 2e-4:
   LoRA and 29 to 30 GiB against 20 (LoRA) and 15 (QLoRA), and writes a
   9 GB model instead of a 5 MB adapter. The 24 GB card cannot run the
   full fine-tuning rows at all.
-- Full fine-tuning here is bf16 weights without an fp32 master copy;
-  fp32 master weights and fp32 Adam moments would need about 72 GB for
-  this model and do not fit one A100 40GB.
 
 ## Speed
 
