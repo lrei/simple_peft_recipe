@@ -789,6 +789,13 @@ holds across the three models and both examples:
 - **Precision.** bf16 is the training dtype on every GPU tested (both
   are Ampere). FP8 and NVFP4 checkpoints are inference formats here
   (Limits above); Hopper and Blackwell GPUs are not measured.
+- **Full fine-tuning buys nothing measurable at this size.** Qwen 3.5
+  4B on Banking77, 300 steps on one A100 40GB, same seed: full
+  fine-tuning (bf16 weights, 8-bit AdamW, learning rate 2e-5), LoRA
+  rank 1 and QLoRA rank 1 (2e-4) score 0.856, 0.833 and 0.868
+  accuracy, within the spread of repeated runs; full fine-tuning takes
+  27% longer per step and 29 GiB against 20 and 15
+  ([intent README](../examples/intent/README.md#full-fine-tuning-lora-and-qlora-on-one-a100)).
 - **Larger models or more throughput** come from more memory or more
   GPUs, not from different hyperparameters: the combinations table
   above and [Multiple GPUs](#11-multiple-gpus).

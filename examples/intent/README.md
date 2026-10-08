@@ -185,6 +185,33 @@ steady step time and 23 to 38% less memory. The longer A100 wall times
 for Qwen and Gemma are warm-up: the three 4-bit runs loaded and
 compiled at the same time on shared nodes.
 
+### Full fine-tuning, LoRA and QLoRA on one A100
+
+Qwen 3.5 4B, the same 300 steps at batch 16 and the same seed, run one
+after another on one A100 40GB. Full fine-tuning (`--full_finetuning`)
+trains every weight in bf16 with the recipe's 8-bit AdamW at a ten times
+lower learning rate (2e-5, the "LoRA Without Regret" ratio); the LoRA
+runs use rank 1 at 2e-4:
+
+| Method | Trainable parameters | Steady s/step | 300 steps | Peak GiB | Final eval loss | Accuracy / macro-F1 / invalid |
+|--------|----------------------|---------------|-----------|----------|-----------------|-------------------------------|
+| Full fine-tuning, batch 16 | 4.54B (100%) | 1.93 | 11.3 min | 29.4 | 0.068 | 0.856 / 0.850 / 0.06% |
+| Full fine-tuning, batch 8 × 2 | 4.54B (100%) | 2.05 | 11.1 min | 30.4 | 0.077 | 0.846 / 0.845 / 0.19% |
+| LoRA, rank 1 | 1.33M (0.03%) | 1.52 | 8.3 min | 20.4 | 0.074 | 0.833 / 0.828 / 0.29% |
+| QLoRA, rank 1 (4-bit base) | 1.33M (0.03%) | 1.66 | 8.7 min | 15.1 | 0.095 | 0.868 / 0.863 / 0.16% |
+
+- Scores span 0.833 to 0.868, and repeats of the same configuration on
+  the same GPU span about as much: this LoRA run scored 0.833 against
+  0.849 in the [table above](#results), this QLoRA run 0.868 against
+  0.862. Nothing separates the four methods on this task at 300 steps.
+- What differs is cost: full fine-tuning takes 27% longer per step than
+  LoRA and 29 to 30 GiB against 20 (LoRA) and 15 (QLoRA), and writes a
+  9 GB model instead of a 5 MB adapter. The 24 GB card cannot run the
+  full fine-tuning rows at all.
+- Full fine-tuning here is bf16 weights without an fp32 master copy;
+  fp32 master weights and fp32 Adam moments would need about 72 GB for
+  this model and do not fit one A100 40GB.
+
 ## Speed
 
 `examples/speed.py` runs `intent_train` once per setting of the
