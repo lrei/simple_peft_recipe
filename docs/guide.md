@@ -767,9 +767,12 @@ holds across the three models and both examples:
 - **Gradient checkpointing stays on** at batch 16: without it these
   2B to 8B models run out of memory at 600-token prompts even on 40 GB
   (turning it off pays at batch 1, see the table above).
-- **4-bit costs no speed.** `load_in_4bit` trains within 8% of the
-  bf16 step time on both GPUs with 23 to 38% less memory, so on a
-  larger GPU bf16 buys exactness, not time, for models of this size.
+- **4-bit costs no speed, and no measured quality.** `load_in_4bit`
+  trains within 8% of the bf16 step time on both GPUs with 23 to 38%
+  less memory, and the 300-step 4-bit runs score within the bf16 runs'
+  spread (intent accuracy 0.80 to 0.86 against 0.82 to 0.86; TL;DR
+  ROUGE-1 within 0.01) on both GPUs. On a larger GPU bf16 buys nothing
+  measurable here for models of this size.
 - **Attention and batching kernels are model-specific.** Flex
   attention is 6 to 8% faster than SDPA for Granite on both GPUs at
   steady state (and recompiles for new sequence lengths, which eats

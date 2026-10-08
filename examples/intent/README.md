@@ -164,6 +164,27 @@ steps (4,800 of the 9,503 train rows), scored on the full test split
 "Invalid" means the first line of the reply is not an intent name; it
 counts as an error in accuracy and macro-F1.
 
+### 4-bit base weights
+
+The same 300-step runs with `--load_in_4bit` (QLoRA: NF4 base weights,
+the adapter in bf16), evaluated on the bf16 base:
+
+| Model | GPU | Fine-tuned: accuracy / macro-F1 / invalid | Final eval loss | 300 steps | Peak GiB |
+|-------|-----|-------------------------------------------|-----------------|-----------|----------|
+| Granite 3.3 2B, 4-bit | RTX 3090 | 0.834 / 0.825 / 0.4% | 0.100 | 18.8 min (3.52 s/step) | 5.7 |
+| Granite 3.3 2B, 4-bit | A100 | 0.799 / 0.786 / 0.3% | 0.122 | 8.6 min (1.62 s/step) | 5.7 |
+| Qwen 3.5 4B, 4-bit | RTX 3090 | 0.855 / 0.854 / 0.0% | 0.072 | 19.2 min (3.60 s/step) | 15.1 |
+| Qwen 3.5 4B, 4-bit | A100 | 0.862 / 0.859 / 0.0% | 0.065 | 15.3 min (1.65 s/step) | 15.1 |
+| Gemma 4 E4B, 4-bit | RTX 3090 | 0.849 / 0.843 / 0.0% | 0.079 | 29.6 min (5.95 s/step) | 14.7 |
+| Gemma 4 E4B, 4-bit | A100 | 0.853 / 0.840 / 0.1% | 0.071 | 14.1 min (2.71 s/step) | 14.7 |
+
+4-bit scores land within the bf16 runs' spread (0.799 to 0.862 against
+0.815 to 0.858 accuracy; the largest gap, Granite on the A100, is 1.6
+points below its bf16 run and 1.4 above it on the 3090) at the same
+steady step time and 23 to 38% less memory. The longer A100 wall times
+for Qwen and Gemma are warm-up: the three 4-bit runs loaded and
+compiled at the same time on shared nodes.
+
 ## Speed
 
 `examples/speed.py` runs `intent_train` once per setting of the
@@ -259,7 +280,8 @@ What the three models show, on both GPUs:
   than the default for any of the three.
 - **4-bit** trains at the bf16 step time, within 8%, with 23 to 38% less
   memory (Granite 9.0 to 5.6 GiB, Qwen 20.4 to 15.1, Gemma 19.3 to
-  14.8).
+  14.8), and its 300-step scores match bf16
+  ([above](#4-bit-base-weights)).
 - **Batch 32** doubles the step time: 4.4 to 4.6 samples/s either way
   on the 3090, 10.0 to 10.6 on the A100 for Granite and Qwen, 5.9 to
   6.1 for Gemma, whose batch 32 (23.9 GiB) no longer fits the 3090.

@@ -166,6 +166,23 @@ settings were run on one RTX 3090 (24 GB) and on one A100 40GB:
       --prompt_column prompt --response_column completion --responses_only
   ```
 
+### 4-bit base weights
+
+The same 300-step runs with `--load_in_4bit` (QLoRA: NF4 base weights,
+the adapter in bf16), evaluated on the bf16 base:
+
+| Model | GPU | Fine-tuned: ROUGE-1 / ROUGE-2 / ROUGE-L, words | Final eval loss | 300 steps | Peak GiB |
+|-------|-----|------------------------------------------------|-----------------|-----------|----------|
+| Granite 3.3 2B, 4-bit | RTX 3090 | 0.357 / 0.135 / 0.281, 22 | 1.757 | 14.2 min (2.70 s/step) | 5.5 |
+| Granite 3.3 2B, 4-bit | A100 | 0.353 / 0.135 / 0.278, 23 | 1.757 | 6.4 min (1.16 s/step) | 5.5 |
+| Qwen 3.5 4B, 4-bit | RTX 3090 | 0.359 / 0.139 / 0.283, 22 | 1.749 | 18.2 min (3.45 s/step) | 16.8 |
+| Qwen 3.5 4B, 4-bit | A100 | 0.361 / 0.141 / 0.285, 23 | 1.749 | 8.4 min (1.52 s/step) | 16.8 |
+| Gemma 4 E4B, 4-bit | RTX 3090 | 0.361 / 0.143 / 0.284, 23 | 1.874 | 19.6 min (3.66 s/step) | 14.7 |
+| Gemma 4 E4B, 4-bit | A100 | 0.367 / 0.146 / 0.287, 24 | 1.873 | 8.7 min (1.56 s/step) | 14.7 |
+
+4-bit ROUGE is within 0.01 of the bf16 runs for every model and GPU,
+at the same steady step time and 24 to 38% less memory.
+
 ## Speed
 
 `examples/speed.py` runs `tldr_train` once per setting of the recipe's
@@ -257,7 +274,8 @@ to long, near-identical prompts:
   372-token rows.
 - **4-bit** trains within 8% of the bf16 step time with 24 to 38% less
   memory (Qwen 22.2 to 16.8 GiB, Gemma 19.3 to 14.7, Granite 8.9 to
-  5.5).
+  5.5), and its 300-step ROUGE matches bf16
+  ([above](#4-bit-base-weights)).
 - **Batch 32** doubles the step time: the same samples per second as
   batch 16 within 4% on both GPUs; Gemma's batch 32 (23.8 GiB) does not
   fit the 3090.
