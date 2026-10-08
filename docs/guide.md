@@ -88,6 +88,7 @@ gets LoRA adapters.
 |-------|---------|-------|
 | `model_name_or_path` | `unsloth/Qwen2.5-0.5B-Instruct` | Hub id or local dir |
 | `load_in_4bit` | `False` | QLoRA; use for anything ≥ 4B on 24 GB |
+| `full_finetuning` | `False` | Train every weight instead of LoRA (bf16 weights, the configured optimizer); for comparison runs, with a learning rate about ten times lower; `save_model` writes the whole model; not with 4-bit or 8-bit |
 | `max_seq_length` | 2048 | Longer rows are truncated |
 | `chat_template` | `"qwen2.5"` | `None` = model's own |
 | `lora_r` / `lora_alpha` | 8 / 32 | See [rank](#7-checking-the-rank) |

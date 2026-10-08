@@ -625,3 +625,33 @@ def test_collect_train_metrics_includes_step_times(monkeypatch):
         "warmup_seconds": 14.0,
         "steady_seconds_per_step": 2.0,
     }
+
+
+# --- full fine-tuning ------------------------------------------------------
+
+
+def test_full_finetuning_rejects_quantized_bases():
+    with pytest.raises(ValueError, match="full_finetuning"):
+        PESFTConfig(full_finetuning=True, load_in_4bit=True)
+    with pytest.raises(ValueError, match="full_finetuning"):
+        PESFTConfig(full_finetuning=True, load_in_8bit=True)
+
+
+def test_full_finetuning_reaches_the_loader_only_when_set():
+    holder = types.SimpleNamespace(config=PESFTConfig(full_finetuning=True))
+    assert PESFT._model_load_kwargs(cast("PESFT", holder))["full_finetuning"]
+    holder = types.SimpleNamespace(config=PESFTConfig())
+    assert "full_finetuning" not in PESFT._model_load_kwargs(
+        cast("PESFT", holder)
+    )
+
+
+def test_parser_exposes_full_finetuning():
+    parser = PESFTConfig.get_argument_parser()
+    assert (
+        PESFTConfig.from_args(parser.parse_args([])).full_finetuning is False
+    )
+    args = parser.parse_args(["--full_finetuning", "--learning_rate", "2e-5"])
+    config = PESFTConfig.from_args(args)
+    assert config.full_finetuning is True
+    assert config.learning_rate == 2e-5

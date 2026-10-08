@@ -102,6 +102,12 @@ class PESFTConfig:
         load_in_8bit: Load the base model in 8-bit (bitsandbytes
             LLM.int8). Slower than 4-bit and 16-bit; cannot be combined
             with ``load_in_4bit``.
+        full_finetuning: Train every weight of the base model (Unsloth's
+            full fine-tuning: bf16 weights, the configured optimizer)
+            instead of LoRA adapters; the LoRA fields are ignored and
+            ``save_model`` writes the whole model. For comparisons with
+            the recipe, which is LoRA; needs a learning rate about ten
+            times lower. Not with ``load_in_4bit`` or ``load_in_8bit``.
         device_map: Passed to the model loader when set, e.g.
             ``"unsloth_balanced"`` to split one model's layers across all
             visible GPUs in a single process, for models that do not fit
@@ -186,6 +192,7 @@ class PESFTConfig:
     max_seq_length: int = 2048
     load_in_4bit: bool = False
     load_in_8bit: bool = False
+    full_finetuning: bool = False
     device_map: str | None = None
     attn_implementation: str = "sdpa"
     chat_template: str | None = "qwen2.5"
@@ -253,6 +260,11 @@ class PESFTConfig:
         """
         if self.load_in_4bit and self.load_in_8bit:
             msg = "load_in_4bit and load_in_8bit are mutually exclusive"
+            raise ValueError(msg)
+        if self.full_finetuning and (self.load_in_4bit or self.load_in_8bit):
+            msg = (
+                "full_finetuning trains bf16 weights; not with 4-bit or 8-bit"
+            )
             raise ValueError(msg)
 
     @classmethod
@@ -347,6 +359,14 @@ class PESFTConfig:
             help=(
                 "Load the base model in 8-bit (bitsandbytes); slower than "
                 "4-bit; not with --load_in_4bit"
+            ),
+        )
+        model_group.add_argument(
+            "--full_finetuning",
+            action="store_true",
+            help=(
+                "Train all weights instead of LoRA adapters (comparison "
+                "runs; use ~10x lower learning rate; not with 4/8-bit)"
             ),
         )
         model_group.add_argument(
@@ -1058,6 +1078,8 @@ class PESFT:
         }
         if self.config.device_map is not None:
             kwargs["device_map"] = self.config.device_map
+        if self.config.full_finetuning:
+            kwargs["full_finetuning"] = True
         return kwargs
 
     def load_model(
@@ -1066,8 +1088,9 @@ class PESFT:
         """Load a base model with Unsloth and attach LoRA adapters.
 
         Returns:
-            Tuple containing the PEFT-wrapped model and tokenizer. The
-            tokenizer carries ``config.chat_template`` when one is set.
+            Tuple containing the PEFT-wrapped model (the plain model with
+            ``config.full_finetuning``) and tokenizer. The tokenizer
+            carries ``config.chat_template`` when one is set.
         """
         # Unsloth before peft/transformers so its patches apply.
         from unsloth import FastLanguageModel  # noqa: PLC0415, I001
@@ -1086,6 +1109,14 @@ class PESFT:
                 tokenizer,
                 chat_template=self.config.chat_template,
             )
+
+        if self.config.full_finetuning:
+            # Every weight trains; the trainer's gradient_checkpointing
+            # flag covers checkpointing.
+            print("Full fine-tuning: no LoRA adapters attached.")
+            self.model = model
+            self.tokenizer = tokenizer
+            return model, tokenizer
 
         # Add LoRA adapters
         # Convert string gradient checkpointing option to appropriate value.
@@ -1432,7 +1463,11 @@ class PESFT:
             output_dir if output_dir is not None else self.config.output_dir
         )
 
-        if normalized_method == "lora":
+        if self.config.full_finetuning:
+            print(f"\nSaving the fully fine-tuned model to {save_dir}...")
+            self.model.save_pretrained(save_dir)
+            self.tokenizer.save_pretrained(save_dir)
+        elif normalized_method == "lora":
             print(f"\nSaving adapters to {save_dir}...")
             self.model.save_pretrained(save_dir)
             self.tokenizer.save_pretrained(save_dir)
