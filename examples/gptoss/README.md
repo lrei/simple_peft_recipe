@@ -161,12 +161,13 @@ printed at the end:
 | `--device_map` | none (one GPU) |
 | `--output_dir` | `./models/speftr-gptoss-20b` |
 
-`gptoss_eval.py` batches rows of similar length by padded tokens:
-`--token_budget` (16384, prompt plus `--max_new_tokens` per row) for
-generation and `--loss_token_budget` (6144) for the eval loss. The eval
-loss is the mean over all assistant tokens. A row longer than
-`--max_seq_length` (4096) loses its end for the eval loss, and a prompt
-plus `--max_new_tokens` longer than it loses its beginning for
+`gptoss_eval.py` generates in batches of prompts of similar length,
+limited by `--token_budget` (16384 padded tokens, prompt plus
+`--max_new_tokens` per row) and, if set, by `--batch_size` rows
+(default: no row limit). The eval loss scores one row at a time and
+averages the rows' mean assistant-token losses. A row longer
+than `--max_seq_length` (4096) loses its end for the eval loss, and a
+prompt plus `--max_new_tokens` longer than it loses its beginning for
 generation; the script prints a `WARNING` and reports the counts as
 `truncated_rows` and `truncated_prompts` with the results.
 
@@ -192,7 +193,7 @@ CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss \
 CUDA_VISIBLE_DEVICES=0,1 uv run --extra gptoss \
     python -m examples.gptoss.gptoss_eval \
     --adapter_dir ./models/speftr-gptoss-120b \
-    --device_map unsloth_balanced --token_budget 1312 \
+    --device_map unsloth_balanced --batch_size 4 \
     --max_new_tokens 128 --num_rows 40
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss_inference \
     --adapter_dir ./models/speftr-gptoss-120b --device_map unsloth_balanced
@@ -233,7 +234,7 @@ Unsloth gradient checkpointing):
 | Peak GPU memory in `nvidia-smi` (whole process), training | 15,758 MiB |
 | Time per optimizer step (16 rows) | ~15 s |
 | One epoch (57 steps) with `--eval_steps 10 --save_steps 10` (6 evaluations of ~116 s each) | 26 min; 29 min end to end with loading and saving |
-| `gptoss_eval.py` (2 × 100 eval losses and 2 × 100 generations of 320 tokens, `--batch_size 32`) | 18.5 min end to end, 21.6 GiB peak allocated by torch |
+| `gptoss_eval.py` (2 × 100 eval losses and 2 × 100 generations of 320 tokens, 32 rows per batch) | 18.5 min end to end, 21.6 GiB peak allocated by torch |
 
 Evaluation after a 10-step run (`trainer.evaluate()` on the 100
 held-out rows, experts and attention in training mode), by
@@ -252,15 +253,19 @@ vocabulary in bfloat16 and float32. The loss differs slightly between
 batch sizes because of padding.
 
 `gptoss_eval.py` generation (64 held-out prompts, 320 new tokens), by
-`--batch_size`:
+rows per batch:
 
 | Batch | Model | Time | Mean GPU util | Peak allocated (torch) | Peak `nvidia-smi` |
 |------:|-------|-----:|--------------:|-----------------------:|------------------:|
 | 16 | base | 311 s | 57% | 16.64 GiB | 17,464 MiB |
-| 32 (default) | base | 157 s | 68% | 21.55 GiB | 22,894 MiB |
+| 32 | base | 157 s | 68% | 21.55 GiB | 22,894 MiB |
 | 16 | adapter | 613 s | 35% | 16.64 GiB | 17,504 MiB |
-| 32 (default) | adapter | 308 s | 41% | 21.55 GiB | 22,574 MiB |
+| 32 | adapter | 308 s | 41% | 21.55 GiB | 22,574 MiB |
 | 64 | both | out of memory | | | |
+
+`--batch_size N` gives batches of N rows only when `--token_budget` is
+at least N × (longest prompt + `--max_new_tokens`); a smaller budget
+makes the batches of long prompts smaller.
 
 Decoding is bound by per-step overhead, not by the GPU, so doubling
 the batch halves the time. The adapter decodes at half the base's speed:

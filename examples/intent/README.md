@@ -115,7 +115,7 @@ with the example's defaults in the epilog). Main flags:
 | | `--output_dir` | `./models/granite-3.3-2b-lora-banking77` |
 | `intent_eval` | `--model_path` | `./models/granite-3.3-2b-lora-banking77` |
 | | `--max_samples` | -1 (all 3,080) |
-| | `--token_budget`, `--max_new_tokens` | 16384, 16 |
+| | `--token_budget`, `--batch_size`, `--max_new_tokens` | 16384, no limit, 16 |
 | | `--max_seq_length` | 1024 |
 | | `--load_in_4bit` | off (bf16) |
 

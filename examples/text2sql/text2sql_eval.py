@@ -303,27 +303,33 @@ def load_for_generation(
 
 
 def length_batches(
-    lengths: Sequence[int], token_budget: int
+    lengths: Sequence[int],
+    token_budget: int,
+    max_rows: int | None = None,
 ) -> list[list[int]]:
     """Group sequences into batches of similar length.
 
     Sequences are taken longest first and a batch grows while its padded
-    size (rows times the longest row) fits ``token_budget``; a sequence
-    longer than the budget gets a batch of its own.
+    size (rows times the longest row) fits ``token_budget`` and it holds
+    fewer than ``max_rows`` rows; a sequence longer than the budget gets
+    a batch of its own.
 
     Args:
         lengths: Token count of each sequence.
         token_budget: Maximum padded tokens per batch.
+        max_rows: Maximum rows per batch; ``None`` sets no row limit.
 
     Returns:
         Batches of indices into ``lengths``; every index appears once.
     """
     order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    row_limit = len(lengths) if max_rows is None else max_rows
     batches: list[list[int]] = []
     for index in order:
         # The first row of each batch is its longest.
         if (
             batches
+            and len(batches[-1]) < row_limit
             and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
             <= token_budget
         ):
@@ -406,12 +412,14 @@ def evaluate(
     """Score ``model_path`` on ``rows``.
 
     Questions are generated in batches of similar length that fit
-    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row).
+    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row) and,
+    when ``--batch_size`` is set, hold at most that many rows.
 
     Args:
         model_path: Model to evaluate (see ``load_for_generation``).
         rows: Held-out rows whose gold query executes.
-        args: Parsed CLI arguments (``token_budget``, ``max_new_tokens``).
+        args: Parsed CLI arguments (``token_budget``, ``batch_size``,
+            ``max_new_tokens``).
 
     Returns:
         ``exact_match`` (normalised string match), ``execution_accuracy``
@@ -422,7 +430,7 @@ def evaluate(
     lengths = [len(prompt) + args.max_new_tokens for prompt in prompts]
     scores: list[float] = []
     exact_matches: list[bool] = []
-    for batch in length_batches(lengths, args.token_budget):
+    for batch in length_batches(lengths, args.token_budget, args.batch_size):
         replies = generate_sql(
             model,
             tokenizer,
@@ -469,6 +477,13 @@ def parse_args() -> argparse.Namespace:
             "generation batch; a longer question runs alone "
             f"(default: {TOKEN_BUDGET})"
         ),
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Most rows per batch (default: no limit; batches are "
+        "limited by --token_budget)",
     )
     parser.add_argument(
         "--max_new_tokens",

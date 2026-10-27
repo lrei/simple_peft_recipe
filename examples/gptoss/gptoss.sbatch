@@ -47,4 +47,4 @@ uv run python -m examples.gptoss.gptoss \
 
 uv run --extra gptoss python -m examples.gptoss.gptoss_eval \
     --adapter_dir "$OUTPUT_DIR" --device_map unsloth_balanced \
-    --token_budget 1312 --max_new_tokens 128 --num_rows 40
+    --batch_size 4 --max_new_tokens 128 --num_rows 40

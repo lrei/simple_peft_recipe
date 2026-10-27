@@ -95,7 +95,7 @@ Every script takes `--help`. Main flags:
 | | `--output_dir` | `./models/gemma-3-270m-it-lora-wildguard` |
 | `guard_eval` | `--model_path` | same as `--output_dir` above |
 | | `--max_samples` | -1 (full split) |
-| | `--token_budget`, `--max_seq_length` | 16384, 2048 |
+| | `--token_budget`, `--batch_size`, `--max_seq_length` | 16384, no limit, 2048 |
 | `guard_test` | `--model_path` | same as `--output_dir` above |
 | | `--load_in_4bit` | off |
 | `guard_count_tokens` | `--model_name_or_path` | `unsloth/gemma-3-270m-it` |

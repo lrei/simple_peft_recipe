@@ -182,7 +182,7 @@ Key flags (`--help` lists all):
 | | `--train_rows`, `--learning_rate` | 2000, 1e-5 |
 | | `--output_dir` | `./models/smollm3-3b-sql-grpo` |
 | `text2sql_eval` | `--model_path` | `./models/smollm3-3b-sql-sft` |
-| | `--token_budget`, `--max_new_tokens` | 16384, 128 |
+| | `--token_budget`, `--batch_size`, `--max_new_tokens` | 16384, no limit, 128 |
 
 Fixed in code: `max_seq_length` 1024 (both stages), GRPO
 `max_completion_length` 128, constant learning rate, 4-bit policy.

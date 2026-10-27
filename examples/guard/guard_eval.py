@@ -98,6 +98,8 @@ class EvaluationConfig:
         token_budget: Padded tokens (prompt plus ``max_new_tokens`` per
             example) per generation batch; examples of similar length are
             batched together and a longer example runs alone.
+        batch_size: Most examples per generation batch; ``None`` sets no
+            limit, so ``token_budget`` alone decides.
         max_seq_length: Longest prompt plus answer the model was loaded
             for; a longer prompt loses its beginning, with a warning
             (``truncate_prompts``).
@@ -106,6 +108,7 @@ class EvaluationConfig:
     """
 
     token_budget: int = TOKEN_BUDGET
+    batch_size: int | None = None
     max_seq_length: int = MAX_SEQ_LENGTH
     gen_config: GenerationConfig | None = None
 
@@ -204,6 +207,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Most rows per batch (default: no limit; batches are "
+        "limited by --token_budget)",
+    )
+
+    parser.add_argument(
         "--max_seq_length",
         type=int,
         default=MAX_SEQ_LENGTH,
@@ -239,27 +250,33 @@ def _load_eval_dataset(max_samples: int) -> Dataset:
 
 
 def length_batches(
-    lengths: Sequence[int], token_budget: int
+    lengths: Sequence[int],
+    token_budget: int,
+    max_rows: int | None = None,
 ) -> list[list[int]]:
     """Group sequences into batches of similar length.
 
     Sequences are taken longest first and a batch grows while its padded
-    size (rows times the longest row) fits ``token_budget``; a sequence
-    longer than the budget gets a batch of its own.
+    size (rows times the longest row) fits ``token_budget`` and it holds
+    fewer than ``max_rows`` rows; a sequence longer than the budget gets
+    a batch of its own.
 
     Args:
         lengths: Token count of each sequence.
         token_budget: Maximum padded tokens per batch.
+        max_rows: Maximum rows per batch; ``None`` sets no row limit.
 
     Returns:
         Batches of indices into ``lengths``; every index appears once.
     """
     order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    row_limit = len(lengths) if max_rows is None else max_rows
     batches: list[list[int]] = []
     for index in order:
         # The first row of each batch is its longest.
         if (
             batches
+            and len(batches[-1]) < row_limit
             and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
             <= token_budget
         ):
@@ -396,7 +413,8 @@ def _generate_predictions(
         tokenizer: Tokenizer with the guard chat template applied.
         eval_dataset: Examples with prompt and harm label columns.
         valid_labels: Labels a generated answer is matched against.
-        eval_config: Token budget, length limit and generation settings.
+        eval_config: Token budget, row cap, length limit and generation
+            settings.
 
     Returns:
         True labels, predicted labels (``"INVALID_PREDICTION"`` when no
@@ -412,7 +430,9 @@ def _generate_predictions(
         gen_config.max_new_tokens,
     )
     lengths = [len(prompt) + gen_config.max_new_tokens for prompt in prompts]
-    batches = length_batches(lengths, eval_config.token_budget)
+    batches = length_batches(
+        lengths, eval_config.token_budget, eval_config.batch_size
+    )
 
     y_pred_raw = [""] * len(prompts)
     for number, batch in enumerate(batches, 1):
@@ -560,6 +580,7 @@ def main() -> None:
 
     eval_config = EvaluationConfig(
         token_budget=args.token_budget,
+        batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
         gen_config=GenerationConfig(
             instruction=instruction,

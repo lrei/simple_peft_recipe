@@ -14,6 +14,10 @@ prompts (CC-BY-4.0) and ``TeeZee/dolly-15k-pirate-speech`` rows
 
 from __future__ import annotations
 
+import importlib
+import sys
+from typing import cast
+
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -62,7 +66,10 @@ def prompt_lengths(texts, qwen_tokenizer) -> list[int]:
 
 
 def assert_valid_batches(
-    batches: list[list[int]], lengths: list[int], token_budget: int
+    batches: list[list[int]],
+    lengths: list[int],
+    token_budget: int,
+    max_rows: int | None = None,
 ) -> None:
     """Every index once; a batch over the budget holds one sequence."""
     assert sorted(i for batch in batches for i in batch) == list(
@@ -71,6 +78,7 @@ def assert_valid_batches(
     for batch in batches:
         padded = len(batch) * max(lengths[i] for i in batch)
         assert padded <= token_budget or len(batch) == 1
+        assert max_rows is None or len(batch) <= max_rows
 
 
 @pytest.mark.parametrize("path", BATCHING_MODULES)
@@ -102,19 +110,60 @@ def test_length_batches_run_an_oversize_input_alone(
 
 
 @pytest.mark.parametrize("path", BATCHING_MODULES)
+def test_length_batches_keep_the_row_cap_and_the_budget(
+    path, load_functions, prompt_lengths
+):
+    length_batches = load_functions(path, "length_batches").length_batches
+    lengths = [length + MAX_NEW_TOKENS for length in prompt_lengths]
+    # Two of the longest rows fill the budget; the short rows hit the cap.
+    token_budget = 2 * max(lengths)
+    max_rows = 4
+
+    batches = length_batches(lengths, token_budget, max_rows)
+
+    assert_valid_batches(batches, lengths, token_budget, max_rows)
+    assert len(batches[0]) == 2
+    assert max(len(batch) for batch in batches) == max_rows
+
+
+@pytest.mark.parametrize("path", BATCHING_MODULES)
+def test_length_batches_run_an_oversize_input_alone_under_a_row_cap(
+    path, load_functions, prompt_lengths
+):
+    length_batches = load_functions(path, "length_batches").length_batches
+    token_budget = 4 * max(prompt_lengths)
+    lengths = [token_budget + 1, *prompt_lengths]
+
+    batches = length_batches(lengths, token_budget, 3)
+
+    assert batches[0] == [0]
+    assert_valid_batches(batches, lengths, token_budget, 3)
+
+
+@pytest.mark.parametrize("path", BATCHING_MODULES)
 @settings(max_examples=50, deadline=None)
 @given(
     lengths=st.lists(st.integers(1, 4096), max_size=60),
     token_budget=st.integers(1, 16_384),
+    max_rows=st.one_of(st.none(), st.integers(1, 64)),
 )
 def test_length_batches_cover_every_index_once(
-    path, load_functions, lengths, token_budget
+    path, load_functions, lengths, token_budget, max_rows
 ):
     length_batches = load_functions(path, "length_batches").length_batches
 
-    batches = length_batches(lengths, token_budget)
+    batches = length_batches(lengths, token_budget, max_rows)
 
-    assert_valid_batches(batches, lengths, token_budget)
+    assert_valid_batches(batches, lengths, token_budget, max_rows)
+
+
+def test_text2sql_eval_batch_size_is_an_optional_row_cap(monkeypatch):
+    text2sql_eval = importlib.import_module("examples.text2sql.text2sql_eval")
+
+    monkeypatch.setattr(sys, "argv", ["text2sql_eval"])
+    assert text2sql_eval.parse_args().batch_size is None
+    monkeypatch.setattr(sys, "argv", ["text2sql_eval", "--batch_size", "4"])
+    assert text2sql_eval.parse_args().batch_size == 4
 
 
 @pytest.fixture(scope="module")
@@ -125,7 +174,7 @@ def long_prompts(texts, qwen_tokenizer) -> list[list[int]]:
     encoded = qwen_tokenizer.apply_chat_template(
         chats, add_generation_prompt=True, return_dict=True
     )
-    return encoded["input_ids"]
+    return cast("list[list[int]]", encoded["input_ids"])
 
 
 @pytest.mark.parametrize("path", TRUNCATING_MODULES)
@@ -219,8 +268,11 @@ def conversation(load_fixture) -> list[dict[str, str]]:
 
 def render(tokenizer, messages: list[dict[str, str]]) -> list[int]:
     """Prompt token ids of ``messages``, ending with the assistant header."""
-    return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_dict=False
+    return cast(
+        "list[int]",
+        tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_dict=False
+        ),
     )
 
 

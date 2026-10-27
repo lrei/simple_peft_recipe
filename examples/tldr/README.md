@@ -121,7 +121,7 @@ the example's defaults in the epilog). Main flags:
 | | `--output_dir` | `./models/qwen3.5-4b-lora-tldr` |
 | `tldr_eval` | `--model_path` | `./models/qwen3.5-4b-lora-tldr` |
 | | `--max_samples` | 1000 (-1: all 6,553) |
-| | `--token_budget`, `--max_new_tokens` | 16384, 96 |
+| | `--token_budget`, `--batch_size`, `--max_new_tokens` | 16384, no limit, 96 |
 | | `--max_seq_length` | 1024 |
 | | `--load_in_4bit` | off (bf16) |
 

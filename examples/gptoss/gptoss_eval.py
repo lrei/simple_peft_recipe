@@ -21,7 +21,7 @@ Usage (``py3langid`` comes with the ``gptoss`` extra):
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval \\
         --adapter_dir ./models/speftr-gptoss-120b \\
-        --device_map unsloth_balanced --token_budget 1312 \\
+        --device_map unsloth_balanced --batch_size 4 \\
         --max_new_tokens 128 --num_rows 40
 
 Results and hardware: ``examples/gptoss/README.md``.
@@ -72,10 +72,6 @@ EVAL_MAX_SEQ_LENGTH = 4096
 # Padded tokens (prompt plus --max_new_tokens per row) per generation
 # batch.
 TOKEN_BUDGET = 16_384
-# Padded tokens per eval-loss batch. The forward pass keeps the logits of
-# every token over the 201,088-token vocabulary; 6144 is the trainer's
-# eval batch in gptoss.py (3 rows of up to 2048 tokens).
-LOSS_TOKEN_BUDGET = 6144
 # Harmony markers: tokens after "<|start|>assistant" up to the next
 # message are trained, i.e. both the analysis and the final channel.
 INSTRUCTION_PART = "<|start|>user<|message|>"
@@ -238,27 +234,33 @@ def experts_in_training_mode(model: torch.nn.Module) -> Iterator[None]:
 
 
 def length_batches(
-    lengths: Sequence[int], token_budget: int
+    lengths: Sequence[int],
+    token_budget: int,
+    max_rows: int | None = None,
 ) -> list[list[int]]:
     """Group sequences into batches of similar length.
 
     Sequences are taken longest first and a batch grows while its padded
-    size (rows times the longest row) fits ``token_budget``; a sequence
-    longer than the budget gets a batch of its own.
+    size (rows times the longest row) fits ``token_budget`` and it holds
+    fewer than ``max_rows`` rows; a sequence longer than the budget gets
+    a batch of its own.
 
     Args:
         lengths: Token count of each sequence.
         token_budget: Maximum padded tokens per batch.
+        max_rows: Maximum rows per batch; ``None`` sets no row limit.
 
     Returns:
         Batches of indices into ``lengths``; every index appears once.
     """
     order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    row_limit = len(lengths) if max_rows is None else max_rows
     batches: list[list[int]] = []
     for index in order:
         # The first row of each batch is its longest.
         if (
             batches
+            and len(batches[-1]) < row_limit
             and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
             <= token_budget
         ):
@@ -444,16 +446,17 @@ def score_compliance(
     """Generate the start of every row's reasoning and check its language.
 
     Rows are generated in batches of similar length that fit
-    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row). A
-    prompt longer than ``--max_seq_length`` minus ``--max_new_tokens``
-    loses its beginning (``truncate_prompts``).
+    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row) and,
+    when ``--batch_size`` is set, hold at most that many rows. A prompt
+    longer than ``--max_seq_length`` minus ``--max_new_tokens`` loses its
+    beginning (``truncate_prompts``).
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
         tokenizer: Its tokenizer.
         rows: Held-out rows with ``messages`` and ``reasoning_language``.
-        args: Parsed CLI arguments (``token_budget``, ``max_new_tokens``,
-            ``max_seq_length``).
+        args: Parsed CLI arguments (``token_budget``, ``batch_size``,
+            ``max_new_tokens``, ``max_seq_length``).
 
     Returns:
         Per row, in row order, whether the analysis channel was in the
@@ -468,7 +471,7 @@ def score_compliance(
     languages: list[str] = rows["reasoning_language"]
     compliant = [False] * len(prompts)
     done = 0
-    for batch in length_batches(lengths, args.token_budget):
+    for batch in length_batches(lengths, args.token_budget, args.batch_size):
         completions = generate_completions(
             model,
             tokenizer,
@@ -528,40 +531,23 @@ def encode_rows(
     return sequences
 
 
-def batch_loss(
-    model: PeftModel,
-    tokenizer: PreTrainedTokenizerBase,
-    sequences: Sequence[list[int]],
-    labels: Sequence[list[int]],
-) -> tuple[float, int]:
-    """Mean token loss of one batch and the number of tokens it covers.
+def row_loss(
+    model: PeftModel, input_ids: list[int], labels: list[int]
+) -> float:
+    """Mean assistant-turn token loss of one row.
 
     Runs under autocast in the model dtype with the experts in training
-    mode, as in training.
+    mode, as in training, so the value is comparable to the trainer's
+    ``eval_loss``.
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
-        tokenizer: Its tokenizer; pads the batch on the right.
-        sequences: Token ids of each row.
-        labels: Each row's labels, ``IGNORE_INDEX`` where no loss is taken.
+        input_ids: Token ids of the row.
+        labels: The row's labels, ``IGNORE_INDEX`` where no loss is taken.
 
     Returns:
-        The mean loss over the predicted label tokens and their count.
+        The mean loss over the row's predicted label tokens.
     """
-    padded = tokenizer.pad(
-        {"input_ids": list(sequences)},
-        padding=True,
-        padding_side="right",
-        return_tensors="pt",
-    )
-    inputs = padded.to(model.device)
-    width = inputs["input_ids"].shape[1]
-    padded_labels = [
-        row + [IGNORE_INDEX] * (width - len(row)) for row in labels
-    ]
-    # The loss predicts token t + 1 from token t: the first label of a row
-    # is never a target.
-    targets = sum(label != IGNORE_INDEX for row in labels for label in row[1:])
     # Training-mode experts return float32; autocast runs the layers after
     # them in the model dtype, as in training.
     with (
@@ -570,51 +556,42 @@ def batch_loss(
         experts_in_training_mode(model),
     ):
         output = model(
-            **inputs,
-            labels=torch.tensor(padded_labels, device=model.device),
+            input_ids=torch.tensor([input_ids], device=model.device),
+            labels=torch.tensor([labels], device=model.device),
         )
-    return float(output.loss), targets
+    return float(output.loss)
 
 
 def eval_loss(
     model: PeftModel,
     tokenizer: PreTrainedTokenizerBase,
     rows: Dataset,
-    args: argparse.Namespace,
+    max_seq_length: int,
 ) -> tuple[float, int]:
-    """Mean assistant-turn token loss over the rows.
+    """Mean assistant-turn loss over the rows, one row at a time.
 
-    Rows are rendered in full, cut to ``--max_seq_length`` tokens
-    (``truncate_rows``), masked as in training and run in batches of
-    similar length that fit ``--loss_token_budget``. The mean is taken
-    over all assistant tokens of all rows, so it does not depend on the
-    batching.
+    Rows are rendered in full, cut to ``max_seq_length`` tokens
+    (``truncate_rows``) and masked as in training.
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
         tokenizer: Its tokenizer.
         rows: Held-out rows with ``messages``.
-        args: Parsed CLI arguments (``loss_token_budget``,
-            ``max_seq_length``).
+        max_seq_length: Longest row in tokens.
 
     Returns:
-        The token-weighted mean loss and the number of rows that were
-        cut.
+        The average over rows of each row's mean token loss, and the
+        number of rows that were cut.
     """
     label_mask = build_label_mask(tokenizer)
     sequences, truncated = truncate_rows(
-        encode_rows(tokenizer, rows), args.max_seq_length
+        encode_rows(tokenizer, rows), max_seq_length
     )
-    lengths = [len(sequence) for sequence in sequences]
-    loss_sum = 0.0
-    token_count = 0
-    for batch in length_batches(lengths, args.loss_token_budget):
-        batch_ids = [sequences[index] for index in batch]
-        labels = label_mask({"input_ids": batch_ids})["labels"]
-        loss, targets = batch_loss(model, tokenizer, batch_ids, labels)
-        loss_sum += loss * targets
-        token_count += targets
-    return loss_sum / token_count, truncated
+    losses = [
+        row_loss(model, ids, label_mask({"input_ids": [ids]})["labels"][0])
+        for ids in sequences
+    ]
+    return sum(losses) / len(losses), truncated
 
 
 def parse_args() -> argparse.Namespace:
@@ -650,11 +627,11 @@ def parse_args() -> argparse.Namespace:
         f"(default: {TOKEN_BUDGET})",
     )
     parser.add_argument(
-        "--loss_token_budget",
+        "--batch_size",
         type=int,
-        default=LOSS_TOKEN_BUDGET,
-        help="Padded tokens per eval-loss batch; a longer row runs alone "
-        f"(default: {LOSS_TOKEN_BUDGET})",
+        default=None,
+        help="Most rows per generation batch (default: no limit; batches are "
+        "limited by --token_budget)",
     )
     parser.add_argument(
         "--max_seq_length",
@@ -699,7 +676,9 @@ def main() -> None:
     )
 
     with model.disable_adapter():
-        base_loss, cut_rows = eval_loss(model, tokenizer, eval_rows, args)
+        base_loss, cut_rows = eval_loss(
+            model, tokenizer, eval_rows, args.max_seq_length
+        )
         base_compliant, cut_prompts = score_compliance(
             model, tokenizer, eval_rows, args
         )
@@ -708,7 +687,9 @@ def main() -> None:
     requested = eval_rows["reasoning_language"]
     print(f"\nbase eval_loss {base_loss:.4f}")
     print(f"base compliance {compliance_rates(requested, base_compliant)}")
-    adapter_loss, _ = eval_loss(model, tokenizer, eval_rows, args)
+    adapter_loss, _ = eval_loss(
+        model, tokenizer, eval_rows, args.max_seq_length
+    )
     adapter_compliant, _ = score_compliance(model, tokenizer, eval_rows, args)
 
     base_rates = compliance_rates(requested, base_compliant)
