@@ -115,7 +115,8 @@ with the example's defaults in the epilog). Main flags:
 | | `--output_dir` | `./models/granite-3.3-2b-lora-banking77` |
 | `intent_eval` | `--model_path` | `./models/granite-3.3-2b-lora-banking77` |
 | | `--max_samples` | -1 (all 3,080) |
-| | `--batch_size`, `--max_new_tokens` | 32, 16 |
+| | `--token_budget`, `--max_new_tokens` | 16384, 16 |
+| | `--max_seq_length` | 1024 |
 | | `--load_in_4bit` | off (bf16) |
 
 ## Results
@@ -365,6 +366,14 @@ one engine per route (about 3 min per run in total). The script holds
 the 77 intent names (`INTENTS`) because the prompt lists them all,
 exactly as `intent_eval.build_messages` does.
 
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
+
 ### Export to GGUF
 
 For llama.cpp or Ollama, export the merged model with
@@ -433,7 +442,10 @@ training](../../docs/guide.md#5-after-training).
 2. **Prompt.** Edit `INSTRUCTION` and `build_messages`. Every label name
    is in every prompt, so prompt length grows with the label set: keep
    the longest prompt under `MAX_SEQ_LENGTH` (1024 here; the longest
-   Banking77 prompt is about 600 tokens).
+   Banking77 prompt is about 600 tokens). When a prompt plus
+   `--max_new_tokens` exceeds its `--max_seq_length`, `intent_eval`
+   cuts the prompt's beginning, prints a `WARNING` and reports
+   `truncated_prompts` with the metrics.
 3. **Answer parsing.** `extract_intent` accepts the first line,
    case-insensitive, exact match. Loosen it only if your labels need it.
 4. **Model.** Pass `--model_name_or_path`. The markers are inferred

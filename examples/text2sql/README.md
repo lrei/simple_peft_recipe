@@ -182,7 +182,7 @@ Key flags (`--help` lists all):
 | | `--train_rows`, `--learning_rate` | 2000, 1e-5 |
 | | `--output_dir` | `./models/smollm3-3b-sql-grpo` |
 | `text2sql_eval` | `--model_path` | `./models/smollm3-3b-sql-sft` |
-| | `--batch_size`, `--max_new_tokens` | 32, 128 |
+| | `--token_budget`, `--max_new_tokens` | 16384, 128 |
 
 Fixed in code: `max_seq_length` 1024 (both stages), GRPO
 `max_completion_length` 128, constant learning rate, 4-bit policy.
@@ -268,6 +268,14 @@ of the GPU whatever the model size and starts one engine per route
   it answers with the query directly.
 - The GRPO adapter (`./models/smollm3-3b-sql-grpo`) is the complete
   final model; pass it as `--adapter_dir`.
+
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
 
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).

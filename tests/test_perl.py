@@ -362,7 +362,9 @@ def test_load_model_limits_lora_to_language_model_on_multimodal(tmp_path):
     assert all(".language_model." in name for name in lora_modules)
 
 
-TINY_QWEN35 = "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration"
+TINY_QWEN35 = (
+    "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink"
+)
 
 
 def test_load_model_uses_checkpoint_architecture(tmp_path):

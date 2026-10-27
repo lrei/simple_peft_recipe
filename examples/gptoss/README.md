@@ -161,6 +161,15 @@ printed at the end:
 | `--device_map` | none (one GPU) |
 | `--output_dir` | `./models/speftr-gptoss-20b` |
 
+`gptoss_eval.py` batches rows of similar length by padded tokens:
+`--token_budget` (16384, prompt plus `--max_new_tokens` per row) for
+generation and `--loss_token_budget` (6144) for the eval loss. The eval
+loss is the mean over all assistant tokens. A row longer than
+`--max_seq_length` (4096) loses its end for the eval loss, and a prompt
+plus `--max_new_tokens` longer than it loses its beginning for
+generation; the script prints a `WARNING` and reports the counts as
+`truncated_rows` and `truncated_prompts` with the results.
+
 ### gpt-oss-120b on several GPUs
 
 The 4-bit 120b weights (~58 GiB) do not fit one 40 GB GPU, so
@@ -183,8 +192,8 @@ CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss \
 CUDA_VISIBLE_DEVICES=0,1 uv run --extra gptoss \
     python -m examples.gptoss.gptoss_eval \
     --adapter_dir ./models/speftr-gptoss-120b \
-    --device_map unsloth_balanced --batch_size 4 --max_new_tokens 128 \
-    --num_rows 40
+    --device_map unsloth_balanced --token_budget 1312 \
+    --max_new_tokens 128 --num_rows 40
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m examples.gptoss.gptoss_inference \
     --adapter_dir ./models/speftr-gptoss-120b --device_map unsloth_balanced
 ```
@@ -441,6 +450,12 @@ answers in the language of the question.
   gpt-oss is not covered by this example.
 - **120b**: `--device_map unsloth_balanced` splits the model evenly over
   all visible GPUs (the loader the eval script uses on 120b).
+- **Long inputs.** `--max_seq_length` (default 2048) is the context
+  length the base loads with, prompt plus `--max_new_tokens`. A longer
+  prompt loses its beginning (the end, with the question, stays), with
+  a `WARNING`. Prompts of similar length run in batches of at most
+  `--token_budget` (default 16384) padded tokens, rows times the
+  longest prompt plus `--max_new_tokens`; a longer input runs alone.
 
 ## Adapt it to your data or model
 

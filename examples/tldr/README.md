@@ -121,7 +121,8 @@ the example's defaults in the epilog). Main flags:
 | | `--output_dir` | `./models/qwen3.5-4b-lora-tldr` |
 | `tldr_eval` | `--model_path` | `./models/qwen3.5-4b-lora-tldr` |
 | | `--max_samples` | 1000 (-1: all 6,553) |
-| | `--batch_size`, `--max_new_tokens` | 32, 96 |
+| | `--token_budget`, `--max_new_tokens` | 16384, 96 |
+| | `--max_seq_length` | 1024 |
 | | `--load_in_4bit` | off (bf16) |
 
 ## Results
@@ -309,6 +310,14 @@ uv run python -m examples.tldr.tldr_inference --engine vllm \
 
 Output: to be added.
 
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
+
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).
 
@@ -323,7 +332,10 @@ training](../../docs/guide.md#5-after-training).
    `PROMPT_SUFFIX` handling if your documents carry no cue). Keep the
    longest document plus summary under `MAX_SEQ_LENGTH` (1024 here);
    raise it for longer documents, with a smaller batch if memory runs
-   out.
+   out. When a prompt plus `--max_new_tokens` exceeds its
+   `--max_seq_length`, `tldr_eval` cuts the prompt's beginning, prints
+   a `WARNING` and reports `truncated_prompts` with the metrics; it
+   batches generation by padded tokens (`--token_budget`).
 3. **Scoring.** `compute_metrics` reports ROUGE-1/2/L, the mean length
    in words and the invalid rate; `is_valid_summary` rejects empty
    replies and think tags. Add your own checks there (a length limit,

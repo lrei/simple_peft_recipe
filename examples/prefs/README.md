@@ -240,9 +240,27 @@ Same data, split and seed; one setting changed each time.
 
 `prefs_eval` scores every response by its summed token log-probability
 under a model, in padded batches sorted by length (`--token_budget`
-tokens per forward pass). Prompts and responses are tokenized as TRL
-does in training (`encode_response`), and sequences are cut at 4096
-tokens (the model's context), not at the training `max_length`.
+tokens per forward pass; a longer sequence runs alone). Prompts and
+responses are tokenized as TRL does in training (`encode_response`).
+Sequences longer than `--max_length` (default 4096, OLMo 2's context,
+not the training `max_length`) are cut at the end, keeping the start,
+so their ends are not scored; `prefs_eval` prints a warning with the
+number cut per dataset (also `truncated_sequences` in
+`prefs_eval.json`). A held-out pair in which a response has no token
+left after the cut is left out of the held-out accuracies. With the
+OLMo 2 tokenizer, 21 of the 1,000 held-out pairs have a sequence
+longer than 4096 tokens (the longest 7,054); all RewardBench sequences
+fit (the longest 2,013).
+
+For long inputs, raise `--max_length` and `--token_budget` (within
+the model's context), or filter or shorten those rows. Padded rows run
+without an attention mask: causal attention already hides the padding
+after each real token, and without a mask transformers' SDPA attention
+can use PyTorch's flash or memory-efficient kernel instead of building
+a mask of length × length.
+The decoder returns hidden states and the output head runs only on the
+response positions, 1,024 at a time, so the logits of the full
+sequence × vocabulary never exist.
 
 - **Held-out preference accuracy.** On the 1,000 held-out pairs: the
   fraction where the model gives the chosen response a higher
@@ -340,6 +358,14 @@ after its first point.
 `./models/olmo2-1b-lora-dpo-merged` (default `<adapter_dir>-merged`)
 holds the merged bf16 weights, config, tokenizer and
 `chat_template.jinja`; it loads without peft, like any Hub checkpoint.
+
+**Long inputs.** `--max_model_len` (default 4096) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
 
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).

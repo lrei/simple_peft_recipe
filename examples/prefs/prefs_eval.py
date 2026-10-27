@@ -22,6 +22,13 @@ the length-normalized DPO loss (TRL ``loss_type="sigmoid_norm"``).
 The adapter's reference is the same model with the adapter disabled.
 Prompts and responses are rendered with the chat template and split into
 prompt and response tokens as TRL's ``DPOTrainer`` does in training.
+Sequences longer than ``--max_length`` are cut at the end (the start is
+kept, as TRL's default truncation does in training), and the number cut
+is printed as a warning.
+
+For long sequences, padded rows run without an attention mask (so
+SDPA can use its flash or memory-efficient kernel) and the output head
+only sees the response positions, a chunk at a time.
 
 This module also defines the data for ``prefs_train.py``
 (``load_preference_splits``).
@@ -51,7 +58,7 @@ from datasets import load_dataset
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from datasets import Dataset
     from transformers import (
@@ -78,6 +85,9 @@ BETA = 0.1
 MAX_LENGTH = 4096
 # Prompt + response tokens per forward pass, padding included.
 TOKEN_BUDGET = 16_384
+# Response positions per output-head call: 1024 x vocabulary float32
+# log-probabilities (1 GB for a 248k vocabulary).
+HEAD_CHUNK = 1024
 # RewardBench's section of each subset and its weight within the section
 # (rewardbench/constants.py). math-prm has 447 rows but counts as much as
 # the six hep-* code subsets together.
@@ -245,37 +255,34 @@ def encode_response(
     tokenizer: PreTrainedTokenizerBase,
     prompt: list[Message],
     response: list[Message],
-    max_length: int,
 ) -> Encoded:
     """Tokenize prompt + response as TRL's ``DPOTrainer`` does.
 
     The prompt is rendered with the assistant header; the response tokens
     are what the full conversation adds after it, including the template's
-    end-of-turn token.
+    end-of-turn token. Nothing is truncated (``truncate_sequences``).
 
     Args:
         tokenizer: Tokenizer with a chat template.
         prompt: Prompt turns.
         response: Response turns (one assistant message).
-        max_length: Keep at most this many tokens from the start.
 
     Returns:
         The token ids and the index of the first response token.
     """
     prompt_ids = chat_token_ids(tokenizer, prompt, add_generation_prompt=True)
     full_ids = chat_token_ids(tokenizer, prompt + response)
-    return full_ids[:max_length], len(prompt_ids)
+    return full_ids, len(prompt_ids)
 
 
 def encode_conversation_pairs(
-    tokenizer: PreTrainedTokenizerBase, pairs: Dataset, max_length: int
+    tokenizer: PreTrainedTokenizerBase, pairs: Dataset
 ) -> list[Encoded]:
     """Encode preference pairs stored as full conversations.
 
     Args:
         tokenizer: Tokenizer with a chat template.
         pairs: Rows with ``chosen`` and ``rejected`` conversations.
-        max_length: Token limit per sequence.
 
     Returns:
         Chosen and rejected sequences interleaved:
@@ -287,22 +294,19 @@ def encode_conversation_pairs(
         prompt, chosen, rejected = split_prompt(
             pair["chosen"], pair["rejected"]
         )
-        encoded.append(encode_response(tokenizer, prompt, chosen, max_length))
-        encoded.append(
-            encode_response(tokenizer, prompt, rejected, max_length)
-        )
+        encoded.append(encode_response(tokenizer, prompt, chosen))
+        encoded.append(encode_response(tokenizer, prompt, rejected))
     return encoded
 
 
 def encode_rewardbench(
-    tokenizer: PreTrainedTokenizerBase, rows: Dataset, max_length: int
+    tokenizer: PreTrainedTokenizerBase, rows: Dataset
 ) -> list[Encoded]:
     """Encode RewardBench rows (prompt and responses as plain strings).
 
     Args:
         tokenizer: Tokenizer with a chat template.
         rows: Rows with ``prompt``, ``chosen`` and ``rejected`` strings.
-        max_length: Token limit per sequence.
 
     Returns:
         Chosen and rejected sequences interleaved, as
@@ -314,10 +318,28 @@ def encode_rewardbench(
         prompt = [{"role": "user", "content": pair["prompt"]}]
         for key in ("chosen", "rejected"):
             response = [{"role": "assistant", "content": pair[key]}]
-            encoded.append(
-                encode_response(tokenizer, prompt, response, max_length)
-            )
+            encoded.append(encode_response(tokenizer, prompt, response))
     return encoded
+
+
+def truncate_sequences(
+    sequences: list[Encoded], max_length: int
+) -> tuple[list[Encoded], int]:
+    """Cut every sequence to its first ``max_length`` tokens.
+
+    The response start is kept as it is, so a sequence whose prompt
+    already fills ``max_length`` is left without response tokens.
+
+    Args:
+        sequences: Token ids and response start per sequence.
+        max_length: Most tokens (prompt + response) a sequence keeps.
+
+    Returns:
+        The sequences, in the same order, and how many were cut.
+    """
+    truncated = [(ids[:max_length], start) for ids, start in sequences]
+    cut = sum(len(ids) > max_length for ids, _ in sequences)
+    return truncated, cut
 
 
 def length_batches(
@@ -351,26 +373,77 @@ def length_batches(
     return batches
 
 
+def output_head(
+    model: PreTrainedModel,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return the model's hidden-states-to-logits step.
+
+    The output embeddings, followed by final-logit soft-capping
+    (``tanh(logits / cap) * cap``) when the config sets
+    ``final_logit_softcapping`` (Gemma 2/3/4), as the model's own
+    forward computes its logits.
+
+    Args:
+        model: Causal LM, plain or wrapped in a peft ``PeftModel``.
+
+    Returns:
+        A function mapping hidden states ``(..., hidden)`` to logits
+        ``(..., vocab)`` in the model's dtype.
+    """
+    head = cast("torch.nn.Module", model.get_output_embeddings())
+    text_config = model.config.get_text_config()
+    softcap = getattr(text_config, "final_logit_softcapping", None)
+
+    def logits(hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the output head (and soft-capping) to hidden states.
+
+        Args:
+            hidden: Final hidden states, ``(..., hidden)``.
+
+        Returns:
+            The logits, ``(..., vocab)``.
+        """
+        values = head(hidden)
+        if softcap is not None:
+            values = torch.tanh(values / softcap) * softcap
+        return values
+
+    return logits
+
+
 def response_log_prob(
-    logits: torch.Tensor, token_ids: list[int], start: int
+    hidden: torch.Tensor,
+    token_ids: list[int],
+    start: int,
+    head: Callable[[torch.Tensor], torch.Tensor],
 ) -> float:
     """Sum the log-probabilities of the response tokens of one sequence.
 
+    Logits are computed only at the positions that predict response
+    tokens, ``HEAD_CHUNK`` positions at a time, and normalized in
+    float32, so memory does not grow with the sequence length times the
+    vocabulary.
+
     Args:
-        logits: Logits of this row, ``(padded_length, vocab)``; position
-            ``t`` predicts token ``t + 1``.
+        hidden: Final hidden states of this row, ``(padded_length,
+            hidden)``; position ``t`` predicts token ``t + 1``.
         token_ids: The row's unpadded token ids.
-        start: Index of the first response token.
+        start: Index of the first response token (at least 1); past
+            the end of ``token_ids`` when truncation cut the response.
+        head: Hidden states to logits (``output_head``).
 
     Returns:
-        The summed log-probability, 0.0 when no response token is left.
+        The summed log-probability, 0.0 when there is no response token.
     """
-    targets = torch.tensor(token_ids[start:], device=logits.device)
-    if targets.numel() == 0:
-        return 0.0
-    predicting = logits[start - 1 : len(token_ids) - 1].float()
-    log_probs = predicting.log_softmax(dim=-1)
-    return float(log_probs.gather(1, targets[:, None]).sum())
+    predicting = hidden[start - 1 : len(token_ids) - 1]
+    targets = torch.tensor(token_ids[start:])
+    total = 0.0
+    for begin in range(0, len(targets), HEAD_CHUNK):
+        log_probs = head(predicting[begin : begin + HEAD_CHUNK])
+        log_probs = log_probs.float().log_softmax(dim=-1)
+        chunk = targets[begin : begin + HEAD_CHUNK, None]
+        total += float(log_probs.gather(1, chunk.to(log_probs.device)).sum())
+    return total
 
 
 def response_log_probs(
@@ -381,39 +454,48 @@ def response_log_probs(
 ) -> tuple[list[float], list[int]]:
     """Score the response tokens of many sequences in padded batches.
 
-    Rows are padded on the right, which leaves the logits of the real
-    tokens unchanged in a causal model.
+    Rows are padded on the right and run without an attention mask:
+    causal attention already keeps every real token from seeing the
+    padding after it, and without a mask transformers' SDPA attention
+    uses ``is_causal`` and a flash or memory-efficient kernel (memory
+    linear in the length) instead of materializing a 4-D mask. The
+    decoder returns hidden states and ``response_log_prob`` applies the
+    output head to the response positions only, so full-sequence logits
+    never exist.
 
     Args:
-        model: Causal LM (with its adapter state as it should be scored).
+        model: Causal LM (with its adapter state as it should be scored),
+            plain or a peft ``PeftModel``; must provide
+            ``get_decoder()`` and ``get_output_embeddings()`` as
+            transformers models do.
         sequences: Token ids and response start per sequence.
         pad_token_id: Id used for padding.
-        token_budget: Maximum padded tokens per forward pass.
+        token_budget: Maximum padded tokens per forward pass; a sequence
+            longer than this runs alone.
 
     Returns:
         Per sequence, the summed response log-probability and the number
         of response tokens, in the order of ``sequences``.
     """
+    causal_lm = cast("PreTrainedModel", model)
+    decoder = causal_lm.get_decoder()
+    head = output_head(causal_lm)
     device = next(model.parameters()).device
     sums = [0.0] * len(sequences)
     counts = [max(len(ids) - start, 0) for ids, start in sequences]
     lengths = [len(ids) for ids, _ in sequences]
     for batch in length_batches(lengths, token_budget):
-        width = lengths[batch[0]]
-        input_ids = torch.full((len(batch), width), pad_token_id)
-        attention_mask = torch.zeros((len(batch), width), dtype=torch.long)
+        input_ids = torch.full((len(batch), lengths[batch[0]]), pad_token_id)
         for row, index in enumerate(batch):
             ids = sequences[index][0]
             input_ids[row, : len(ids)] = torch.tensor(ids)
-            attention_mask[row, : len(ids)] = 1
         with torch.inference_mode():
-            logits = model(
-                input_ids=input_ids.to(device),
-                attention_mask=attention_mask.to(device),
-            ).logits
-        for row, index in enumerate(batch):
-            ids, start = sequences[index]
-            sums[index] = response_log_prob(logits[row], ids, start)
+            hidden = decoder(
+                input_ids=input_ids.to(device), use_cache=False
+            ).last_hidden_state
+            for row, index in enumerate(batch):
+                ids, start = sequences[index]
+                sums[index] = response_log_prob(hidden[row], ids, start, head)
     return sums, counts
 
 
@@ -697,13 +779,15 @@ def parse_args() -> argparse.Namespace:
         "--max_length",
         type=int,
         default=MAX_LENGTH,
-        help=f"Token limit per sequence (default: {MAX_LENGTH})",
+        help="Cut sequences (prompt + response) to their first this many "
+        f"tokens (default: {MAX_LENGTH}, OLMo 2's context)",
     )
     parser.add_argument(
         "--token_budget",
         type=int,
         default=TOKEN_BUDGET,
-        help=f"Padded tokens per forward pass (default: {TOKEN_BUDGET})",
+        help="Padded tokens per forward pass; a longer sequence runs "
+        f"alone (default: {TOKEN_BUDGET})",
     )
     return parser.parse_args()
 
@@ -746,6 +830,50 @@ def print_reports(
             print(f"{name:<12} {values}")
 
 
+def encode_datasets(
+    tokenizer: PreTrainedTokenizerBase,
+    held_out: Dataset,
+    rewardbench: Dataset,
+    max_length: int,
+) -> tuple[dict[str, list[Encoded]], dict[str, int]]:
+    """Encode both evaluation sets and cut sequences at ``max_length``.
+
+    Prints a warning for each set with sequences longer than
+    ``max_length``: their ends are not scored.
+
+    Args:
+        tokenizer: Tokenizer with a chat template.
+        held_out: Held-out conversation pairs.
+        rewardbench: RewardBench rows.
+        max_length: Most tokens a sequence keeps (``truncate_sequences``).
+
+    Returns:
+        Encoded sequences by dataset name (``held_out``, ``rewardbench``)
+        and, by the same names, how many sequences were cut.
+    """
+    encoded = {
+        "held_out": encode_conversation_pairs(tokenizer, held_out),
+        "rewardbench": encode_rewardbench(tokenizer, rewardbench),
+    }
+    datasets = {}
+    truncated = {}
+    for name, sequences in encoded.items():
+        datasets[name], truncated[name] = truncate_sequences(
+            sequences, max_length
+        )
+        if truncated[name]:
+            longest = max(len(ids) for ids, _ in sequences)
+            print(
+                f"\nWARNING: {truncated[name]} of {len(sequences)} {name} "
+                f"sequences are longer than --max_length={max_length} "
+                f"tokens (longest: {longest}). They are cut to "
+                f"{max_length} tokens, so their ends are not scored.\n"
+                "  Fix: raise --max_length (up to the model's context; "
+                "more memory), or filter or shorten those rows."
+            )
+    return datasets, truncated
+
+
 def main() -> None:
     """Score the models and print and save the results.
 
@@ -766,23 +894,20 @@ def main() -> None:
         rewardbench = rewardbench.shuffle(seed=SEED).select(
             range(args.rewardbench_rows)
         )
-    datasets = {
-        "held_out": encode_conversation_pairs(
-            tokenizer, held_out, args.max_length
-        ),
-        "rewardbench": encode_rewardbench(
-            tokenizer, rewardbench, args.max_length
-        ),
-    }
+    datasets, truncated = encode_datasets(
+        tokenizer, held_out, rewardbench, args.max_length
+    )
+    subsets = rewardbench["subset"]
     scores = score_models(
         args.adapter_dir, args.reference_model, datasets, args
     )
     results = {
         "held_out": held_out_report(scores),
-        "rewardbench": rewardbench_report(scores, rewardbench["subset"]),
+        "rewardbench": rewardbench_report(scores, subsets),
         "rewardbench_normalized": rewardbench_report(
-            scores, rewardbench["subset"], normalize=True
+            scores, subsets, normalize=True
         ),
+        "truncated_sequences": truncated,
         "peak_gpu_gb": torch.cuda.max_memory_allocated() / 1024**3,
     }
     print_reports(

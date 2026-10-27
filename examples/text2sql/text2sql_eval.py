@@ -47,6 +47,8 @@ from datasets import load_dataset
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from datasets import Dataset
     from transformers import (
         BatchEncoding,
@@ -58,6 +60,8 @@ if TYPE_CHECKING:
 DATASET_NAME = "b-mc2/sql-create-context"
 DEFAULT_MODEL_PATH = "./models/smollm3-3b-sql-sft"
 HELD_OUT_ROWS = 500
+# Padded tokens (prompt plus --max_new_tokens per row) per generation batch.
+TOKEN_BUDGET = 16_384
 SPLIT_SEED = 0
 INSTRUCTION = (
     "Write one SQLite query that answers the question. "
@@ -298,22 +302,49 @@ def load_for_generation(
     return model, tokenizer
 
 
-def generate_sql(
-    model: GenerationMixin,
-    tokenizer: PreTrainedTokenizerBase,
-    rows: Dataset,
-    max_new_tokens: int,
-) -> list[str]:
-    """Greedily answer a batch of questions.
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
 
     Args:
-        model: Model from ``load_for_generation``.
-        tokenizer: Its tokenizer; must have a chat template.
-        rows: Rows with ``context`` and ``question``.
-        max_new_tokens: Generation budget per reply.
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
 
     Returns:
-        The decoded replies without the prompt or special tokens.
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def encode_prompts(
+    tokenizer: PreTrainedTokenizerBase, rows: Dataset
+) -> list[list[int]]:
+    """Render and tokenize the question prompts, without padding.
+
+    Args:
+        tokenizer: Tokenizer with a chat template.
+        rows: Rows with ``context`` and ``question``.
+
+    Returns:
+        The token ids of each row's prompt, ending with the assistant
+        header.
     """
     chats = [
         build_messages(context, question)
@@ -324,12 +355,39 @@ def generate_sql(
     encoded = tokenizer.apply_chat_template(
         chats,
         add_generation_prompt=True,
-        padding=True,
         return_dict=True,
-        return_tensors="pt",
         **CHAT_TEMPLATE_KWARGS,
     )
-    inputs = cast("BatchEncoding", encoded).to(model.device)
+    input_ids = cast("BatchEncoding", encoded)["input_ids"]
+    return cast("list[list[int]]", input_ids)
+
+
+def generate_sql(
+    model: GenerationMixin,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: Sequence[list[int]],
+    max_new_tokens: int,
+) -> list[str]:
+    """Greedily answer a batch of questions.
+
+    Args:
+        model: Model from ``load_for_generation``.
+        tokenizer: Its tokenizer.
+        prompts: Token ids from ``encode_prompts``.
+        max_new_tokens: Generation budget per reply.
+
+    Returns:
+        The decoded replies without the prompt or special tokens.
+    """
+    # Left padding with the attention mask, so every prompt ends where
+    # generation starts and the padding is not attended to.
+    padded = tokenizer.pad(
+        {"input_ids": list(prompts)},
+        padding=True,
+        padding_side="left",
+        return_tensors="pt",
+    )
+    inputs = padded.to(model.device)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -347,25 +405,33 @@ def evaluate(
 ) -> dict[str, float]:
     """Score ``model_path`` on ``rows``.
 
+    Questions are generated in batches of similar length that fit
+    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row).
+
     Args:
         model_path: Model to evaluate (see ``load_for_generation``).
         rows: Held-out rows whose gold query executes.
-        args: Parsed CLI arguments (``batch_size``, ``max_new_tokens``).
+        args: Parsed CLI arguments (``token_budget``, ``max_new_tokens``).
 
     Returns:
         ``exact_match`` (normalised string match), ``execution_accuracy``
         (score 1.0) and ``valid_sql`` (the query runs) as fractions.
     """
     model, tokenizer = load_for_generation(model_path)
+    prompts = encode_prompts(tokenizer, rows)
+    lengths = [len(prompt) + args.max_new_tokens for prompt in prompts]
     scores: list[float] = []
     exact_matches: list[bool] = []
-    for start in range(0, len(rows), args.batch_size):
-        end = min(start + args.batch_size, len(rows))
-        batch = rows.select(range(start, end))
-        replies = generate_sql(model, tokenizer, batch, args.max_new_tokens)
-        for reply, row in zip(replies, batch, strict=True):
-            gold = row["answer"]
-            scores.append(score_sql(reply, row["context"], gold))
+    for batch in length_batches(lengths, args.token_budget):
+        replies = generate_sql(
+            model,
+            tokenizer,
+            [prompts[index] for index in batch],
+            args.max_new_tokens,
+        )
+        for reply, index in zip(replies, batch, strict=True):
+            gold = rows[index]["answer"]
+            scores.append(score_sql(reply, rows[index]["context"], gold))
             predicted = normalize_sql(extract_sql(reply))
             exact_matches.append(predicted == normalize_sql(gold))
         print(f"Scored {len(scores)}/{len(rows)} questions")
@@ -395,10 +461,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--batch_size",
+        "--token_budget",
         type=int,
-        default=32,
-        help="Questions generated per batch (default: 32)",
+        default=TOKEN_BUDGET,
+        help=(
+            "Padded tokens (prompt plus --max_new_tokens per question) per "
+            "generation batch; a longer question runs alone "
+            f"(default: {TOKEN_BUDGET})"
+        ),
     )
     parser.add_argument(
         "--max_new_tokens",

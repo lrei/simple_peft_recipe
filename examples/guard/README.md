@@ -95,7 +95,7 @@ Every script takes `--help`. Main flags:
 | | `--output_dir` | `./models/gemma-3-270m-it-lora-wildguard` |
 | `guard_eval` | `--model_path` | same as `--output_dir` above |
 | | `--max_samples` | -1 (full split) |
-| | `--batch_size` | 64 |
+| | `--token_budget`, `--max_seq_length` | 16384, 2048 |
 | `guard_test` | `--model_path` | same as `--output_dir` above |
 | | `--load_in_4bit` | off |
 | `guard_count_tokens` | `--model_name_or_path` | `unsloth/gemma-3-270m-it` |
@@ -189,6 +189,14 @@ one engine per route (about 2 min per run in total). The prompt is
 `INSTRUCTION`, a blank line and the text, with the adapter's Gemma 3
 chat template; change `INSTRUCTION` in both scripts together.
 
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
+
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).
 
@@ -229,6 +237,9 @@ For any "text in, one label out" task:
   separate validation split.
 - `guard_eval` always loads the model in 4-bit; `guard_test` loads 16-bit
   unless `--load_in_4bit`.
+- `guard_eval` cuts the beginning of a prompt longer than
+  `--max_seq_length` minus `--max_new_tokens`, prints a `WARNING` and
+  reports `truncated_prompts` with the metrics.
 - Every script imports Unsloth, which needs a GPU even to import.
 - `import unsloth` must come before `datasets`, `transformers` and `trl`
   so its patches apply.

@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -39,6 +40,8 @@ import torch
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from peft import PeftModel
     from transformers import (
         BatchEncoding,
@@ -60,10 +63,33 @@ DEFAULT_PROMPTS = (
 DEFAULT_MAX_NEW_TOKENS = 128
 CHAT_TEMPLATE_KWARGS: dict[str, Any] = {}
 MAX_MODEL_LEN = 2048
+# Most padded tokens per transformers batch: rows times the longest
+# prompt plus max_new_tokens, the length the KV cache grows to.
+TOKEN_BUDGET = 16_384
 # vLLM reserves this share of GPU memory whatever the model size.
 GPU_MEMORY_UTILIZATION = 0.8
 # The values vLLM accepts for max_lora_rank.
 VLLM_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    """Generation options shared by every route.
+
+    Attributes:
+        engine: ``"transformers"`` (peft) or ``"vllm"``.
+        max_new_tokens: Generation budget per reply.
+        max_model_len: Context length in tokens, prompt plus
+            ``max_new_tokens``. Both engines cut a longer prompt from
+            the start, with a warning (``truncate_prompts``).
+        token_budget: Transformers engine: most padded tokens per batch,
+            rows times the longest prompt plus ``max_new_tokens``.
+    """
+
+    engine: str = "transformers"
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
+    max_model_len: int = MAX_MODEL_LEN
+    token_budget: int = TOKEN_BUDGET
 
 
 def build_chats(
@@ -210,32 +236,167 @@ def load_adapter_model(adapter_dir: str, base_id: str) -> PeftModel:
     return model
 
 
-def generate_transformers(
-    model: GenerationMixin | PeftModel,
-    tokenizer: PreTrainedTokenizerBase,
-    chats: list[list[Message]],
-    max_new_tokens: int,
-) -> list[str]:
-    """Answer a batch of chats with greedy decoding.
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
 
     Args:
-        model: A causal LM, with or without an adapter.
-        tokenizer: Its tokenizer, padding on the left.
-        chats: Conversations ending with a user turn.
-        max_new_tokens: Generation budget per reply.
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
 
     Returns:
-        The decoded replies without the prompt or special tokens.
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def prompt_token_limit(settings: GenerationSettings) -> int:
+    """Return the most prompt tokens that leave room for the reply.
+
+    Args:
+        settings: Context length and reply length.
+
+    Returns:
+        ``max_model_len`` minus ``max_new_tokens``.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = settings.max_model_len - settings.max_new_tokens
+    if limit < 1:
+        msg = (
+            f"--max_new_tokens {settings.max_new_tokens} leaves no room "
+            f"for a prompt in --max_model_len {settings.max_model_len}; "
+            "lower --max_new_tokens or raise --max_model_len."
+        )
+        raise ValueError(msg)
+    return limit
+
+
+def warn_long_prompts(
+    lengths: Sequence[int], settings: GenerationSettings
+) -> int:
+    """Warn about prompts that lose their beginning to fit the context.
+
+    Args:
+        lengths: Prompt tokens of each input, chat template applied.
+        settings: Context length and reply length.
+
+    Returns:
+        The number of prompts longer than ``prompt_token_limit``; a
+        warning is printed when it is not 0.
+    """
+    limit = prompt_token_limit(settings)
+    too_long = [length for length in lengths if length > limit]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(lengths)} prompts are "
+            f"longer than {limit} tokens (context {settings.max_model_len} "
+            f"minus max_new_tokens {settings.max_new_tokens}; longest: "
+            f"{max(too_long)}). Their beginning is cut off, so the model "
+            "never sees it.\n"
+            "  Fix: raise --max_model_len (more memory), lower "
+            "--max_new_tokens, or shorten those inputs."
+        )
+    return len(too_long)
+
+
+def truncate_prompts(
+    prompts: list[list[int]], settings: GenerationSettings
+) -> list[list[int]]:
+    """Cut prompts to ``prompt_token_limit`` tokens, keeping their end.
+
+    Chat templates put the question and the assistant header at the end
+    of a prompt, so the start is what goes. Prints the
+    ``warn_long_prompts`` warning.
+
+    Args:
+        prompts: Token ids of each prompt, chat template applied.
+        settings: Context length and reply length.
+
+    Returns:
+        The prompts, each at most ``prompt_token_limit`` tokens long.
+    """
+    warn_long_prompts([len(prompt) for prompt in prompts], settings)
+    limit = prompt_token_limit(settings)
+    return [prompt[-limit:] for prompt in prompts]
+
+
+def vllm_truncation(settings: GenerationSettings) -> dict[str, Any]:
+    """Return vLLM options that cut prompts like ``truncate_prompts``.
+
+    Args:
+        settings: Context length and reply length.
+
+    Returns:
+        ``tokenization_kwargs`` for ``LLM.chat``: keep the last
+        ``prompt_token_limit`` tokens of each prompt.
+    """
+    return {
+        "truncate_prompt_tokens": prompt_token_limit(settings),
+        "truncation_side": "left",
+    }
+
+
+def encode_chats(
+    tokenizer: PreTrainedTokenizerBase, chats: list[list[Message]]
+) -> list[list[int]]:
+    """Render and tokenize generation prompts, without padding.
+
+    Args:
+        tokenizer: Tokenizer with the training chat template.
+        chats: Conversations ending with a user turn.
+
+    Returns:
+        The token ids of each chat, ending with the assistant header.
     """
     encoded = tokenizer.apply_chat_template(
         chats,
         add_generation_prompt=True,
-        padding=True,
         return_dict=True,
-        return_tensors="pt",
         **CHAT_TEMPLATE_KWARGS,
     )
-    inputs = cast("BatchEncoding", encoded).to(model.device)
+    return cast("list[list[int]]", cast("BatchEncoding", encoded)["input_ids"])
+
+
+def generate_batch(
+    model: GenerationMixin | PeftModel,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: list[list[int]],
+    max_new_tokens: int,
+) -> list[str]:
+    """Answer tokenized prompts greedily in one left-padded batch.
+
+    Args:
+        model: A causal LM, with or without an adapter.
+        tokenizer: Its tokenizer, padding on the left.
+        prompts: Token ids of each prompt, chat template applied.
+        max_new_tokens: Generation budget per reply.
+
+    Returns:
+        The decoded replies without the prompt or special tokens, in the
+        order of ``prompts``.
+    """
+    # The attention mask keeps the model from attending to the padding.
+    padded = tokenizer.pad({"input_ids": prompts}, return_tensors="pt")
+    inputs = padded.to(model.device)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -246,6 +407,44 @@ def generate_transformers(
     # Left padding: every prompt ends at the same position.
     replies = outputs[:, inputs["input_ids"].shape[1] :]
     return list(tokenizer.batch_decode(replies, skip_special_tokens=True))
+
+
+def generate_transformers(
+    model: GenerationMixin | PeftModel,
+    tokenizer: PreTrainedTokenizerBase,
+    chats: list[list[Message]],
+    settings: GenerationSettings,
+) -> list[str]:
+    """Answer chats with greedy decoding, in token-budget batches.
+
+    Chats of similar length share a batch of at most
+    ``settings.token_budget`` padded tokens, each row counting its prompt
+    plus ``max_new_tokens`` (the length its KV cache grows to).
+
+    Args:
+        model: A causal LM, with or without an adapter.
+        tokenizer: Its tokenizer, padding on the left.
+        chats: Conversations ending with a user turn.
+        settings: Reply length, context length and batch token budget.
+
+    Returns:
+        The decoded replies without the prompt or special tokens, in the
+        order of ``chats``. A prompt longer than ``prompt_token_limit``
+        loses its beginning (``truncate_prompts``).
+    """
+    prompts = truncate_prompts(encode_chats(tokenizer, chats), settings)
+    lengths = [len(prompt) + settings.max_new_tokens for prompt in prompts]
+    replies = [""] * len(prompts)
+    for batch in length_batches(lengths, settings.token_budget):
+        batch_replies = generate_batch(
+            model,
+            tokenizer,
+            [prompts[index] for index in batch],
+            settings.max_new_tokens,
+        )
+        for index, reply in zip(batch, batch_replies, strict=True):
+            replies[index] = reply
+    return replies
 
 
 def free_gpu_memory() -> None:
@@ -276,7 +475,7 @@ def vllm_max_lora_rank(adapter_dir: str) -> int:
 def generate_vllm(
     model_id: str,
     chats: list[list[Message]],
-    max_new_tokens: int,
+    settings: GenerationSettings,
     adapter_dir: str | None = None,
 ) -> list[str]:
     """Answer a batch of chats greedily with an offline vLLM engine.
@@ -287,15 +486,24 @@ def generate_vllm(
     Args:
         model_id: Base model (with ``adapter_dir``) or merged model.
         chats: Conversations ending with a user turn.
-        max_new_tokens: Generation budget per reply.
+        settings: Reply length and context length
+            (``max_model_len``).
         adapter_dir: LoRA adapter every request is routed through, or
             ``None`` to use ``model_id`` as is.
 
     Returns:
-        The generated replies.
+        The generated replies. A prompt longer than
+        ``prompt_token_limit`` loses its beginning, as in
+        ``generate_transformers``.
     """
     from vllm import LLM, SamplingParams  # noqa: PLC0415
     from vllm.lora.request import LoRARequest  # noqa: PLC0415
+
+    # vLLM would otherwise apply the base model's own chat template.
+    template = Path(adapter_dir or model_id) / "chat_template.jinja"
+    # Tokenized only to count the prompts vLLM cuts (tokenization_kwargs).
+    prompts = encode_chats(load_tokenizer(str(template.parent)), chats)
+    warn_long_prompts([len(prompt) for prompt in prompts], settings)
 
     lora_options: dict[str, Any] = {}
     lora_request = None
@@ -310,20 +518,19 @@ def generate_vllm(
     )
     llm = LLM(
         model=model_id,
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=settings.max_model_len,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         # Skip the vision/audio encoders: the prompts are text only.
         language_model_only=multimodal,
         **lora_options,
     )
-    # vLLM would otherwise apply the base model's own chat template.
-    template = Path(adapter_dir or model_id) / "chat_template.jinja"
     outputs = llm.chat(
         chats,
-        SamplingParams(temperature=0.0, max_tokens=max_new_tokens),
+        SamplingParams(temperature=0.0, max_tokens=settings.max_new_tokens),
         lora_request=lora_request,
         chat_template=template.read_text(),
         chat_template_kwargs=CHAT_TEMPLATE_KWARGS,
+        tokenization_kwargs=vllm_truncation(settings),
     )
     del llm
     free_gpu_memory()
@@ -362,8 +569,7 @@ def run_adapter_route(
     adapter_dir: str,
     base_id: str,
     chats: list[list[Message]],
-    engine: str,
-    max_new_tokens: int,
+    settings: GenerationSettings,
 ) -> list[str]:
     """Generate with the base model and the separate LoRA adapter.
 
@@ -371,42 +577,39 @@ def run_adapter_route(
         adapter_dir: Directory written by ``save_model("lora")``.
         base_id: 16-bit base model.
         chats: Conversations ending with a user turn.
-        engine: ``"transformers"`` (peft) or ``"vllm"`` (``LoRARequest``).
-        max_new_tokens: Generation budget per reply.
+        settings: Engine, reply length and limits.
 
     Returns:
         One reply per chat.
     """
-    if engine == "vllm":
-        return generate_vllm(base_id, chats, max_new_tokens, adapter_dir)
+    if settings.engine == "vllm":
+        return generate_vllm(base_id, chats, settings, adapter_dir)
     model = load_adapter_model(adapter_dir, base_id)
     tokenizer = load_tokenizer(adapter_dir)
-    return generate_transformers(model, tokenizer, chats, max_new_tokens)
+    return generate_transformers(model, tokenizer, chats, settings)
 
 
 def run_merged_route(
     merged_dir: str,
     chats: list[list[Message]],
-    engine: str,
-    max_new_tokens: int,
+    settings: GenerationSettings,
 ) -> list[str]:
     """Generate with the merged model saved by ``merge_adapter``.
 
     Args:
         merged_dir: Directory written by ``merge_adapter``.
         chats: Conversations ending with a user turn.
-        engine: ``"transformers"`` or ``"vllm"``.
-        max_new_tokens: Generation budget per reply.
+        settings: Engine, reply length and limits.
 
     Returns:
         One reply per chat.
     """
-    if engine == "vllm":
-        return generate_vllm(merged_dir, chats, max_new_tokens)
+    if settings.engine == "vllm":
+        return generate_vllm(merged_dir, chats, settings)
     # Causal LM classes subclass GenerationMixin.
     model = cast("GenerationMixin", load_model(merged_dir))
     tokenizer = load_tokenizer(merged_dir)
-    return generate_transformers(model, tokenizer, chats, max_new_tokens)
+    return generate_transformers(model, tokenizer, chats, settings)
 
 
 def parse_args() -> argparse.Namespace:
@@ -414,7 +617,8 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         Namespace with the adapter, base model, merged directory, engine,
-        prompts and generation budget.
+        prompts, generation budget, context length and batch token
+        budget.
     """
     parser = argparse.ArgumentParser(
         description="Chat with the instruct adapter, separately and "
@@ -444,6 +648,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS
     )
+    parser.add_argument(
+        "--max_model_len",
+        type=int,
+        default=MAX_MODEL_LEN,
+        help="Context length: prompt plus --max_new_tokens tokens "
+        f"(default: {MAX_MODEL_LEN}). A longer prompt loses its beginning, "
+        "with a warning.",
+    )
+    parser.add_argument(
+        "--token_budget",
+        type=int,
+        default=TOKEN_BUDGET,
+        help="Transformers engine: most padded tokens per batch, rows "
+        "times the longest prompt plus --max_new_tokens (default: "
+        f"{TOKEN_BUDGET}). A longer input runs alone.",
+    )
     return parser.parse_args()
 
 
@@ -459,16 +679,17 @@ def main() -> None:
     chats = build_chats(prompts, args.system_prompt)
     merged_dir = args.merged_dir or f"{args.adapter_dir.rstrip('/')}-merged"
     base_id = resolve_base_model(args.adapter_dir, args.base_model)
+    settings = GenerationSettings(
+        args.engine, args.max_new_tokens, args.max_model_len, args.token_budget
+    )
 
     adapter_replies = run_adapter_route(
-        args.adapter_dir, base_id, chats, args.engine, args.max_new_tokens
+        args.adapter_dir, base_id, chats, settings
     )
     free_gpu_memory()
     merge_adapter(args.adapter_dir, base_id, merged_dir)
     free_gpu_memory()
-    merged_replies = run_merged_route(
-        merged_dir, chats, args.engine, args.max_new_tokens
-    )
+    merged_replies = run_merged_route(merged_dir, chats, settings)
 
     print(f"\nEngine: {args.engine}. Merged model saved to {merged_dir}")
     for prompt, adapter, merged in zip(

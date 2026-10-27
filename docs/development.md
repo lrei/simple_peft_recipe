@@ -26,6 +26,10 @@ uv sync --group dev --extra gym            # + reasoning-gym (examples/rgym)
 `--extra gym` implies `rl`. Type checking with pyright resolves imports from
 the synced environment, so run it with the extras your change touches.
 
+`causal-conv1d` is optional and not in `uv.lock`, so a plain `uv sync`
+removes it; use `uv sync --inexact` to keep it. Build recipe:
+[guide.md, Optional kernels](guide.md#optional-kernels).
+
 Change dependencies with `uv add` / `uv lock`; never hand-edit `uv.lock`.
 
 Install the git hooks once per clone:

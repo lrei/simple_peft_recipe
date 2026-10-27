@@ -87,9 +87,9 @@ gets LoRA adapters.
 | Field | Default | Notes |
 |-------|---------|-------|
 | `model_name_or_path` | `unsloth/Qwen2.5-0.5B-Instruct` | Hub id or local dir |
-| `load_in_4bit` | `False` | QLoRA; use for anything ≥ 4B on 24 GB |
+| `load_in_4bit` | `False` | QLoRA: the frozen base weights in 4-bit, about a quarter of their bf16 memory; use when the bf16 model leaves too little GPU memory for training |
 | `full_finetuning` | `False` | Train every weight instead of LoRA (bf16 weights, the configured optimizer); for comparison runs, with a learning rate about ten times lower; `save_model` writes the whole model; not with 4-bit or 8-bit |
-| `max_seq_length` | 2048 | Longer rows are truncated |
+| `max_seq_length` | 2048 | Longer rows are truncated to it (with `packing` too), so training never sees their end. `train` tokenizes every row once up front and prints a warning with how many rows are cut and the longest; the counts are also in `train_metrics.json` (`truncated_train_rows`, `longest_train_row`, and the same for `eval`) |
 | `chat_template` | `"qwen2.5"` | `None` = model's own |
 | `lora_r` / `lora_alpha` | 8 / 32 | See [rank](#7-checking-the-rank) |
 | `target_modules` | all attention + MLP projections | |
@@ -98,13 +98,181 @@ gets LoRA adapters.
 | `num_train_epochs` / `max_steps` | 3 / -1 | `max_steps` > 0 overrides epochs |
 | `eval_strategy` / `save_strategy` | `"epoch"` / `"epoch"` | Must match (the best checkpoint by `eval_loss` is loaded at the end). `eval_strategy="no"` keeps the final model and evaluates the eval set once after training; `save_strategy` is then free. Without an eval set use `"no"` for both |
 | `save_method` | `"lora"` | or `"merged_16bit"` |
-| `attn_implementation` | `"sdpa"` | Fastest on a 3090 |
-| `padding_free` | `False` | Without FlashAttention (3090 + SDPA) it is several times slower than padded batches |
+| `attn_implementation` | `"sdpa"` | Needs no extra package and does not recompile for new sequence lengths (Unsloth's own default, flex attention, does); `"flash_attention_2"` needs `flash-attn` |
+| `padding_free` | `False` | Without FlashAttention the joined batch can get a full attention mask whose memory grows with the square of its tokens, so it can be slower and use more memory than padded batches; `train` warns when it or `packing` is on without FlashAttention. Unsloth turns it off for hybrid linear-attention models (Qwen 3.5) unless its experimental hybrid packing is on and `causal-conv1d` is installed ([Batching](#batching)); `train` prints when it does |
+| `max_batch_tokens` | `None` | Token budget per batch, see [Batching](#batching); not with `packing` |
 | `router_aux_loss_coef` | 0.0 | MoE router load-balancing loss; the router stays frozen (not a LoRA target), and Unsloth's 4-bit gpt-oss fails with it on |
 | `eval_in_train_mode` | `[]` | Module class names kept in training mode during evaluation, for eval-mode kernels that are wrong or too heavy (gpt-oss example); only for modules without dropout |
 
 `PESFTConfig.from_args()` / `get_argument_parser()` expose most fields as
 CLI flags.
+
+### Batching
+
+How rows become batches and what each setting changes:
+
+- `per_device_train_batch_size`: rows per forward and backward pass on
+  one GPU. A batch is padded to its longest row, so its memory grows
+  roughly with rows × longest row.
+- `gradient_accumulation_steps`: passes per optimizer step. Gradients
+  of the passes are accumulated before the update, so memory stays that of
+  one pass. Effective batch: `per_device_train_batch_size` ×
+  `gradient_accumulation_steps` × number of GPUs.
+- Length grouping: `PESFT` always puts rows of similar length in the
+  same training batch, in random order, so less padding is computed.
+  Every batch still has `per_device_train_batch_size` rows, so a batch
+  of long rows needs far more memory than a batch of short ones.
+- `max_batch_tokens` (default `None`): a token budget per batch. Rows
+  are sorted by length and grouped so that a batch has at most
+  `per_device_train_batch_size` rows and at most `max_batch_tokens`
+  tokens: rows × longest row for padded batches, the sum of the rows
+  with `padding_free`. Short rows share a batch; a row longer than the
+  budget runs alone. Details:
+  - Rows per optimizer step vary, so the number of steps per epoch
+    changes, and step-based settings (`max_steps`, `warmup_steps`,
+    `eval_steps`, `save_steps`, `logging_steps`) cover a different
+    amount of data than with fixed batches. `train` prints the batches
+    and optimizer steps per epoch; prefer `num_train_epochs` and
+    `warmup_ratio`.
+  - The loss is averaged over all trained tokens of a step, so long
+    rows are not under-weighted.
+  - Batches keep their rows across epochs; their order is shuffled
+    every epoch with the trainer seed, and a resumed run replays the
+    same order.
+  - Evaluation batches follow the same budget, with
+    `per_device_eval_batch_size` rows at most. `eval_loss` is a mean
+    over batches, which is a mean over rows only with one row per eval
+    batch.
+  - TRL's `train_samples_per_second` assumes full batches.
+  - Under DDP each GPU gets whole batches in turn, and the first
+    batches are repeated so every GPU runs the same number of steps.
+  - Not with `packing`.
+- `padding_free` and `packing` (default off): `padding_free` joins the
+  rows of a batch into one sequence without padding; `packing` fills
+  sequences of up to `max_seq_length` tokens with several rows, and
+  `per_device_train_batch_size` then counts those sequences. Both save
+  memory and time only with FlashAttention
+  (`attn_implementation="flash_attention_2"`, needs `flash-attn`).
+  Without it, the joined sequence can get a full attention mask whose
+  memory grows with the square of its length; `train` warns
+  (`WARNING: padding_free=True ... without FlashAttention`).
+  Hybrid linear-attention models such as Qwen 3.5 mix full-attention
+  layers with linear-attention layers that read the joined sequence as
+  one stream, so rows would leak into each other. Unsloth therefore
+  turns both off for them, and `train` prints
+  `Unsloth turned padding_free off for this model`. They stay on only
+  when all of these hold:
+  - the environment variable `UNSLOTH_EXPERIMENTAL_HYBRID_PACKING=1` is
+    set before training starts (an experimental Unsloth switch);
+  - `flash-linear-attention` (installed with `speftr`) and
+    `causal-conv1d` (optional, see [Optional kernels](#optional-kernels))
+    are installed.
+
+  Unsloth then passes the row boundaries to the linear-attention layers,
+  and training matches padded batches. The trade-off without
+  FlashAttention: steps are faster than with padded batches, but GPU
+  memory is higher, because the full-attention layers get a mask over
+  the whole joined batch. Compare loss, step time and peak memory before
+  you keep it on.
+- `max_seq_length`: longer rows are truncated to it, so training never
+  sees their end. `train` counts every row's tokens before training and
+  prints a warning with how many rows are cut and the longest.
+
+Which to use:
+
+- Short rows of similar length: the defaults.
+- Lengths vary a lot: `max_batch_tokens`. When the longest row is far
+  longer than the median, `train` prints a note with a starting value
+  (`per_device_train_batch_size` × the 90th-percentile row length); it
+  is a rule of thumb.
+- Mostly long rows: `per_device_train_batch_size=1` with
+  `gradient_accumulation_steps` for the effective batch.
+- Out of GPU memory: `train` prints the batch settings and the fixes to
+  try, in order.
+
+### Long context
+
+For rows of thousands to tens of thousands of tokens (see
+[Batching](#batching) for the settings):
+
+1. Set `max_seq_length` to at least the longest row. The warning that
+   `train` prints names it.
+2. Use `per_device_train_batch_size=1` with
+   `gradient_accumulation_steps` for the effective batch, or set
+   `max_batch_tokens` so short rows still share a batch. Keep
+   `per_device_eval_batch_size=1`.
+3. Keep `use_gradient_checkpointing="unsloth"` (the default; activations
+   are offloaded to CPU memory).
+4. Leave `padding_free` and `packing` off unless FlashAttention is
+   installed (hybrid linear-attention models: see
+   [Batching](#batching)).
+5. For linear-attention models (Qwen 3.5), `causal-conv1d` makes
+   training faster and lowers memory somewhat
+   ([Optional kernels](#optional-kernels)).
+6. Do not set the environment variable `UNSLOTH_COMPILE_DISABLE=1`:
+   for many models the loss then holds the logits of every token over
+   the whole vocabulary at once. `train` warns when it is set.
+7. When batches vary (`max_batch_tokens`), set the length of training
+   and warmup with `num_train_epochs` and `warmup_ratio`, not step
+   counts.
+8. The evaluation and inference scripts of `examples/` batch inputs by
+   a token budget (`--token_budget`); a longer input runs alone. Inputs
+   longer than the context length are truncated, with a warning.
+9. On out of GPU memory, follow the printed guidance: lower the batch
+   size or the budget, load the model in 4-bit (`load_in_4bit=True`),
+   shorten `max_seq_length`, or use a GPU with more memory.
+
+### Optional kernels
+
+Linear-attention layers (e.g. the gated delta net layers of Qwen 3.5)
+run fast only with dedicated GPU kernels. Without them transformers
+falls back to a much slower pure-PyTorch path.
+
+- `flash-linear-attention` (`fla`): installed with `speftr`. Triton
+  kernels for the layer's scan in training and prefill, the per-token
+  decode step and a fused gated norm. It matters most for
+  plain-transformers inference and evaluation (the examples'
+  `*_inference.py` and `*_eval.py`). Unsloth bundles its own copy and
+  uses the installed one when it is newer; training results do not
+  change.
+- `causal-conv1d`: optional, not installed. The kernel for the layer's
+  short causal convolution. It makes training and prefill faster and
+  lowers memory somewhat, and padding-free or packed training of hybrid
+  linear-attention models needs it ([Batching](#batching)). Until it is
+  installed, transformers logs `The fast path is not available because
+  one of the required library is not installed`; this is harmless.
+
+`causal-conv1d` has no prebuilt wheel for every torch version, so build
+it from source against the installed torch, with a CUDA toolkit of the
+same version as torch's CUDA. Check both with
+`uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"`
+(this project: the CUDA 13.0 build). The NVIDIA pip wheels work as the
+toolkit; install them in a separate environment so the project's own
+locked packages stay as they are:
+
+```bash
+uv venv ~/cuda-13.0
+uv pip install --python ~/cuda-13.0 "nvidia-cuda-nvcc==13.0.*" \
+  "nvidia-cuda-cccl==13.0.*" "nvidia-cuda-crt==13.0.*" \
+  "nvidia-nvvm==13.0.*" "nvidia-cuda-runtime==13.0.*"
+export CUDA_HOME=$(echo ~/cuda-13.0/lib/python3*/site-packages/nvidia/cu13)
+CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+  uv pip install --no-build-isolation causal-conv1d
+```
+
+- A system or module CUDA toolkit of the same version works too: point
+  `CUDA_HOME` at it.
+- `--no-build-isolation` builds against the installed torch;
+  `MAX_JOBS` bounds parallel compilation. The build takes several
+  minutes and a few GB of RAM.
+- `CUDA compiler and CUDA toolkit headers are incompatible`: nvcc and
+  the CUDA headers come from different versions; use one toolkit whose
+  version matches torch's CUDA. The `rl` extra (vLLM) installs a newer
+  nvcc wheel into the project environment, so do not point `CUDA_HOME`
+  there.
+- `uv sync` removes packages that are not in `uv.lock`, including
+  `causal-conv1d`; reinstall it after a sync, or run
+  `uv sync --inexact`.
 
 ### Example: from a JSONL of messages to a saved adapter
 
@@ -217,9 +385,9 @@ def reward(completions, answer, **kwargs) -> list[float]: ...
 
 `load_in_4bit=True` with `use_vllm=True` raises `ValueError`: TRL syncs
 merged weights into vLLM after each step, which corrupts a 4-bit vLLM
-copy. Without vLLM, generation runs in transformers and is several times
-slower (~35 s/step for Qwen 3.5 2B), but the base model takes about a
-quarter of the memory.
+copy. Without vLLM, generation runs in transformers' `generate`, which
+is slower than vLLM, but the base model takes about a quarter of its
+bf16 memory.
 
 ### Example: GSM8K with an exact-match reward
 
@@ -541,36 +709,38 @@ best when the model can already solve the task sometimes.
 
 ### Validated models
 
-RTX 3090 24 GB; torch 2.11 (cu130), transformers 5.13.1, TRL 1.13,
-vLLM 0.26, unsloth 2026.9.11.
+These models train with `speftr` on torch 2.11 (cu130), transformers
+5.13.1, TRL 1.13, vLLM 0.26 and unsloth 2026.9.11. Speed and memory
+depend on your GPU, data and settings; each example's README records
+its own runs.
 
-SFT: 20 steps on Dolly-pirate rows, rank 8, `max_seq_length` 1024,
-batch 8 unless noted.
+SFT (Dolly-pirate rows, rank 8, `max_seq_length` 1024, batch 8 unless
+noted):
 
-| Model | Hub id used | Load | s/step | Peak VRAM |
-|-------|-------------|------|--------|-----------|
-| Gemma 4 E2B | `unsloth/gemma-4-E2B-it-unsloth-bnb-4bit` | 4-bit | 1.4 | 10.3 GB |
-| Gemma 4 E2B | `unsloth/gemma-4-E2B-it` | 16-bit | | 12.3 GB |
-| Gemma 4 E4B | `unsloth/gemma-4-E4B-it-unsloth-bnb-4bit` | 4-bit | 2.1 | 13.8 GB |
-| Gemma 4 12B | `google/gemma-4-12B-it` | 4-bit | 3.6 | 10.3 GB |
-| Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 4-bit | | ~5 GB |
-| Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 4-bit | 3.2 | 9.5 GB |
-| Qwen 3.8 27B | `unsloth/Qwen3.8-27B-unsloth-bnb-4bit` | 4-bit, batch 1 × grad-acc 8 | 13.1 | 21.7 GB |
-| Gemma 3 270M | `unsloth/gemma-3-270m-it` | guard example | 4.5 it/s | ~5 GB |
-| Qwen3 0.6B | `unsloth/Qwen3-0.6B-unsloth-bnb-4bit` | 4-bit, instruct example | | |
-| gpt-oss-20b | `unsloth/gpt-oss-20b-unsloth-bnb-4bit` | 4-bit, rank 1, gptoss example (batch 4 × grad-acc 4, 2048 tokens) | 15 | 15.4 GiB |
+| Model | Hub id used | Load |
+|-------|-------------|------|
+| Gemma 4 E2B | `unsloth/gemma-4-E2B-it-unsloth-bnb-4bit` | 4-bit |
+| Gemma 4 E2B | `unsloth/gemma-4-E2B-it` | 16-bit |
+| Gemma 4 E4B | `unsloth/gemma-4-E4B-it-unsloth-bnb-4bit` | 4-bit |
+| Gemma 4 12B | `google/gemma-4-12B-it` | 4-bit |
+| Qwen 3.5 4B | `Qwen/Qwen3.5-4B` | 4-bit |
+| Qwen 3.5 9B | `Qwen/Qwen3.5-9B` | 4-bit |
+| Qwen 3.8 27B | `unsloth/Qwen3.8-27B-unsloth-bnb-4bit` | 4-bit, batch 1 × grad-acc 8 |
+| Gemma 3 270M | `unsloth/gemma-3-270m-it` | guard example |
+| Qwen3 0.6B | `unsloth/Qwen3-0.6B-unsloth-bnb-4bit` | 4-bit, instruct example |
+| gpt-oss-20b | `unsloth/gpt-oss-20b-unsloth-bnb-4bit` | 4-bit, rank 1, gptoss example (batch 4 × grad-acc 4, 2048 tokens) |
 
 Gemma 4 used `chat_template="gemma-4"`, Qwen 3.5/3.8 `chat_template=None`.
 
-RL: `examples/rgym` on `chain_sum` (rank 1, 16 generations, batch 8 ×
-grad-acc 2, 512-token completions), accuracy before → after:
+RL ([examples/rgym](../examples/rgym/README.md) on `chain_sum`: rank 1,
+16 generations, batch 8 × grad-acc 2, 512-token completions):
 
 | Model | Setup | Result |
 |-------|-------|--------|
-| Qwen3 1.7B (`Qwen/Qwen3-1.7B`) | bf16 + vLLM colocate | 27% → 89% in 100 steps |
-| Qwen 3.5 2B (`Qwen/Qwen3.5-2B`) | bf16 + vLLM colocate | 23% → 94% in 30 steps |
-| Qwen 3.5 2B | 4-bit, no vLLM | 39% → 94% in 30 steps; model 1.8 GB, ~35 s/step |
-| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM, `vllm_gpu_memory_utilization=0.45`, batch 2 × grad-acc 8 | Runs; 44% → 48% in 30 steps (needs tuning) |
+| Qwen3 1.7B (`Qwen/Qwen3-1.7B`) | bf16 + vLLM colocate | Learns the task |
+| Qwen 3.5 2B (`Qwen/Qwen3.5-2B`) | bf16 + vLLM colocate | Learns the task |
+| Qwen 3.5 2B | 4-bit, no vLLM | Learns the task |
+| Gemma 4 E2B (`unsloth/gemma-4-E2B-it`) | bf16 + vLLM, `vllm_gpu_memory_utilization=0.45`, batch 2 × grad-acc 8 | Runs; little gain without tuning |
 
 ### Chat templates and markers
 
@@ -684,7 +854,7 @@ Download once and run without Hub access: see
 
 | Symptom | Fix |
 |---------|-----|
-| CUDA out of memory (SFT) | Lower `per_device_train_batch_size`, raise `gradient_accumulation_steps` to keep the effective batch, use `load_in_4bit=True`, shorten `max_seq_length` |
+| CUDA out of memory (SFT, DPO) | `PESFT` and `PEDPO` print the longest training row (pair), the batch settings and these fixes, in order: set `max_batch_tokens` so long rows train alone (SFT), or lower `per_device_train_batch_size` and raise `gradient_accumulation_steps` to keep the effective batch; keep gradient checkpointing on; lower `max_seq_length` (`max_length`); use `load_in_4bit=True`; use a GPU with more memory |
 | CUDA out of memory (RL) | Lower `max_completion_length` or batch (keep batch × grad-acc a multiple of `num_generations`), lower `vllm_gpu_memory_utilization`, keep `vllm_enable_sleep_mode=True` |
 | Gemma 4 RL OOM | `vllm_gpu_memory_utilization=0.45`, batch 2 × grad-acc 8 |
 | `ValueError: load_in_4bit requires use_vllm=False` | 4-bit RL cannot use vLLM; set `use_vllm=False` or load bf16 |
@@ -692,6 +862,11 @@ Download once and run without Hub access: see
 | `ValueError: You have set args.eval_strategy to ... but you didn't pass an eval_dataset` | `eval_strategy="no"` and `save_strategy="no"` (they must match) |
 | Chat-template error formatting conversations | The tokenizer has no chat template (base model): set `chat_template` to a named template, or format plain text yourself |
 | Formatting function never called | Dataset has a `text` column or `prompt` + `completion` columns; rename them |
+| `WARNING: N of M train rows are longer than max_seq_length` (DPO: `pairs ... max_length`) | Those rows are truncated, so training never sees their end. Raise `max_seq_length` (`max_length`) to the longest row named in the message (more GPU memory), or filter or shorten those rows |
+| `WARNING: ... UNSLOTH_COMPILE_DISABLE=1 is set` | Unset it before starting the script: for many models it makes the loss build the full logits (every token × the whole vocabulary) at once |
+| `The fast path is not available because one of the required library is not installed` (transformers, Qwen 3.5 and other linear-attention models) | Harmless: training and results are correct. Install `causal-conv1d` for the full fast path ([Optional kernels](#optional-kernels)) |
+| `WARNING: padding_free=True ... without FlashAttention` | Leave `padding_free` and `packing` off, or install `flash-attn` and set `attn_implementation="flash_attention_2"` |
+| `Unsloth turned padding_free off for this model` | A hybrid linear-attention model (Qwen 3.5): batches are padded, training is correct. To keep padding-free, see the conditions in [Batching](#batching) |
 | Response-only loss trains nothing / everything | `instruction_part` / `response_part` don't match the rendered template; print one formatted row |
 | Fine-tuned model's replies run on into `assistant` / `<think>` text (Qwen 3.5) | The model's `eos_token_id` is `<|endoftext|>`, not the turn's `<|im_end|>`; pass `eos_token_id=[..., tokenizer.eos_token_id]` to `generate` ([markers](#chat-templates-and-markers)) |
 | Adapter loads but outputs look like the base model | Loaded with `AutoModelForCausalLM` on a multimodal checkpoint; use the `architectures` class ([above](#load-an-adapter-for-inference-transformers--peft)) |
@@ -702,21 +877,19 @@ More memory levers: [Fitting in memory](#10-fitting-in-memory).
 
 ## 10. Fitting in memory
 
-Measured on one RTX 3090 (24 GB), LoRA rank 8, one sequence of 2048
-tokens per micro-batch unless noted; peak memory allocated by torch, in
-GiB. The config fields named below are also CLI flags (`--<field>`) of
-`get_argument_parser()`, except `max_completion_length`. Levers, largest
-effect first:
+The config fields named below are also CLI flags (`--<field>`) of
+`get_argument_parser()`, except `max_completion_length`. Levers, usually
+largest effect first:
 
-| Lever | Measured effect | `PESFT` | `PERL` |
-|-------|-----------------|---------|--------|
-| 4-bit base weights (NF4, QLoRA) | Weights ≈ ¼ of bf16; the only lever that fits 12B–31B on 24 GB. Gemma 4 31B: 18 GiB of weights, 19.6 GiB peak | `load_in_4bit` | `load_in_4bit` (needs `use_vllm=False`) |
-| Gradient checkpointing | Off: Gemma 4 E4B 4-bit peak 11.3 → 21.0 GiB, 28% faster | `use_gradient_checkpointing`: `"unsloth"` (default, offloads activations to CPU), `"true"`, `"false"` | `use_gradient_checkpointing` (`"true"` default) |
-| Tokens per micro-batch | Gemma 4 31B 4-bit: 19.1 / 19.6 / 20.7 GiB at 1024 / 2048 / 4096 tokens | `per_device_train_batch_size`, `max_seq_length` | `per_device_train_batch_size`, `max_completion_length` |
-| Full-vocabulary logits | A 262k vocabulary (Gemma) costs ~1 GiB of bf16 logits per 2048 tokens, plus fp32 copies; a non-fused loss raised Gemma 4 E4B 4-bit from 10.6 to 16.3 GiB | Always fused by Unsloth; nothing to set | `use_liger_kernel` (`speftr[liger]` extra) |
-| Gradient accumulation | Same peak (±0.07 GiB); keeps the effective batch when the micro-batch shrinks | `gradient_accumulation_steps` | `gradient_accumulation_steps` |
-| 8-bit base weights (LLM.int8) | Weights ≈ ½ of bf16, but peak ≈ bf16 (Gemma 4 E4B 16.3 vs 16.0 GiB) and 5–46% slower; helps only when weights dominate | `load_in_8bit` | `load_in_8bit` (needs `use_vllm=False`) |
-| Optimizer | ≤ 0.15 GiB between `adamw_torch`, `adamw_8bit`, `paged_adamw_8bit`, `adamw_torch_4bit`: LoRA state is tiny. Paged optimizers only page state tensors of ≥ 100k elements, which LoRA rarely has | `optim` (`adamw_8bit`) | `optim` (`adamw_8bit`) |
+| Lever | Effect | `PESFT` | `PERL` |
+|-------|--------|---------|--------|
+| 4-bit base weights (NF4, QLoRA) | Frozen weights ≈ ¼ of bf16; the main lever when the weights take most of the GPU memory, and what lets a large model fit one GPU | `load_in_4bit` | `load_in_4bit` (needs `use_vllm=False`) |
+| Gradient checkpointing | On: activations are recomputed in the backward pass instead of stored, so activation memory stays small, at the cost of extra compute. Off is faster when a step's activations fit (e.g. batch 1, short rows) | `use_gradient_checkpointing`: `"unsloth"` (default, offloads activations to CPU), `"true"`, `"false"` | `use_gradient_checkpointing` (`"true"` default) |
+| Tokens per micro-batch | Activation memory grows with the tokens of a micro-batch (padded: rows × longest row) | `per_device_train_batch_size`, `max_seq_length` | `per_device_train_batch_size`, `max_completion_length` |
+| Full-vocabulary logits | The logits hold tokens × vocabulary-size values, plus fp32 copies in a plain loss; large for vocabularies of 100k+ tokens. A fused loss never holds them all | Fused by Unsloth; nothing to set (`PESFT` warns when `UNSLOTH_COMPILE_DISABLE=1` is set, which turns it off for many models) | `use_liger_kernel` (`speftr[liger]` extra) |
+| Gradient accumulation | No extra memory; keeps the effective batch when the micro-batch shrinks, at the cost of more, smaller passes | `gradient_accumulation_steps` | `gradient_accumulation_steps` |
+| 8-bit base weights (LLM.int8) | Weights ≈ ½ of bf16; slower than 4-bit and bf16 (LLM.int8 handles outlier features separately) and saves less than 4-bit; helps only when weights dominate | `load_in_8bit` | `load_in_8bit` (needs `use_vllm=False`) |
+| Optimizer | Little difference between `adamw_torch`, `adamw_8bit`, `paged_adamw_8bit`, `adamw_torch_4bit`: the optimizer state covers only the LoRA parameters, which are few. Paged optimizers only page state tensors of ≥ 100k elements, which LoRA rarely has | `optim` (`adamw_8bit`) | `optim` (`adamw_8bit`) |
 
 Loss functions compute the log-sum-exp over the vocabulary in fp32 for
 stability; fused or chunked losses (Unsloth, TRL's default SFT loss,
@@ -726,8 +899,8 @@ Recommended combinations:
 
 | Situation | `PESFT` | `PERL` |
 |-----------|---------|--------|
-| One 24 GB GPU | 16-bit up to ~4B; `load_in_4bit` above. From ~12B: batch 1 × `gradient_accumulation_steps`, `max_seq_length` ≤ 4096. Gemma 4 31B is about the limit ([examples/big](../examples/big/README.md)) | bf16 + colocated vLLM for small models; 4-bit without vLLM for larger ones (slow generation); lower batch and `max_completion_length`; Liger for models without final-logit soft-capping |
-| Model fits one A100 (40/80 GB) | bf16 LoRA, no quantization; more GPUs: DDP ([below](#11-multiple-gpus)) | bf16 + colocated vLLM; more GPUs: DDP |
+| Model fits one GPU in bf16, with room for activations | bf16 LoRA (the default); more GPUs: DDP ([below](#11-multiple-gpus)) | bf16 + colocated vLLM; more GPUs: DDP |
+| Model fits one GPU only in 4-bit | `load_in_4bit`; with little memory left, batch 1 × `gradient_accumulation_steps` and a shorter `max_seq_length` ([examples/big](../examples/big/README.md) shows this setup) | 4-bit without vLLM (slower generation); lower batch and `max_completion_length`; Liger for models without final-logit soft-capping |
 | Model does not fit one GPU | `load_in_4bit` first; else `device_map="unsloth_balanced"` over several GPUs | `load_in_4bit` without vLLM; generation is slow |
 
 Limits:
@@ -746,67 +919,53 @@ Limits:
 
 ### Bigger or newer GPUs
 
-Measured with `examples/speed.py` on the
-[intent](../examples/intent/README.md#speed) and
-[tldr](../examples/tldr/README.md#speed) examples (Granite 3.3 2B,
-Qwen 3.5 4B and Gemma 4 E4B, bf16, batch 16, 40-step runs plus
-300-step runs) on one RTX 3090 (24 GB) and one A100 40GB (PCIe). What
-holds across the three models and both examples:
+The [intent](../examples/intent/README.md#speed) and
+[tldr](../examples/tldr/README.md#speed) examples record speed sweeps
+(`examples/speed.py`) on their GPUs. In general:
 
-- **Same settings, shorter steps.** The A100 runs the recipe defaults
-  2.2 to 2.5 times faster per step than the 3090 (intent: 3.49 → 1.60,
-  3.55 → 1.52, 5.97 → 2.69 s/step; tldr: 2.67 → 1.14, 3.40 → 1.45,
-  3.73 → 1.53), at the same peak memory, loss and score. The 300-step
-  intent runs went from 18.7, 18.8 and 29.6 minutes to 8.7, 9.1 and
-  14.2.
-- **Keep the batch.** Batch 32 doubles the step time and gives the same
-  samples per second as batch 16 on both GPUs; the recipe stops at 32
-  for LoRA's sake anyway ([README](../README.md#the-recipe)). Gradient
-  accumulation is a cost, not a lever: 8 × 2 adds up to 7% per step and
-  4 × 4 8 to 43%, so run the largest per-device batch that fits and
-  accumulate only for the remainder.
-- **Gradient checkpointing stays on** at batch 16: without it these
-  2B to 8B models run out of memory at 600-token prompts even on 40 GB
-  (turning it off pays at batch 1, see the table above).
-- **4-bit costs no speed, and no measured quality.** `load_in_4bit`
-  trains within 8% of the bf16 step time on both GPUs with 23 to 38%
-  less memory, and the 300-step 4-bit runs score within the bf16 runs'
-  spread (intent accuracy 0.80 to 0.86 against 0.82 to 0.86; TL;DR
-  ROUGE-1 within 0.01) on both GPUs. On a larger GPU bf16 buys nothing
-  measurable here for models of this size.
+- **Same settings, shorter steps.** The recipe defaults do not depend on
+  the GPU: on a faster GPU the same config gives the same results in
+  less time.
+- **Keep the batch.** The recipe stops at 32 for LoRA's sake
+  ([README](../README.md#the-recipe)). Run the largest
+  `per_device_train_batch_size` that fits and use
+  `gradient_accumulation_steps` only for the remainder: each accumulated
+  pass is a separate, smaller forward and backward pass, which keeps the
+  GPU less busy.
+- **Gradient checkpointing stays on** for multi-row batches: without it
+  activation memory grows with every layer and every token of the
+  batch. Turning it off pays when a step's activations fit (table
+  above).
+- **4-bit or bf16.** `load_in_4bit` cuts weight memory to about a
+  quarter; the weights are dequantized on the fly, and quantization can
+  change quality. When bf16 fits, compare both on your task; the intent
+  and tldr READMEs compare them on theirs.
 - **Attention and batching kernels are model-specific.** Flex
-  attention is 6 to 8% faster than SDPA for Granite on both GPUs at
-  steady state (and recompiles for new sequence lengths, which eats
-  most of it over 40 steps), no faster for Gemma and unsupported for
-  Qwen 3.5. Padding-free and packing break Granite's training (eval
-  loss 1.9 to 4.5 instead of 0.2 to 1.75), leave Qwen 3.5 unchanged,
-  and slow Gemma down. Measure before switching either on.
-- **Warm-up is the same on both GPUs.** The first steps compile
-  kernels: 14 to 90 s with a warm compile cache, up to 2 minutes (12
-  with flex attention plus padding-free on Gemma) with a cold one.
-  `train_metrics.json` separates it (`warmup_seconds`,
+  attention, `padding_free` and `packing` depend on the model's
+  attention code and the installed kernels: the same setting can speed
+  up one model, slow down another or break its training. Compare loss
+  and step time before switching one on.
+- **Warm-up.** The first steps compile kernels, longer with a cold
+  compile cache. `train_metrics.json` separates it (`warmup_seconds`,
   `steady_seconds_per_step`).
-- **Precision.** bf16 is the training dtype on every GPU tested (both
-  are Ampere). FP8 and NVFP4 checkpoints are inference formats here
-  (Limits above); Hopper and Blackwell GPUs are not measured.
-- **Full fine-tuning buys nothing measurable at this size.** Qwen 3.5
-  4B on Banking77, 300 steps on one A100 40GB, same seed: full
-  fine-tuning (bf16 weights, 8-bit AdamW, learning rate 2e-5), LoRA
-  rank 1 and QLoRA rank 1 (2e-4) score 0.856, 0.833 and 0.868
-  accuracy, within the spread of repeated runs; full fine-tuning takes
-  27% longer per step and 29 GiB against 20 and 15
-  ([intent README](../examples/intent/README.md#full-fine-tuning-lora-and-qlora-on-one-a100)).
+- **Precision.** bf16 is the training dtype (Ampere or newer). FP8 and
+  NVFP4 checkpoints are inference formats here (Limits above).
+- **Full fine-tuning** (`full_finetuning`) trains every weight, so
+  gradients and optimizer state cover the whole model: far more memory
+  and compute per step than LoRA. It is there for comparisons; the
+  [intent README](../examples/intent/README.md#full-fine-tuning-lora-and-qlora-on-one-a100)
+  compares full fine-tuning, LoRA and QLoRA.
 - **Larger models or more throughput** come from more memory or more
   GPUs, not from different hyperparameters: the combinations table
   above and [Multiple GPUs](#11-multiple-gpus).
 
 ## 11. Multiple GPUs
 
-Validated on two A100 40GB: `PESFT` DDP with Gemma 4 31B (4-bit),
-model splitting with gpt-oss-120b and `PERL` DDP with Qwen3 1.7B
-(`examples/rgym`). `PERL` with a separate vLLM server is implemented
-but not validated. `examples/big` and `examples/gptoss` have Slurm
-templates ([big](../examples/big/big.sbatch),
+Validated: `PESFT` DDP ([examples/big](../examples/big/README.md)),
+`PESFT` model splitting ([examples/gptoss](../examples/gptoss/README.md))
+and `PERL` DDP ([examples/rgym](../examples/rgym/README.md)). `PERL`
+with a separate vLLM server is implemented but not validated.
+`examples/big` and `examples/gptoss` have Slurm templates ([big](../examples/big/big.sbatch),
 [gptoss](../examples/gptoss/gptoss.sbatch)).
 
 **`PESFT`, data parallel (DDP).** One process per GPU, each with a full
@@ -821,10 +980,8 @@ Unsloth puts each process on its own GPU. Effective batch =
 `gradient_accumulation_steps` by N to keep it. Only rank 0 prints the
 parameters and writes files.
 
-Measured with Gemma 4 31B (4-bit) on two A100 40GB
-([examples/big](../examples/big/README.md#several-gpus)): per-GPU batch
-4 × accumulation 2 (16 rows per step) ran at ~2.6 s per step, one epoch
-of Dolly (14,970 rows) in ~40 min, at a peak of 29.7 / 24.0 GB.
+[examples/big](../examples/big/README.md#several-gpus) records a DDP
+run.
 
 **`PESFT`, one model split over GPUs.** For a model too large for one
 GPU even in 4-bit: `device_map="unsloth_balanced"`
@@ -834,23 +991,17 @@ and logits on the head's GPU and balances the rest; transformers'
 `"balanced"` splits the weights evenly without that reserve. Layers run
 one GPU at a time, so it adds memory, not speed.
 
-Measured with gpt-oss-120b (4-bit, LoRA rank 1 on attention and every
-expert, 2048 tokens) on two A100 40GB
-([examples/gptoss](../examples/gptoss/README.md#gpt-oss-120b-on-two-a100-40gb)):
-`unsloth_balanced` put 28 / 28 GiB of weights on the two GPUs
-(`"balanced"`: 27 / 33 GB). With micro-batch 8 × accumulation 2 one
-epoch of 57 steps trained in 34.7 min (~36 s per step) at a peak of
-36.0 / 36.8 GB; `"balanced"` with 4 × 4 took 57.3 min (~60 s per step)
-for the same losses. GPU utilization stays at ~17–19% per GPU: Unsloth's
-4-bit gpt-oss experts loop over the experts in Python on one CPU core,
-and the split layers run one GPU at a time.
+[examples/gptoss](../examples/gptoss/README.md#gpt-oss-120b-on-two-a100-40gb)
+records a split run of gpt-oss-120b. GPU utilization stays low with
+that model: Unsloth's 4-bit gpt-oss experts loop over the experts in
+Python on one CPU core, and the split layers run one GPU at a time.
 
 **`PERL`, DDP.** `torchrun --nproc_per_node N my_rl.py` (or
 `accelerate launch --num_processes N`). Each rank loads the whole model
 on its GPU; with colocated vLLM each rank also runs its own vLLM engine,
-so `vllm_gpu_memory_utilization` applies per GPU. Validated on
-2× A100 40GB with `examples/rgym` (Qwen3 1.7B: 100 steps in 5.8 min,
-24.8 GB peak per GPU; [2-GPU run](../examples/rgym/README.md#two-gpus)).
+so `vllm_gpu_memory_utilization` applies per GPU.
+[examples/rgym](../examples/rgym/README.md#two-gpus) records a 2-GPU
+run.
 
 **vLLM.** 4-bit and 8-bit `PERL` runs generate without vLLM. For
 generation on separate GPUs, run TRL's vLLM server there
@@ -882,7 +1033,9 @@ A `datasets.Dataset` of preference pairs, in one of two layouts:
 
 Message lists are rendered with the tokenizer's chat template. Prompt +
 completion is truncated at the end to `max_length`; pairs whose
-completion is cut off entirely are dropped.
+completion is cut off entirely are dropped. `train` prints a warning
+right after tokenization with how many pairs are truncated or dropped
+and the longest.
 
 ### DPO config
 
@@ -893,7 +1046,7 @@ completion is cut off entirely are dropped.
 | `learning_rate` | 5e-6 | constant; ~10× the ~5e-7 of full-model DPO (alignment-handbook QLoRA DPO) |
 | `beta` | 0.1 | Higher keeps the policy closer to the reference |
 | `loss_type` | `["sigmoid"]` | Any TRL DPO loss name(s); several are summed with equal weights |
-| `max_length` | 1024 | Prompt + completion tokens |
+| `max_length` | 1024 | Prompt + completion tokens; longer pairs are truncated, with a warning. `None`: no truncation |
 | `per_device_train_batch_size` | 4 | Counted in **pairs**; each pair runs two sequences |
 | `gradient_accumulation_steps` | 4 | 16 pairs per optimizer step |
 | `num_train_epochs` / `max_steps` | 1 / -1 | |

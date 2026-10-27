@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -40,6 +41,8 @@ import torch
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from peft import PeftModel
     from transformers import BatchEncoding, PreTrainedTokenizerBase
 
@@ -54,12 +57,33 @@ DEFAULT_PROMPTS = (
 DEFAULT_LANGUAGE = "German"
 DEFAULT_MAX_NEW_TOKENS = 512
 MAX_SEQ_LENGTH = 2048
+# Most padded tokens per batch: rows times the longest prompt plus
+# max_new_tokens, the length the KV cache grows to.
+TOKEN_BUDGET = 16_384
 # One harmony message in generated text: its channel and its content, up
 # to the end-of-message token or the end of the (possibly cut) text.
 CHANNEL_PATTERN = re.compile(
     r"<\|channel\|>(\w+)<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|\Z)",
     re.DOTALL,
 )
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    """Generation options.
+
+    Attributes:
+        max_new_tokens: Generation budget per reply, reasoning included.
+        max_seq_length: Context length the model is loaded with, prompt
+            plus ``max_new_tokens``. A longer prompt is cut from the
+            start, with a warning (``truncate_prompts``).
+        token_budget: Most padded tokens per batch, rows times the
+            longest prompt plus ``max_new_tokens``.
+    """
+
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
+    max_seq_length: int = MAX_SEQ_LENGTH
+    token_budget: int = TOKEN_BUDGET
 
 
 def build_chats(
@@ -124,7 +148,7 @@ def read_base_model(adapter_dir: str) -> str:
 
 
 def load_adapter_model(
-    adapter_dir: str, device_map: str | None
+    adapter_dir: str, device_map: str | None, max_seq_length: int
 ) -> tuple[PeftModel, PreTrainedTokenizerBase]:
     """Load the 4-bit base with Unsloth and attach the adapter with peft.
 
@@ -133,6 +157,7 @@ def load_adapter_model(
         device_map: ``None`` for one GPU, or e.g. ``"unsloth_balanced"``
             to split a model that does not fit one GPU over all visible
             GPUs.
+        max_seq_length: Context length the model is loaded for.
 
     Returns:
         The adapted model in eval mode and the tokenizer saved with the
@@ -148,7 +173,7 @@ def load_adapter_model(
     options = {} if device_map is None else {"device_map": device_map}
     base, _ = FastLanguageModel.from_pretrained(
         model_name=read_base_model(adapter_dir),
-        max_seq_length=MAX_SEQ_LENGTH,
+        max_seq_length=max_seq_length,
         load_in_4bit=True,
         **options,
     )
@@ -159,31 +184,111 @@ def load_adapter_model(
     return model, tokenizer
 
 
-def generate(
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
+
+    Args:
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
+
+    Returns:
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def prompt_token_limit(settings: GenerationSettings) -> int:
+    """Return the most prompt tokens that leave room for the reply.
+
+    Args:
+        settings: Context length and reply length.
+
+    Returns:
+        ``max_seq_length`` minus ``max_new_tokens``.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = settings.max_seq_length - settings.max_new_tokens
+    if limit < 1:
+        msg = (
+            f"--max_new_tokens {settings.max_new_tokens} leaves no room "
+            f"for a prompt in --max_seq_length {settings.max_seq_length}; "
+            "lower --max_new_tokens or raise --max_seq_length."
+        )
+        raise ValueError(msg)
+    return limit
+
+
+def truncate_prompts(
+    prompts: list[list[int]], settings: GenerationSettings
+) -> list[list[int]]:
+    """Cut prompts to ``prompt_token_limit`` tokens, keeping their end.
+
+    Chat templates put the question and the assistant header at the end
+    of a prompt, so the start is what goes. A warning is printed when a
+    prompt is cut.
+
+    Args:
+        prompts: Token ids of each prompt, chat template applied.
+        settings: Context length and reply length.
+
+    Returns:
+        The prompts, each at most ``prompt_token_limit`` tokens long.
+    """
+    limit = prompt_token_limit(settings)
+    too_long = [len(prompt) for prompt in prompts if len(prompt) > limit]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(prompts)} prompts are "
+            f"longer than {limit} tokens (context {settings.max_seq_length} "
+            f"minus max_new_tokens {settings.max_new_tokens}; longest: "
+            f"{max(too_long)}). Their beginning is cut off, so the model "
+            "never sees it.\n"
+            "  Fix: raise --max_seq_length (more memory), lower "
+            "--max_new_tokens, or shorten those inputs."
+        )
+    return [prompt[-limit:] for prompt in prompts]
+
+
+def generate_batch(
     model: PeftModel,
     tokenizer: PreTrainedTokenizerBase,
-    chats: list[list[Message]],
+    prompts: list[list[int]],
     max_new_tokens: int,
 ) -> list[str]:
-    """Answer a batch of chats with greedy decoding.
+    """Answer tokenized prompts greedily in one left-padded batch.
 
     Args:
         model: The adapted model (adapter enabled or disabled).
         tokenizer: Its tokenizer, padding on the left.
-        chats: Conversations ending with a user turn.
+        prompts: Token ids of each prompt, chat template applied.
         max_new_tokens: Generation budget per reply, reasoning included.
 
     Returns:
-        The completions with harmony tokens, for ``parse_channels``.
+        The completions with harmony tokens, in the order of ``prompts``.
     """
-    encoded = tokenizer.apply_chat_template(
-        chats,
-        add_generation_prompt=True,
-        padding=True,
-        return_dict=True,
-        return_tensors="pt",
-    )
-    inputs = cast("BatchEncoding", encoded).to(model.device)
+    # The attention mask keeps the model from attending to the padding.
+    padded = tokenizer.pad({"input_ids": prompts}, return_tensors="pt")
+    inputs = padded.to(model.device)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -194,6 +299,51 @@ def generate(
     # Left padding: every prompt ends at the same position.
     completions = outputs[:, inputs["input_ids"].shape[1] :]
     return list(tokenizer.batch_decode(completions))
+
+
+def generate(
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizerBase,
+    chats: list[list[Message]],
+    settings: GenerationSettings,
+) -> list[str]:
+    """Answer chats with greedy decoding, in token-budget batches.
+
+    Chats of similar length share a batch of at most
+    ``settings.token_budget`` padded tokens, each row counting its prompt
+    plus ``max_new_tokens`` (the length its KV cache grows to).
+
+    Args:
+        model: The adapted model (adapter enabled or disabled), loaded
+            with ``settings.max_seq_length``.
+        tokenizer: Its tokenizer, padding on the left.
+        chats: Conversations ending with a user turn.
+        settings: Reply length, context length and batch token budget.
+
+    Returns:
+        The completions with harmony tokens, for ``parse_channels``, in
+        the order of ``chats``. A prompt longer than
+        ``prompt_token_limit`` loses its beginning (``truncate_prompts``).
+    """
+    encoded = tokenizer.apply_chat_template(
+        chats, add_generation_prompt=True, return_dict=True
+    )
+    prompts = truncate_prompts(
+        cast("list[list[int]]", cast("BatchEncoding", encoded)["input_ids"]),
+        settings,
+    )
+    lengths = [len(prompt) + settings.max_new_tokens for prompt in prompts]
+    completions = [""] * len(prompts)
+    for batch in length_batches(lengths, settings.token_budget):
+        batch_completions = generate_batch(
+            model,
+            tokenizer,
+            [prompts[index] for index in batch],
+            settings.max_new_tokens,
+        )
+        for index, completion in zip(batch, batch_completions, strict=True):
+            completions[index] = completion
+    return completions
 
 
 def print_reply(label: str, completion: str) -> None:
@@ -217,7 +367,8 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         Namespace with the adapter, device map, prompts, reasoning
-        language, system prompt and generation budget.
+        language, system prompt, generation budget, context length and
+        batch token budget.
     """
     parser = argparse.ArgumentParser(
         description="Chat with the GPT-OSS adapter without speftr."
@@ -247,6 +398,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS
     )
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=MAX_SEQ_LENGTH,
+        help="Context length: prompt plus --max_new_tokens tokens "
+        f"(default: {MAX_SEQ_LENGTH}). A longer prompt loses its "
+        "beginning, with a warning.",
+    )
+    parser.add_argument(
+        "--token_budget",
+        type=int,
+        default=TOKEN_BUDGET,
+        help="Most padded tokens per batch, rows times the longest prompt "
+        f"plus --max_new_tokens (default: {TOKEN_BUDGET}). A longer input "
+        "runs alone.",
+    )
     return parser.parse_args()
 
 
@@ -259,11 +426,16 @@ def main() -> None:
     args = parse_args()
     prompts: list[str] = args.prompt or list(DEFAULT_PROMPTS)
     chats = build_chats(prompts, args.reasoning_language, args.system_prompt)
-    model, tokenizer = load_adapter_model(args.adapter_dir, args.device_map)
+    settings = GenerationSettings(
+        args.max_new_tokens, args.max_seq_length, args.token_budget
+    )
+    model, tokenizer = load_adapter_model(
+        args.adapter_dir, args.device_map, settings.max_seq_length
+    )
 
-    adapter_replies = generate(model, tokenizer, chats, args.max_new_tokens)
+    adapter_replies = generate(model, tokenizer, chats, settings)
     with model.disable_adapter():
-        base_replies = generate(model, tokenizer, chats, args.max_new_tokens)
+        base_replies = generate(model, tokenizer, chats, settings)
 
     for prompt, adapter, base in zip(
         prompts, adapter_replies, base_replies, strict=True

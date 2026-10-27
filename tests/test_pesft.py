@@ -1,4 +1,8 @@
-"""CPU unit tests for ``speftr.pesft`` (config, parsing, serialization)."""
+"""CPU unit tests for ``speftr.pesft`` (config, parsing, serialization).
+
+Row lengths, token-budget batches and the training warnings are tested
+in ``test_pesft_lengths.py``.
+"""
 
 from __future__ import annotations
 
@@ -534,7 +538,7 @@ def test_collect_train_metrics_merges_trl_eval_and_gpu(monkeypatch):
         global_step=20,
         metrics={"train_runtime": 12.5, "train_samples_per_second": 25.6},
     )
-    metrics = _collect_train_metrics(train_output, {"eval_loss": 0.5})  # type: ignore[arg-type]
+    metrics = _collect_train_metrics(train_output, {"eval_loss": 0.5})
     assert metrics == {
         "train_runtime": 12.5,
         "train_samples_per_second": 25.6,
@@ -551,7 +555,7 @@ def test_collect_train_metrics_without_gpu_or_evaluation(monkeypatch):
     train_output = types.SimpleNamespace(
         global_step=3, metrics={"train_runtime": 1.0}
     )
-    metrics = _collect_train_metrics(train_output, None)  # type: ignore[arg-type]
+    metrics = _collect_train_metrics(train_output, None)
     assert metrics == {"train_runtime": 1.0, "global_step": 3}
 
 
@@ -616,7 +620,7 @@ def test_collect_train_metrics_includes_step_times(monkeypatch):
     _fake_cuda(monkeypatch, available=False)
     train_output = types.SimpleNamespace(global_step=7, metrics={})
     metrics = _collect_train_metrics(
-        train_output,  # type: ignore[arg-type]
+        train_output,
         None,
         [10.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0],
     )

@@ -245,6 +245,14 @@ They run the same adapter and merged routes as the other examples
 on several GPUs add `tensor_parallel_size` to the `LLM(...)` call in
 `generate_vllm`.
 
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
+
 ## Adapt it to your data or model
 
 1. **Data**: change `load_datasets` and `build_conversation`, as in the

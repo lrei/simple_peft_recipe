@@ -22,7 +22,7 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 # unsloth must be imported before datasets/transformers so its patches
 # apply.
@@ -41,9 +41,14 @@ from unsloth.chat_templates import get_chat_template
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from collections.abc import Set as AbstractSet
 
-    from transformers import GenerationMixin, PreTrainedTokenizerBase
+    from transformers import (
+        BatchEncoding,
+        GenerationMixin,
+        PreTrainedTokenizerBase,
+    )
 
 print(unsloth.__version__)
 
@@ -64,6 +69,9 @@ INSTRUCTION = "Classify this prompt's as harmful or unharmful:"
 CHAT_TEMPLATE = "gemma-3"
 MAX_INVALID_EXAMPLES_TO_SHOW = 5
 BINARY_CLASSIFICATION_LABELS = 2
+MAX_SEQ_LENGTH = 2048
+# Padded tokens (prompt plus max_new_tokens per row) per generation batch.
+TOKEN_BUDGET = 16_384
 
 
 @dataclass
@@ -87,12 +95,18 @@ class EvaluationConfig:
     """Configuration for evaluation process.
 
     Attributes:
-        batch_size: Number of examples generated per batch.
+        token_budget: Padded tokens (prompt plus ``max_new_tokens`` per
+            example) per generation batch; examples of similar length are
+            batched together and a longer example runs alone.
+        max_seq_length: Longest prompt plus answer the model was loaded
+            for; a longer prompt loses its beginning, with a warning
+            (``truncate_prompts``).
         gen_config: Generation settings; ``None`` uses
             ``GenerationConfig()`` defaults.
     """
 
-    batch_size: int = 64
+    token_budget: int = TOKEN_BUDGET
+    max_seq_length: int = MAX_SEQ_LENGTH
     gen_config: GenerationConfig | None = None
 
 
@@ -179,17 +193,25 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--batch_size",
+        "--token_budget",
         type=int,
-        default=64,
-        help="Batch size for evaluation (default: 64)",
+        default=TOKEN_BUDGET,
+        help=(
+            "Padded tokens (prompt plus --max_new_tokens per example) per "
+            "generation batch; a longer example runs alone "
+            f"(default: {TOKEN_BUDGET})"
+        ),
     )
 
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=2048,
-        help="Maximum sequence length in tokens (default: 2048)",
+        default=MAX_SEQ_LENGTH,
+        help=(
+            "Longest prompt plus answer the model is loaded for; a longer "
+            "prompt loses its beginning, with a warning "
+            f"(default: {MAX_SEQ_LENGTH})"
+        ),
     )
 
     return parser.parse_args()
@@ -216,110 +238,206 @@ def _load_eval_dataset(max_samples: int) -> Dataset:
     return dataset
 
 
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
+
+    Args:
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
+
+    Returns:
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def truncate_prompts(
+    prompts: list[list[int]], max_seq_length: int, max_new_tokens: int
+) -> tuple[list[list[int]], int]:
+    """Cut prompts so that each fits ``max_seq_length`` with its reply.
+
+    Chat templates put the question and the assistant header at the end
+    of a prompt, so the start is what goes. A warning is printed when a
+    prompt is cut.
+
+    Args:
+        prompts: Token ids of each prompt, chat template applied.
+        max_seq_length: The limit passed to ``from_pretrained``.
+        max_new_tokens: Tokens each reply may add.
+
+    Returns:
+        The prompts, each at most ``max_seq_length - max_new_tokens``
+        tokens long (the last ones kept), and how many were cut.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = max_seq_length - max_new_tokens
+    if limit < 1:
+        message = (
+            f"--max_new_tokens {max_new_tokens} leaves no room for a "
+            f"prompt in --max_seq_length {max_seq_length}; lower "
+            "--max_new_tokens or raise --max_seq_length."
+        )
+        raise ValueError(message)
+    too_long = [len(prompt) for prompt in prompts if len(prompt) > limit]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(prompts)} prompts are "
+            f"longer than {limit} tokens (context {max_seq_length} minus "
+            f"max_new_tokens {max_new_tokens}; longest: {max(too_long)}). "
+            "Their beginning is cut off, so the model never sees it.\n"
+            "  Fix: raise --max_seq_length (more memory), lower "
+            "--max_new_tokens, or shorten those inputs."
+        )
+    return [prompt[-limit:] for prompt in prompts], len(too_long)
+
+
+def _encode_prompts(
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: Sequence[str],
+    instruction: str,
+) -> list[list[int]]:
+    """Render and tokenize the user turns, without padding.
+
+    Args:
+        tokenizer: Tokenizer with the guard chat template applied.
+        prompts: Prompts to classify.
+        instruction: Text put before each prompt in the user turn; empty
+            sends the prompt alone.
+
+    Returns:
+        The token ids of each chat, ending with the assistant header.
+    """
+    instruction = instruction.strip()
+    chats = []
+    for prompt in prompts:
+        text = prompt.strip()
+        content = f"{instruction}\n\n{text}" if instruction else text
+        chats.append([{"role": "user", "content": content}])
+    encoded = tokenizer.apply_chat_template(
+        chats, add_generation_prompt=True, return_dict=True
+    )
+    input_ids = cast("BatchEncoding", encoded)["input_ids"]
+    return cast("list[list[int]]", input_ids)
+
+
+def _generate_batch(
+    model: GenerationMixin,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: Sequence[list[int]],
+    gen_config: GenerationConfig,
+) -> list[str]:
+    """Greedily generate one answer per prompt, as a single batch.
+
+    Args:
+        model: Causal LM used for greedy generation.
+        tokenizer: Its tokenizer.
+        prompts: Token ids from ``_encode_prompts``.
+        gen_config: Generation settings.
+
+    Returns:
+        The decoded, stripped answers without the prompt or special
+        tokens.
+    """
+    # Left padding with the attention mask, so every prompt ends where
+    # generation starts and the padding is not attended to.
+    padded = tokenizer.pad(
+        {"input_ids": list(prompts)},
+        padding=True,
+        padding_side="left",
+        return_tensors="pt",
+    )
+    inputs = padded.to(model.device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=gen_config.max_new_tokens,
+        temperature=gen_config.temperature,
+        do_sample=False,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    answers = outputs[:, inputs["input_ids"].shape[1] :]
+    texts = tokenizer.batch_decode(answers, skip_special_tokens=True)
+    return [text.strip() for text in texts]
+
+
 def _generate_predictions(
     model: GenerationMixin,
     tokenizer: PreTrainedTokenizerBase,
     eval_dataset: Dataset,
     valid_labels: set[str],
     eval_config: EvaluationConfig,
-) -> tuple[list[str], list[str], list[str], int]:
-    """Generate predictions for all examples in dataset using batching.
+) -> tuple[list[str], list[str], list[str], int, int]:
+    """Generate predictions for all examples, batched by token budget.
+
+    A prompt longer than ``max_seq_length`` minus ``max_new_tokens``
+    loses its beginning (``truncate_prompts``).
 
     Args:
         model: Causal LM used for greedy generation.
         tokenizer: Tokenizer with the guard chat template applied.
         eval_dataset: Examples with prompt and harm label columns.
         valid_labels: Labels a generated answer is matched against.
-        eval_config: Batch size and generation settings.
+        eval_config: Token budget, length limit and generation settings.
 
     Returns:
         True labels, predicted labels (``"INVALID_PREDICTION"`` when no
-        valid label matches), raw generated texts, and the number of
-        invalid predictions.
+        valid label matches), raw generated texts, all in dataset order,
+        the number of invalid predictions and the number of cut prompts.
     """
     gen_config = eval_config.gen_config or GenerationConfig()
-    batch_size = eval_config.batch_size
+    prompts, truncated = truncate_prompts(
+        _encode_prompts(
+            tokenizer, eval_dataset[PROMPT_COL], gen_config.instruction
+        ),
+        eval_config.max_seq_length,
+        gen_config.max_new_tokens,
+    )
+    lengths = [len(prompt) + gen_config.max_new_tokens for prompt in prompts]
+    batches = length_batches(lengths, eval_config.token_budget)
 
-    total_examples = len(eval_dataset)
-    num_batches = (total_examples + batch_size - 1) // batch_size
-
-    y_true: list[str] = []
-    y_pred: list[str] = []
-    y_pred_raw: list[str] = []
-    invalid_predictions = 0
-
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, total_examples)
-        batch_examples = eval_dataset.select(range(start_idx, end_idx))
-
+    y_pred_raw = [""] * len(prompts)
+    for number, batch in enumerate(batches, 1):
         print(
-            f"Processing batch {batch_idx + 1}/{num_batches} "
-            f"(examples {start_idx + 1}-{end_idx})..."
+            f"Processing batch {number}/{len(batches)} "
+            f"({len(batch)} examples)..."
         )
-
-        batch_true_labels: list[str] = []
-        batch_messages: list[list[dict[str, str]]] = []
-
-        instruction = gen_config.instruction.strip()
-
-        for example in batch_examples:
-            true_label = example[LABEL_COL]
-            batch_true_labels.append(true_label)
-
-            prompt_text = example[PROMPT_COL].strip()
-            combined = (
-                f"{instruction}\n\n{prompt_text}"
-                if instruction
-                else prompt_text
-            )
-            batch_messages.append(
-                [
-                    {
-                        "role": "user",
-                        "content": combined,
-                    }
-                ]
-            )
-
-        batch_inputs = tokenizer.apply_chat_template(
-            batch_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding=True,
+        answers = _generate_batch(
+            model, tokenizer, [prompts[index] for index in batch], gen_config
         )
+        for index, answer in zip(batch, answers, strict=True):
+            y_pred_raw[index] = answer
 
-        batch_inputs = {k: v.to(model.device) for k, v in batch_inputs.items()}
-
-        outputs = model.generate(
-            **batch_inputs,
-            max_new_tokens=gen_config.max_new_tokens,
-            temperature=gen_config.temperature,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-        input_lengths = batch_inputs["attention_mask"].sum(dim=1)
-
-        for output, input_length in zip(outputs, input_lengths, strict=False):
-            pred_text = tokenizer.decode(
-                output[input_length:],
-                skip_special_tokens=True,
-            ).strip()
-            y_pred_raw.append(pred_text)
-
-            matched_label, _ = extract_label(pred_text, valid_labels)
-            if matched_label is None:
-                invalid_predictions += 1
-                matched_label = "INVALID_PREDICTION"
-
-            y_pred.append(matched_label)
-
-        y_true.extend(batch_true_labels)
-
-    return y_true, y_pred, y_pred_raw, invalid_predictions
+    y_pred: list[str] = []
+    for pred_text in y_pred_raw:
+        matched_label, _ = extract_label(pred_text, valid_labels)
+        y_pred.append(matched_label or "INVALID_PREDICTION")
+    invalid_predictions = y_pred.count("INVALID_PREDICTION")
+    return (
+        list(eval_dataset[LABEL_COL]),
+        y_pred,
+        y_pred_raw,
+        invalid_predictions,
+        truncated,
+    )
 
 
 def extract_label(
@@ -412,7 +530,7 @@ def main() -> None:
     """Evaluate a guard_train.py model on WildGuardMix and print metrics.
 
     Returns:
-        None. Metrics are printed to stdout.
+        None. Metrics and the number of cut prompts are printed to stdout.
     """
     args = parse_args()
 
@@ -441,7 +559,8 @@ def main() -> None:
     print(f"Labels: {sorted(valid_labels)}")
 
     eval_config = EvaluationConfig(
-        batch_size=args.batch_size,
+        token_budget=args.token_budget,
+        max_seq_length=args.max_seq_length,
         gen_config=GenerationConfig(
             instruction=instruction,
             max_new_tokens=args.max_new_tokens,
@@ -449,12 +568,14 @@ def main() -> None:
         ),
     )
 
-    y_true, y_pred, y_pred_raw, invalid_predictions = _generate_predictions(
-        model,
-        tokenizer,
-        eval_dataset,
-        valid_labels,
-        eval_config,
+    y_true, y_pred, y_pred_raw, invalid_predictions, truncated = (
+        _generate_predictions(
+            model,
+            tokenizer,
+            eval_dataset,
+            valid_labels,
+            eval_config,
+        )
     )
 
     print(
@@ -482,6 +603,8 @@ def main() -> None:
             print(f"{metric_name}: {value:.4f}")
         else:
             print(f"{metric_name}: {value}")
+    # Scores of cut prompts are not comparable with uncut ones.
+    print(f"truncated_prompts: {truncated}")
     print(f"\n{metrics['classification_report']}")
 
 

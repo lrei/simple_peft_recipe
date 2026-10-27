@@ -17,7 +17,7 @@ import pytest
 import trl
 from datasets import Dataset
 
-from speftr.pedpo import PEDPO, PEDPOConfig, _device_map
+from speftr.pedpo import PEDPO, PEDPOConfig, _device_map, _warn_long_pairs
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,23 +70,30 @@ def _dpo_config(tmp_path, **overrides):
 # --- Config and CLI --------------------------------------------------------
 
 
+def _fields(obj: object, expected: dict[str, object]) -> dict[str, object]:
+    """Return the attributes of ``obj`` named in ``expected``."""
+    return {name: getattr(obj, name) for name in expected}
+
+
 def test_recipe_defaults():
-    config = PEDPOConfig()
-    assert config.lora_r == 1
-    assert config.lora_alpha == 32
-    assert config.lora_dropout == 0.0
-    assert config.learning_rate == 5e-6
-    assert config.scheduler == "constant"
-    assert config.beta == 0.1
-    assert config.loss_type == ["sigmoid"]
-    assert config.max_length == 1024
-    assert config.per_device_train_batch_size == 4
-    assert config.gradient_accumulation_steps == 4
-    assert config.num_train_epochs == 1
-    assert config.precompute_ref_log_probs is False
-    assert config.optim == "adamw_8bit"
-    assert config.use_liger_kernel is False
-    assert config.report_to == "none"
+    expected = {
+        "lora_r": 1,
+        "lora_alpha": 32,
+        "lora_dropout": 0.0,
+        "learning_rate": 5e-6,
+        "scheduler": "constant",
+        "beta": 0.1,
+        "loss_type": ["sigmoid"],
+        "max_length": 1024,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 4,
+        "num_train_epochs": 1,
+        "precompute_ref_log_probs": False,
+        "optim": "adamw_8bit",
+        "use_liger_kernel": False,
+        "report_to": "none",
+    }
+    assert _fields(PEDPOConfig(), expected) == expected
 
 
 def test_parser_defaults_match_dataclass():
@@ -173,33 +180,38 @@ def test_dpo_config_forwards_fields(cpu_dpo_config, tmp_path):
         random_state=11,
     )
     assert isinstance(args, cpu_dpo_config)
-    assert args.output_dir == str(tmp_path)
-    assert args.beta == 0.2
-    assert args.loss_type == ["sigmoid", "sft"]
-    assert args.learning_rate == 1e-5
-    assert args.max_length == 512
-    assert args.precompute_ref_log_probs is True
-    assert args.precompute_ref_batch_size == 16
-    assert args.gradient_checkpointing is False
-    assert args.optim == "adamw_torch"
-    assert args.max_steps == 7
-    assert args.save_steps == 5
-    assert args.seed == 11
+    expected = {
+        "output_dir": str(tmp_path),
+        "beta": 0.2,
+        "loss_type": ["sigmoid", "sft"],
+        "learning_rate": 1e-5,
+        "max_length": 512,
+        "precompute_ref_log_probs": True,
+        "precompute_ref_batch_size": 16,
+        "gradient_checkpointing": False,
+        "optim": "adamw_torch",
+        "max_steps": 7,
+        "save_steps": 5,
+        "seed": 11,
+    }
+    assert _fields(args, expected) == expected
 
 
 def test_dpo_config_defaults(cpu_dpo_config, tmp_path):
-    args = _dpo_config(tmp_path)
-    assert args.beta == 0.1
-    assert args.loss_type == ["sigmoid"]
-    assert args.learning_rate == 5e-6
-    assert args.lr_scheduler_type == "constant"
-    assert args.max_length == 1024
-    assert args.precompute_ref_log_probs is False
-    assert args.gradient_checkpointing is True
-    assert args.optim == "adamw_8bit"
-    assert args.use_liger_kernel is False
-    assert args.per_device_train_batch_size == 4
-    assert args.gradient_accumulation_steps == 4
+    expected = {
+        "beta": 0.1,
+        "loss_type": ["sigmoid"],
+        "learning_rate": 5e-6,
+        "lr_scheduler_type": "constant",
+        "max_length": 1024,
+        "precompute_ref_log_probs": False,
+        "gradient_checkpointing": True,
+        "optim": "adamw_8bit",
+        "use_liger_kernel": False,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 4,
+    }
+    assert _fields(_dpo_config(tmp_path), expected) == expected
 
 
 # --- PEDPO without training ------------------------------------------------
@@ -269,23 +281,30 @@ def _allow_cpu_dpo_config() -> None:
     trl.DPOConfig = build
 
 
+def _check_training_logs(dpo_trainer: trl.DPOTrainer | None) -> None:
+    """Check the prompt split and the logged train and eval losses."""
+    assert dpo_trainer is not None
+    # Full conversations: TRL split off the shared prompt.
+    assert "prompt" in dpo_trainer.train_dataset.column_names
+    history = dpo_trainer.state.log_history
+    losses = [float(log["loss"]) for log in history if "loss" in log]
+    assert losses
+    assert all(math.isfinite(loss) for loss in losses)
+    assert any("eval_loss" in log for log in history)
+
+
 def _train_and_check_adapter(output_dir: str) -> None:
-    """Train one step, check the prompt split and the saved adapter."""
+    """Train one step, check the logs and the saved adapter."""
     _allow_cpu_dpo_config()
     path = Path(output_dir)
     rows = _fixture_rows()
     trainer = _tiny_trainer(path)
     trainer.train(rows, eval_dataset=rows.select(range(2)))
-
-    # Full conversations: TRL split off the shared prompt.
-    assert "prompt" in trainer.trainer.train_dataset.column_names
-    history = trainer.trainer.state.log_history
-    losses = [float(log["loss"]) for log in history if "loss" in log]
-    assert losses
-    assert all(math.isfinite(loss) for loss in losses)
-    assert any("eval_loss" in log for log in history)
+    _check_training_logs(trainer.trainer)
+    model = trainer.model
+    assert model is not None
     # The reference is a frozen copy of the adapter; only one is saved.
-    assert set(trainer.model.peft_config) == {"default", "ref"}
+    assert set(model.peft_config) == {"default", "ref"}
     trainer.save_model()
     assert (path / "adapter_model.safetensors").is_file()
     assert (path / "tokenizer_config.json").is_file()
@@ -307,12 +326,48 @@ def _train_and_check_merged(output_dir: str) -> None:
     assert not any("lora" in name for name, _ in reloaded.named_parameters())
 
 
-def _run_in_fresh_interpreter(function: str, output_dir: Path) -> None:
+def _train_long_pairs(output_dir: str) -> None:
+    """Train one step with max_length=128, below two of the six pairs.
+
+    With the tiny model's Qwen chat template the six full conversations
+    are 54/59, 163/59, 137/179, 100/111, 77/66 and 94/92 tokens
+    (chosen/rejected), so 2 pairs exceed 128 and the longest is 179;
+    every prompt is shorter than 128, so TRL drops none.
+    """
+    _allow_cpu_dpo_config()
+    rows = _fixture_rows()
+    _tiny_trainer(Path(output_dir)).train(rows, rows.select(range(2)))
+
+
+def _train_out_of_memory(output_dir: str) -> None:
+    """Run ``PEDPO.train`` with a ``DPOTrainer.train`` that runs out of memory.
+
+    Exits with status 0 only when the same ``torch.OutOfMemoryError``
+    comes back out of ``PEDPO.train``.
+    """
+    import torch
+
+    _allow_cpu_dpo_config()
+    error = torch.OutOfMemoryError("CUDA out of memory.")
+
+    def out_of_memory(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    trl.DPOTrainer.train = out_of_memory
+    with pytest.raises(torch.OutOfMemoryError) as raised:
+        _tiny_trainer(Path(output_dir)).train(_fixture_rows())
+    assert raised.value is error
+
+
+def _run_in_fresh_interpreter(function: str, output_dir: Path) -> str:
     """Run ``function(output_dir)`` in a new Python process.
 
     Importing Unsloth (other test modules do) patches TRL's trainers for
     the whole process; PEDPO runs without Unsloth, so its training tests
     run in a clean interpreter, as PEDPO does in real use.
+
+    Returns:
+        What the process printed to stdout.
     """
     code = (
         f"from tests.test_pedpo import {function}; "
@@ -328,6 +383,7 @@ def _run_in_fresh_interpreter(function: str, output_dir: Path) -> None:
     assert result.returncode == 0, (
         result.stdout[-4000:] + result.stderr[-4000:]
     )
+    return result.stdout
 
 
 def test_train_extracts_prompt_and_saves_only_trained_adapter(tmp_path):
@@ -336,3 +392,58 @@ def test_train_extracts_prompt_and_saves_only_trained_adapter(tmp_path):
 
 def test_save_merged_drops_all_adapters(tmp_path):
     _run_in_fresh_interpreter("_train_and_check_merged", tmp_path)
+
+
+def test_pairs_longer_than_max_length_warn_and_train(tmp_path):
+    output = _run_in_fresh_interpreter("_train_long_pairs", tmp_path)
+
+    assert (
+        "WARNING: 2 of 6 train pairs are longer than max_length=128 tokens."
+    ) in output
+    assert (
+        "2 pairs (longest: 179 tokens) are truncated to 128 tokens"
+    ) in output
+    assert (
+        "WARNING: 1 of 2 eval pairs are longer than max_length=128 tokens."
+    ) in output
+    assert "never sees their end" in output
+    assert "Fix: raise max_length" in output
+    assert "filter or shorten those pairs" in output
+    assert "left out of training" not in output
+
+
+def test_training_oom_prints_guidance_and_reraises(tmp_path):
+    output = _run_in_fresh_interpreter("_train_out_of_memory", tmp_path)
+
+    assert "DPO training ran out of GPU memory." in output
+    assert "Longest training pair: 179 tokens" in output
+    assert "per_device_train_batch_size: 2 pairs" in output
+    assert "gradient_accumulation_steps: 1" in output
+    assert "max_length: 128" in output
+    fixes = [
+        "1. Lower per_device_train_batch_size",
+        "2. Keep gradient checkpointing on",
+        "3. Lower max_length",
+        "4. Load the model in 4-bit (load_in_4bit=True)",
+        "5. Use a GPU with more memory",
+    ]
+    positions = [output.index(fix) for fix in fixes]
+    assert positions == sorted(positions)
+
+
+def test_pairs_dropped_by_trl_are_counted_in_the_warning(capsys):
+    # Boundary lengths: TRL already dropped 3 pairs whose prompt filled
+    # max_length; of the 2 kept, one is longer than max_length.
+    assert _warn_long_pairs([50, 200], 128, "train", dropped=3) == 1
+
+    output = capsys.readouterr().out
+    assert "WARNING: 4 of 5 train pairs are longer than max_length=128" in (
+        output
+    )
+    assert "1 pairs (longest: 200 tokens) are truncated" in output
+    assert "3 pairs are left out of training because their prompt" in output
+
+
+def test_pairs_within_max_length_do_not_warn(capsys):
+    assert _warn_long_pairs([50, 128], 128, "eval", dropped=0) == 0
+    assert capsys.readouterr().out == ""

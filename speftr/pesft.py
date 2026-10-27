@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import time
@@ -52,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
+from torch.utils.data import Sampler
 
 from speftr.chat_markers import ChatMarkers, infer_chat_markers
 
@@ -95,9 +97,21 @@ class PESFTConfig:
     With ``train_on_responses`` set, the markers must match the model's
     chat template.
 
+    Long rows (tens of thousands of tokens): set ``max_seq_length`` to at
+    least the longest row, since longer rows are truncated; keep
+    ``use_gradient_checkpointing="unsloth"`` (activations offloaded to
+    CPU) and ``per_device_eval_batch_size=1``; train with
+    ``per_device_train_batch_size=1`` plus ``gradient_accumulation_steps``
+    for the effective batch, or set ``max_batch_tokens`` so short rows
+    still share a batch while long rows run alone.
+
     Attributes:
         model_name_or_path: HuggingFace model name or local path
-        max_seq_length: Maximum sequence length in tokens
+        max_seq_length: Maximum sequence length in tokens. Longer rows
+            are truncated to it (with ``packing`` too: its default "bfd"
+            strategy cuts a row rather than splitting it), so training
+            never sees their end; ``train`` prints a warning with how
+            many rows that affects.
         load_in_4bit: Use 4-bit quantization (QLoRA)
         load_in_8bit: Load the base model in 8-bit (bitsandbytes
             LLM.int8). Slower than 4-bit and 16-bit; cannot be combined
@@ -117,9 +131,10 @@ class PESFTConfig:
         attn_implementation: Attention backend passed to the model loader:
             ``"sdpa"``, ``"flex_attention"``, ``"eager"`` or
             ``"flash_attention_2"`` (needs the ``flash-attn`` package).
-            ``"sdpa"`` is fastest on a 3090; Unsloth's own default (flex
+            ``"sdpa"`` needs no extra package and handles every sequence
+            length with the same kernels; Unsloth's own default (flex
             attention) recompiles its block masks for every new sequence
-            length there.
+            length.
         chat_template: Unsloth chat template name, or None to keep the
             tokenizer's own template (needed for models Unsloth has no
             named template for)
@@ -165,8 +180,39 @@ class PESFTConfig:
         report_to: Experiment tracking backend
         packing: Pack multiple short examples into one sequence
         padding_free: Concatenate each batch into one unpadded sequence.
-            Off by default: without FlashAttention (e.g. a 3090 with SDPA)
-            it is several times slower than padded batches.
+            Off by default: without FlashAttention the joined sequence can
+            get a full attention mask whose memory grows with the square
+            of its length, so it can be slower and use more memory than
+            padded batches; ``train`` warns when it (or ``packing``) is on
+            without FlashAttention. Unsloth turns it off for hybrid
+            linear-attention models (Qwen 3.5) unless its experimental
+            hybrid packing (``UNSLOTH_EXPERIMENTAL_HYBRID_PACKING=1``) can
+            run with the ``causal-conv1d`` and ``flash-linear-attention``
+            kernels; ``train`` prints when that happens.
+        max_batch_tokens: Token budget per training and evaluation batch;
+            None (the default) keeps fixed-size, length-grouped batches.
+            When set, rows are sorted by length and grouped so that a
+            batch holds at most ``per_device_train_batch_size`` rows
+            (evaluation: ``per_device_eval_batch_size``) and at most this
+            many tokens: rows times the longest row for padded batches,
+            the sum of the rows with padding-free batches. A row longer
+            than the budget gets a batch of its own. Batches keep their
+            rows across epochs; their order is shuffled every epoch with
+            the trainer seed (evaluation keeps length order). An
+            optimizer step then holds a varying number of rows; the loss
+            is still averaged over all trained tokens of the step. TRL's
+            ``train_samples_per_second`` assumes full batches, and
+            ``eval_loss`` averages per batch, so keep
+            ``per_device_eval_batch_size=1`` for a per-row mean. Under
+            DDP each GPU gets whole batches in turn and the first batches
+            are repeated so every GPU runs the same number. ``train``
+            prints the batches and optimizer steps per epoch; step-based
+            settings (``max_steps``, ``warmup_steps``, ``eval_steps``,
+            ``save_steps``) then cover a different amount of data than
+            with fixed batches. Unset, ``train`` suggests a value when
+            the longest row is far longer than the median. Not with
+            ``packing``, which already fills every row to
+            ``max_seq_length``.
         router_aux_loss_coef: Weight of the Mixture-of-Experts router
             load-balancing loss; no effect on dense models. 0 disables it
             and stops the model from returning router logits. The router
@@ -240,6 +286,7 @@ class PESFTConfig:
     report_to: str = "none"
     packing: bool = False
     padding_free: bool = False
+    max_batch_tokens: int | None = None
     router_aux_loss_coef: float = 0.0
     eval_in_train_mode: list[str] = field(default_factory=list)
 
@@ -256,7 +303,9 @@ class PESFTConfig:
 
         Raises:
             ValueError: If ``load_in_4bit`` and ``load_in_8bit`` are both
-                set.
+                set, ``full_finetuning`` is combined with either, or
+                ``max_batch_tokens`` is not positive or combined with
+                ``packing``.
         """
         if self.load_in_4bit and self.load_in_8bit:
             msg = "load_in_4bit and load_in_8bit are mutually exclusive"
@@ -264,6 +313,18 @@ class PESFTConfig:
         if self.full_finetuning and (self.load_in_4bit or self.load_in_8bit):
             msg = (
                 "full_finetuning trains bf16 weights; not with 4-bit or 8-bit"
+            )
+            raise ValueError(msg)
+        if self.max_batch_tokens is None:
+            return
+        if self.max_batch_tokens < 1:
+            msg = f"max_batch_tokens must be positive: {self.max_batch_tokens}"
+            raise ValueError(msg)
+        if self.packing:
+            msg = (
+                "max_batch_tokens does not apply with packing, which already "
+                "fills every row to max_seq_length; size packed batches with "
+                "per_device_train_batch_size"
             )
             raise ValueError(msg)
 
@@ -344,7 +405,10 @@ class PESFTConfig:
             "--max_seq_length",
             type=int,
             default=2048,
-            help="Maximum sequence length in tokens (default: 2048)",
+            help=(
+                "Maximum sequence length in tokens; longer rows are "
+                "truncated, with a warning (default: 2048)"
+            ),
         )
         model_group.add_argument(
             "--load_in_4bit",
@@ -548,6 +612,17 @@ class PESFTConfig:
             help=(
                 "Concatenate each batch into one unpadded sequence "
                 "(default: padded batches; see PESFTConfig.padding_free)"
+            ),
+        )
+        train_group.add_argument(
+            "--max_batch_tokens",
+            type=int,
+            default=None,
+            help=(
+                "Token budget per batch: length-sorted rows up to the batch "
+                "size and this many tokens (padded: rows x longest row; "
+                "padding-free: sum); not with --packing (default: fixed "
+                "batches; see PESFTConfig.max_batch_tokens)"
             ),
         )
         model_group.add_argument(
@@ -831,6 +906,552 @@ def _resolve_chat_markers(
     return infer_chat_markers(tokenizer)
 
 
+def _adds_special_tokens(
+    tokenizer: PreTrainedTokenizerBase, first_text: str
+) -> bool:
+    """Tell whether Unsloth tokenizes the texts with special tokens.
+
+    Unsloth's dataset preparation leaves them out when the first text or
+    the chat template already holds the BOS token, so rows do not start
+    with two.
+
+    Args:
+        tokenizer: The text tokenizer handed to the trainer.
+        first_text: The first formatted training text.
+
+    Returns:
+        True when the tokenizer's own special tokens are added.
+    """
+    bos_token = str(tokenizer.bos_token or "")
+    chat_template = str(tokenizer.chat_template or "")
+    has_bos = bool(bos_token) and (
+        first_text.startswith(bos_token) or bos_token in chat_template
+    )
+    return not has_bos
+
+
+def _token_counts(
+    dataset: Dataset,
+    formatting_func: Callable[[Mapping[str, object]], list[str]],
+    tokenizer: PreTrainedTokenizerBase,
+) -> list[int]:
+    """Count the tokens of every row, untruncated, as training sees them.
+
+    Formats batches of rows with ``formatting_func`` and tokenizes them
+    the way Unsloth's dataset preparation does, without its truncation.
+
+    Args:
+        dataset: Raw rows, as passed to ``PESFT.train``.
+        formatting_func: The batched formatting function.
+        tokenizer: The text tokenizer handed to the trainer.
+
+    Returns:
+        The token count of each row, in dataset order.
+    """
+    counts: list[int] = []
+    add_special_tokens: bool | None = None
+    for batch in dataset.iter(batch_size=64):
+        texts = formatting_func(batch)
+        if add_special_tokens is None:
+            add_special_tokens = _adds_special_tokens(tokenizer, texts[0])
+        encoded = tokenizer(texts, add_special_tokens=add_special_tokens)
+        counts.extend(len(ids) for ids in encoded["input_ids"])
+    return counts
+
+
+def _warn_long_rows(counts: list[int], max_seq_length: int, split: str) -> int:
+    """Warn when rows are longer than ``max_seq_length``.
+
+    Unsloth and TRL truncate such rows to ``max_seq_length`` tokens, so
+    the model never trains on their end.
+
+    Args:
+        counts: Token count of each row (``_token_counts``).
+        max_seq_length: The longest row kept whole.
+        split: Name of the dataset in the message (``"train"``,
+            ``"eval"``).
+
+    Returns:
+        The number of rows longer than ``max_seq_length``; a warning is
+        printed when it is not 0.
+    """
+    too_long = [count for count in counts if count > max_seq_length]
+    if not too_long:
+        return 0
+    print(
+        f"\nWARNING: {len(too_long)} of {len(counts)} {split} rows are "
+        f"longer than max_seq_length={max_seq_length} tokens (longest: "
+        f"{max(too_long)}).\n"
+        f"  They are truncated to {max_seq_length} tokens, so the model "
+        "never sees their end.\n"
+        f"  Fix: raise max_seq_length to at least {max(too_long)} (needs "
+        "more GPU memory), or filter or shorten those rows in the "
+        "dataset.\n"
+    )
+    return len(too_long)
+
+
+def _length_metrics(
+    datasets: Mapping[str, Dataset | None],
+    formatting_func: Callable[[Mapping[str, object]], list[str]],
+    tokenizer: PreTrainedTokenizerBase,
+    max_seq_length: int,
+) -> tuple[dict[str, int], dict[str, list[int]]]:
+    """Measure the rows and warn about those above ``max_seq_length``.
+
+    Tokenizes every row once more, untruncated, before the trainer
+    prepares (and truncates) the datasets.
+
+    Args:
+        datasets: Raw rows by name (``"train"``, ``"eval"``); None
+            entries are skipped.
+        formatting_func: The batched formatting function.
+        tokenizer: The text tokenizer handed to the trainer.
+        max_seq_length: The longest row the trainer keeps whole.
+
+    Returns:
+        The metrics and the token counts. Metrics, per dataset name, e.g.
+        ``train``: the longest row in tokens (``longest_train_row``) and
+        the number of rows the trainer truncates
+        (``truncated_train_rows``). Counts: each row's untruncated token
+        count by dataset name, in dataset order.
+    """
+    print(f"\nChecking row lengths (max_seq_length={max_seq_length})...")
+    metrics: dict[str, int] = {}
+    counts_by_name: dict[str, list[int]] = {}
+    for name, dataset in datasets.items():
+        if dataset is None:
+            continue
+        counts = _token_counts(dataset, formatting_func, tokenizer)
+        print(f"  {name}: longest row {max(counts)} tokens")
+        metrics[f"longest_{name}_row"] = max(counts)
+        metrics[f"truncated_{name}_rows"] = _warn_long_rows(
+            counts, max_seq_length, name
+        )
+        counts_by_name[name] = counts
+    return metrics, counts_by_name
+
+
+# Longest row above this multiple of the median: padded batches vary a lot.
+LONG_ROW_RATIO = 4
+# 90% of rows then fit a full batch under the suggested budget.
+SUGGESTED_BUDGET_PERCENTILE = 90
+# Round numbers are easier to read and to adjust by hand.
+BUDGET_ROUNDING = 64
+
+
+def _hint_max_batch_tokens(config: PESFTConfig, counts: list[int]) -> None:
+    """Suggest ``max_batch_tokens`` when row lengths vary a lot.
+
+    Applies to padded, fixed-size batches: more than one row per batch,
+    no ``max_batch_tokens``, no ``packing`` and no ``padding_free``
+    (which joins rows without padding, so a long row does not pad the
+    others). Rows are counted as the trainer keeps them, truncated to
+    ``max_seq_length``.
+
+    Args:
+        config: The run's configuration.
+        counts: Untruncated token count of each training row
+            (``_token_counts``).
+
+    Returns:
+        None. The note is printed when the longest row is more than
+        ``LONG_ROW_RATIO`` times the median row.
+    """
+    batch_size = config.per_device_train_batch_size
+    padded_batches = not (config.packing or config.padding_free)
+    fixed_batches = config.max_batch_tokens is None and padded_batches
+    if batch_size == 1 or not fixed_batches:
+        return
+    lengths = [min(count, config.max_seq_length) for count in counts]
+    longest = max(lengths)
+    median = statistics.median(lengths)
+    if longest <= LONG_ROW_RATIO * median:
+        return
+    percentiles = statistics.quantiles(lengths, n=100, method="inclusive")
+    percentile = percentiles[SUGGESTED_BUDGET_PERCENTILE - 1]
+    budget = math.ceil(batch_size * percentile / BUDGET_ROUNDING)
+    budget *= BUDGET_ROUNDING
+    print(
+        f"\nNOTE: the longest train row ({longest} tokens) is more than "
+        f"{LONG_ROW_RATIO}x the median row ({median:g} tokens), with "
+        f"per_device_train_batch_size={batch_size}.\n"
+        "  A padded batch is as long as its longest row, so batches "
+        "holding the longest rows use far more GPU memory than typical "
+        "ones and may run out of it.\n"
+        f"  Suggestion: set max_batch_tokens={budget} "
+        f"(per_device_train_batch_size x the "
+        f"{SUGGESTED_BUDGET_PERCENTILE}th-percentile row length of "
+        f"{percentile:g} tokens, rounded up to a multiple of "
+        f"{BUDGET_ROUNDING}). The longest rows then train alone or in "
+        "smaller batches, and other batches keep their size. This is a "
+        "rule of thumb: lower it if training runs out of GPU memory.\n"
+    )
+
+
+def _warn_compile_disabled() -> None:
+    """Warn when ``UNSLOTH_COMPILE_DISABLE=1`` is set.
+
+    With it, Unsloth leaves the model code of the models it compiles
+    unchanged, including the loss that works through the logits in
+    chunks; the plain model code computes the logits of every position
+    over the whole vocabulary at once. ``"partial"`` keeps the chunked
+    loss and is not warned about.
+
+    Returns:
+        None. The warning is printed when the variable is ``"1"``.
+    """
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") != "1":
+        return
+    print(
+        "\nWARNING: the environment variable UNSLOTH_COMPILE_DISABLE=1 is "
+        "set.\n"
+        "  For many models Unsloth then skips its compiled model code, "
+        "whose loss works through the logits in chunks. The loss then "
+        "needs the logits of every token over the whole vocabulary at "
+        "once, which takes much more GPU memory for long rows or large "
+        "vocabularies.\n"
+        "  Fix: unset UNSLOTH_COMPILE_DISABLE before starting the "
+        "script.\n"
+    )
+
+
+def _warn_joined_batches_without_flash(
+    config: PESFTConfig, attn_implementation: str | None
+) -> None:
+    """Warn when padding-free or packed batches run without FlashAttention.
+
+    Args:
+        config: The run's configuration (``padding_free``, ``packing``).
+        attn_implementation: The attention the loaded model uses
+            (``model.config._attn_implementation``), or None to judge by
+            ``config.attn_implementation``.
+
+    Returns:
+        None. The warning is printed when ``padding_free`` or
+        ``packing`` is on and the attention is not FlashAttention.
+    """
+    requested = [
+        name
+        for name, enabled in (
+            ("padding_free", config.padding_free),
+            ("packing", config.packing),
+        )
+        if enabled
+    ]
+    if not requested:
+        return
+    used = attn_implementation or config.attn_implementation
+    # transformers names them flash_attention_2, flash_attention_3, ...
+    if "flash_attention" in used:
+        return
+    flags = " and ".join(f"{name}=True" for name in requested)
+    print(
+        f"\nWARNING: {flags} without FlashAttention (attention: {used}).\n"
+        "  Each batch is joined into one long sequence. Without "
+        "FlashAttention it can get a full attention mask whose memory "
+        "grows with the square of the batch's total tokens, so training "
+        "can be slower and run out of GPU memory sooner than with padded "
+        "batches.\n"
+        "  Some models (hybrid linear-attention ones such as Qwen 3.5) "
+        "get padding_free and packing turned off by Unsloth anyway; a "
+        "message then says so.\n"
+        "  Fix: leave padding_free and packing off (the default), or "
+        'install flash-attn and set attn_implementation="flash_attention_2".'
+        "\n"
+    )
+
+
+def _print_training_oom_guidance(
+    config: PESFTConfig, longest_row: int
+) -> None:
+    """Print why training may have run out of GPU memory and what to try.
+
+    Args:
+        config: The run's configuration.
+        longest_row: Tokens of the longest training row, untruncated.
+
+    Returns:
+        None. Output only.
+    """
+    print(
+        "\nTraining ran out of GPU memory.\n"
+        f"  Longest training row: {longest_row} tokens\n"
+        "  per_device_train_batch_size: "
+        f"{config.per_device_train_batch_size}\n"
+        "  gradient_accumulation_steps: "
+        f"{config.gradient_accumulation_steps}\n"
+        f"  max_batch_tokens: {config.max_batch_tokens or 'not set'}\n"
+        f"  max_seq_length: {config.max_seq_length}\n"
+        "  use_gradient_checkpointing: "
+        f"{config.use_gradient_checkpointing}\n"
+        "Try these fixes, in order:\n"
+        "  1. Set max_batch_tokens (or lower it) so long rows train alone "
+        "while short rows still share a batch; or lower "
+        "per_device_train_batch_size and raise gradient_accumulation_steps "
+        "by the same factor to keep the effective batch size.\n"
+        "  2. Keep gradient checkpointing on "
+        '(use_gradient_checkpointing="unsloth").\n'
+        "  3. Lower max_seq_length. Longer rows are then truncated (a "
+        "warning says how many).\n"
+        "  4. Load the model in 4-bit (load_in_4bit=True).\n"
+        "  5. Use a GPU with more memory.\n"
+    )
+
+
+@contextmanager
+def _training_oom_guidance(
+    config: PESFTConfig, longest_row: int
+) -> Iterator[None]:
+    """Print guidance when the block runs out of GPU memory, then re-raise.
+
+    Args:
+        config: The run's configuration.
+        longest_row: Tokens of the longest training row, untruncated.
+
+    Yields:
+        None, while the guarded block runs.
+
+    Raises:
+        torch.OutOfMemoryError: The block's own error, unchanged, after
+            the guidance is printed.
+    """
+    try:
+        yield
+    except torch.OutOfMemoryError:
+        _print_training_oom_guidance(config, longest_row)
+        raise
+
+
+def _token_budget_batches(
+    lengths: list[int],
+    max_rows: int,
+    max_tokens: int,
+    *,
+    padding_free: bool,
+) -> list[list[int]]:
+    """Group row indices into batches under a row cap and a token budget.
+
+    Rows are taken shortest first and added to the current batch while
+    it stays within ``max_rows`` rows and ``max_tokens`` tokens; a row
+    that would break either starts a new batch. A row longer than
+    ``max_tokens`` therefore forms a batch of its own.
+
+    Args:
+        lengths: Token count of each row.
+        max_rows: Most rows per batch.
+        max_tokens: Most tokens per batch.
+        padding_free: Count a batch's tokens as the sum of its rows
+            (padding-free batches) instead of rows times its longest row
+            (padded batches).
+
+    Returns:
+        Batches of row indices; every index appears exactly once, and
+        rows of equal length keep their dataset order.
+    """
+    order = sorted(range(len(lengths)), key=lengths.__getitem__)
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    batch_sum = 0
+    for index in order:
+        length = lengths[index]
+        # Shortest first: a new row is the longest of its batch.
+        if padding_free:
+            tokens = batch_sum + length
+        else:
+            tokens = (len(batch) + 1) * length
+        if batch and (len(batch) == max_rows or tokens > max_tokens):
+            batches.append(batch)
+            batch, batch_sum = [], 0
+        batch.append(index)
+        batch_sum += length
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+class _TokenBudgetBatchSampler(Sampler[list[int]]):
+    """Yield fixed batches of row indices, shuffled per epoch if asked.
+
+    It has no ``batch_size`` attribute on purpose: accelerate's
+    ``BatchSamplerShard`` then deals whole batches of any size to the
+    processes in turn instead of assuming equal batch sizes.
+    """
+
+    def __init__(
+        self,
+        batches: list[list[int]],
+        seed: int,
+        epoch: Callable[[], int] | None,
+    ) -> None:
+        """Keep the batches and how to order them.
+
+        Args:
+            batches: Row indices of each batch (``_token_budget_batches``).
+            seed: Base seed of the per-epoch shuffle.
+            epoch: Returns the current epoch when iteration starts; the
+                order is shuffled with ``seed + epoch()``, so a resumed
+                run sees the same order as the interrupted one. None
+                keeps the batches in the given order.
+        """
+        super().__init__()
+        self.batches = batches
+        self.seed = seed
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        """Iterate over the batches of one epoch.
+
+        Returns:
+            An iterator over the batches, in shuffled or given order.
+        """
+        if self.epoch is None:
+            return iter(self.batches)
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch())
+        order = torch.randperm(len(self.batches), generator=generator)
+        return iter([self.batches[index] for index in order.tolist()])
+
+    def __len__(self) -> int:
+        """Return the number of batches per epoch.
+
+        Returns:
+            The number of batches, the same every epoch.
+        """
+        return len(self.batches)
+
+
+def _print_token_budget_steps(
+    batch_count: int, gradient_accumulation_steps: int, world_size: int
+) -> None:
+    """Print training batches and optimizer steps per epoch and device.
+
+    Under DDP whole batches are dealt to the processes in turn, the first
+    ones repeated so every process gets the same number; an epoch's last
+    optimizer step may accumulate fewer batches.
+
+    Args:
+        batch_count: Token-budget training batches per epoch, all
+            devices (``_token_budget_batches``).
+        gradient_accumulation_steps: Batches per optimizer step.
+        world_size: Number of training processes (GPUs).
+
+    Returns:
+        None. Output only.
+    """
+    batches = math.ceil(batch_count / world_size)
+    steps = math.ceil(batches / gradient_accumulation_steps)
+    print(
+        f"  Per device and epoch: {batches} training batches, {steps} "
+        "optimizer steps (gradient_accumulation_steps="
+        f"{gradient_accumulation_steps}).\n"
+        "  Rows per step vary, so step-based settings (max_steps, "
+        "warmup_steps, eval_steps, save_steps, logging_steps) cover a "
+        "different amount of data than with fixed batches; prefer "
+        "num_train_epochs and warmup_ratio."
+    )
+
+
+def _input_lengths(dataset: Dataset) -> list[int]:
+    """Return the length of every tokenized row.
+
+    Reads the ``input_ids`` column as Arrow, so long rows are not
+    converted to Python lists.
+
+    Args:
+        dataset: A prepared (tokenized) dataset.
+
+    Returns:
+        The number of tokens of each row, in dataset order.
+    """
+    import pyarrow.compute as pc  # noqa: PLC0415
+
+    column = dataset.with_format("arrow")["input_ids"]
+    return cast("list[int]", pc.list_value_length(column).to_pylist())
+
+
+def _token_budget_trainer_class(max_batch_tokens: int) -> type[SFTTrainer]:
+    """Return an ``SFTTrainer`` subclass that batches by a token budget.
+
+    Call it after ``import unsloth``, so the subclass inherits Unsloth's
+    patched trainer.
+
+    Args:
+        max_batch_tokens: Token budget per batch
+            (``PESFTConfig.max_batch_tokens``).
+
+    Returns:
+        The subclass; its train, eval and test dataloaders yield
+        ``_token_budget_batches``.
+    """
+    from torch.utils.data import DataLoader  # noqa: PLC0415
+    from trl import SFTTrainer  # noqa: PLC0415
+
+    class TokenBudgetSFTTrainer(SFTTrainer):
+        """``SFTTrainer`` whose batches follow a token budget."""
+
+        def _current_epoch(self) -> int:
+            """Return the epoch the training loop is in.
+
+            Read from the trainer state, which a resumed run restores, so
+            the shuffle matches the interrupted run's.
+
+            Returns:
+                The whole number of epochs completed so far.
+            """
+            return int(self.state.epoch or 0)
+
+        def _get_dataloader(  # noqa: PLR0913
+            self,
+            dataset: Dataset,
+            description: str,
+            batch_size: int,
+            *,
+            sampler_fn: Callable[[Dataset], object] | None = None,
+            is_training: bool = False,
+            dataloader_key: str | None = None,
+        ) -> DataLoader:
+            """Build a dataloader of token-budget batches.
+
+            Replaces ``Trainer._get_dataloader``, which the public train,
+            eval and test dataloader methods (and Unsloth's wrappers of
+            them) call. The padding mode is read from the collator,
+            since Unsloth may have turned padding-free off.
+
+            Args:
+                dataset: The prepared dataset.
+                description: Unused; the parent's signature.
+                batch_size: Per-device batch size, the row cap.
+                sampler_fn: Unused; batches replace the sampler.
+                is_training: Shuffle the batch order per epoch.
+                dataloader_key: Unused; the parent's signature.
+
+            Returns:
+                The dataloader, prepared by accelerate (sharded under
+                DDP).
+            """
+            del description, sampler_fn, dataloader_key
+            padding_free = bool(getattr(self.data_collator, "padding_free", 0))
+            batches = _token_budget_batches(
+                _input_lengths(dataset),
+                batch_size,
+                max_batch_tokens,
+                padding_free=padding_free,
+            )
+            epoch = self._current_epoch if is_training else None
+            sampler = _TokenBudgetBatchSampler(batches, self.args.seed, epoch)
+            loader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+            return cast("DataLoader", self.accelerator.prepare(loader))
+
+    return TokenBudgetSFTTrainer
+
+
 WARMUP_STEPS_EXCLUDED = 5
 """Optimizer steps left out of the steady-state step time."""
 
@@ -980,6 +1601,8 @@ class PESFT:
         """
         from huggingface_hub import constants as hub_constants  # noqa: PLC0415
 
+        # Read by Unsloth when it is imported below.
+        _warn_compile_disabled()
         # Dataset preparation forks workers; a fork while huggingface_hub's
         # telemetry thread holds its HTTP client lock deadlocks the child.
         hub_constants.HF_HUB_DISABLE_TELEMETRY = True
@@ -1234,10 +1857,17 @@ class PESFT:
                 training and, per ``eval_strategy``, during it. Pass
                 ``None`` to skip evaluation entirely.
             formatting_func: Callable that converts raw dataset rows into
-                chat-formatted strings understood by the tokenizer.
+                chat-formatted strings understood by the tokenizer. Every
+                row is formatted and tokenized once up front: rows longer
+                than ``max_seq_length`` are counted, reported in a warning
+                and in ``train_metrics``, and truncated by the trainer.
             resume_from_checkpoint: Either a path to a checkpoint directory,
                 ``True`` to auto-detect the latest checkpoint, or ``None`` to
                 start fresh.
+
+        When training runs out of GPU memory, the batch settings and what
+        to change are printed and the ``torch.OutOfMemoryError`` is
+        raised again.
 
         Returns:
             None. Training metrics are logged through TRL and the model is
@@ -1273,10 +1903,23 @@ class PESFT:
         from trl import SFTTrainer  # noqa: PLC0415, I001
         from unsloth.chat_templates import train_on_responses_only  # noqa: PLC0415
 
+        length_metrics, row_lengths = _length_metrics(
+            {"train": train_dataset, "eval": eval_dataset},
+            formatting_func,
+            getattr(tokenizer, "tokenizer", tokenizer),
+            self.config.max_seq_length,
+        )
+        _hint_max_batch_tokens(self.config, row_lengths["train"])
+        trainer_class = SFTTrainer
+        if self.config.max_batch_tokens is not None:
+            trainer_class = _token_budget_trainer_class(
+                self.config.max_batch_tokens
+            )
+
         # ``formatting_func`` keeps the dataset lightweight: rows are turned
         # into chat-formatted text while the dataset is prepared, so the
         # raw columns never need a text field of their own.
-        trainer = SFTTrainer(
+        trainer = trainer_class(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -1296,6 +1939,10 @@ class PESFT:
         # never casts, so turning it off makes both evaluations agree.
         trainer.args.bf16_full_eval = False
         trainer.args.fp16_full_eval = False
+        self._report_batching(trainer)
+        _warn_joined_batches_without_flash(
+            self.config, getattr(model.config, "_attn_implementation", None)
+        )
         step_timer, step_seconds = _make_step_timer()
         trainer.add_callback(step_timer)
         self.trainer = trainer
@@ -1323,17 +1970,54 @@ class PESFT:
                 "to mask instruction tokens during training."
             )
 
+        longest_row = length_metrics["longest_train_row"]
         with _modules_in_training_mode(model, self.config.eval_in_train_mode):
-            train_output = self._run_training(
-                trainer, resume_from_checkpoint=resume_from_checkpoint
-            )
+            with _training_oom_guidance(self.config, longest_row):
+                train_output = self._run_training(
+                    trainer, resume_from_checkpoint=resume_from_checkpoint
+                )
             eval_metrics = None
             if eval_dataset is not None:
                 eval_metrics = self._run_final_evaluation(trainer)
         self.train_metrics = _collect_train_metrics(
             train_output, eval_metrics, step_seconds
         )
+        self.train_metrics.update(length_metrics)
         print(f"\nTraining metrics: {self.train_metrics}")
+
+    def _report_batching(self, trainer: SFTTrainer) -> None:
+        """Print how batches are built and whether padding-free stayed on.
+
+        Args:
+            trainer: The constructed trainer; Unsloth may have turned
+                ``padding_free`` off on its collator.
+
+        Returns:
+            None. Output only.
+        """
+        padding_free = bool(getattr(trainer.data_collator, "padding_free", 0))
+        if self.config.padding_free and not padding_free:
+            print(
+                "\nUnsloth turned padding_free off for this model; "
+                "batches are padded."
+            )
+        if self.config.max_batch_tokens is not None:
+            mode = "padding-free" if padding_free else "padded"
+            print(
+                f"Token-budget batches: at most "
+                f"{self.config.max_batch_tokens} tokens ({mode})."
+            )
+            batches = _token_budget_batches(
+                _input_lengths(cast("Dataset", trainer.train_dataset)),
+                self.config.per_device_train_batch_size,
+                self.config.max_batch_tokens,
+                padding_free=padding_free,
+            )
+            _print_token_budget_steps(
+                len(batches),
+                self.config.gradient_accumulation_steps,
+                trainer.args.world_size,
+            )
 
     @staticmethod
     def _run_training(
@@ -1371,7 +2055,7 @@ class PESFT:
         """
         print("\nEvaluating on test set...")
         try:
-            eval_results = trainer.evaluate()
+            eval_results: dict[str, float] = trainer.evaluate()
             print(f"Evaluation results: {eval_results}")
         except torch.cuda.OutOfMemoryError as e:
             # The trained model is intact; free the evaluation's memory so
@@ -1383,16 +2067,17 @@ class PESFT:
                 "smaller per_device_eval_batch_size."
             )
             return None
-        return cast("dict[str, float]", eval_results)
+        return eval_results
 
     def _save_training_metadata(self) -> None:
         """Persist configuration and training arguments alongside artifacts.
 
         Writes ``speftr.json`` (the PESFT config), ``training_args.json``
         (the SFTConfig) and, after ``train``, ``train_metrics.json``
-        (runtime, throughput, peak GPU memory, losses; see
-        ``_collect_train_metrics``) next to the saved model, to reproduce
-        or inspect the run.
+        (runtime, throughput, peak GPU memory, losses, see
+        ``_collect_train_metrics``; longest and truncated rows, see
+        ``_length_metrics``) next to the saved model, to reproduce or
+        inspect the run.
 
         Returns:
             None. Files are written to ``config.output_dir``.

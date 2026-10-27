@@ -75,7 +75,12 @@ uv run python -m examples.chat --model_name_or_path ./model-it
 ```
 
 `chat.py` defaults to the same `chatml` template and pirate system prompt
-as training. The README shows a reply from such a model:
+as training. It keeps the whole conversation as context. Once the
+conversation plus `--max_new_tokens` exceeds `--max_seq_length` (4096),
+it drops the oldest exchanges (the system prompt stays) and, if your
+last message alone is still too long, cuts its beginning; a `WARNING`
+says what was dropped and the chat goes on. The README shows a reply
+from such a model:
 
 ```text
 You: Who was George Washington?
@@ -176,6 +181,14 @@ size and starts one engine per route (about 3 min per run in total).
   saved as `chat_template.jinja` next to the adapter. Both routes use
   that file, not Qwen3's own template; pass `--system_prompt` if you
   trained with another one.
+
+**Long inputs.** `--max_model_len` (default 2048) is the context
+length, prompt plus `--max_new_tokens`. A longer prompt loses its
+beginning (the end, with the question, stays) and the script prints a
+`WARNING` with the count; both engines cut the same way. With
+`--engine transformers` prompts of similar length run in batches of at
+most `--token_budget` (default 16384) padded tokens, rows times the
+longest prompt plus `--max_new_tokens`; a longer input runs alone.
 
 General rules (base class, 16-bit base, vLLM flags, serving): [After
 training](../../docs/guide.md#5-after-training).

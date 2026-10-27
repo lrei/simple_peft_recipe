@@ -167,6 +167,19 @@ def test_pesft_trains_and_saves_lora_adapters(tmp_path):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("padding_free", [False, True])
+def test_pesft_trains_with_token_budget_batches(tmp_path, padding_free):
+    # 4 rows of up to 1024 tokens per batch, train and eval.
+    stdout = _run_training(
+        tmp_path, f", max_batch_tokens=1024, padding_free={padding_free}"
+    )
+    mode = "padding-free" if padding_free else "padded"
+    assert f"at most 1024 tokens ({mode})" in stdout, stdout[-4000:]
+    assert math.isfinite(_final_eval_loss(stdout))
+    _assert_trained_adapters(tmp_path)
+
+
+@pytest.mark.cuda
 def test_pesft_trains_with_8bit_base_model(tmp_path):
     _run_training(
         tmp_path,

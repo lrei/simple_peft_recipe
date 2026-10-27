@@ -160,6 +160,177 @@ def _language_model_targets(
     return rf".*\.language_model\..*\.({'|'.join(module_names)})"
 
 
+def _pair_lengths(dataset: Dataset) -> list[int]:
+    """Return the length of every tokenized pair.
+
+    Args:
+        dataset: Tokenized pairs (``prompt_ids``, ``chosen_ids`` and
+            ``rejected_ids`` columns).
+
+    Returns:
+        Per pair, the prompt plus the longer completion in tokens, in
+        dataset order.
+    """
+    import pyarrow.compute as pc  # noqa: PLC0415
+
+    table = dataset.with_format("arrow")
+    completion_lengths = pc.max_element_wise(
+        pc.list_value_length(table["chosen_ids"]),
+        pc.list_value_length(table["rejected_ids"]),
+    )
+    return cast(
+        "list[int]",
+        pc.add(
+            pc.list_value_length(table["prompt_ids"]), completion_lengths
+        ).to_pylist(),
+    )
+
+
+def _warn_long_pairs(
+    lengths: list[int], max_length: int, split: str, dropped: int
+) -> int:
+    """Warn when pairs are longer than ``max_length``.
+
+    TRL's collator cuts prompt + chosen and prompt + rejected to their
+    first ``max_length`` tokens, so the model never sees the end of
+    such pairs. Pairs whose prompt alone fills ``max_length`` are
+    dropped by TRL before this check.
+
+    Args:
+        lengths: Prompt plus longer completion of each kept pair
+            (``_pair_lengths``).
+        max_length: The longest prompt plus completion kept whole.
+        split: Name of the dataset in the message (``"train"``,
+            ``"eval"``).
+        dropped: Pairs TRL dropped because the prompt fills
+            ``max_length``.
+
+    Returns:
+        The number of kept pairs longer than ``max_length`` (the ones
+        truncated); a warning is printed when it or ``dropped`` is not 0.
+    """
+    too_long = [length for length in lengths if length > max_length]
+    if not too_long and not dropped:
+        return 0
+    message = (
+        f"\nWARNING: {len(too_long) + dropped} of {len(lengths) + dropped} "
+        f"{split} pairs are longer than max_length={max_length} tokens.\n"
+    )
+    if too_long:
+        message += (
+            f"  {len(too_long)} pairs (longest: {max(too_long)} tokens) are "
+            f"truncated to {max_length} tokens, prompt + chosen and prompt + "
+            "rejected each, so the model never sees their end.\n"
+        )
+    if dropped:
+        message += (
+            f"  {dropped} pairs are left out of training because their "
+            "prompt alone fills max_length.\n"
+        )
+    message += (
+        "  Fix: raise max_length (needs more GPU memory), or filter or "
+        "shorten those pairs in the dataset.\n"
+    )
+    print(message)
+    return len(too_long)
+
+
+def _length_checked_dpo_trainer(max_length: int | None) -> type[DPOTrainer]:
+    """Return a ``DPOTrainer`` subclass that measures and warns on pairs.
+
+    Args:
+        max_length: The longest prompt plus completion kept whole, or
+            None for no limit (no warning).
+
+    Returns:
+        The subclass; right after tokenizing a dataset it warns about
+        pairs above ``max_length`` (``_warn_long_pairs``) and keeps the
+        longest training pair in ``longest_train_pair``.
+    """
+    from trl import DPOTrainer  # noqa: PLC0415
+
+    class LengthCheckedDPOTrainer(DPOTrainer):
+        """``DPOTrainer`` that warns on pairs above ``max_length``.
+
+        Attributes:
+            longest_train_pair: Tokens of the longest training pair
+                (prompt plus the longer completion), untruncated; 0
+                until the training set is tokenized.
+        """
+
+        longest_train_pair = 0
+
+        def _prepare_dataset(
+            self,
+            dataset: Dataset,
+            processing_class: PreTrainedTokenizerBase,
+            args: DPOConfig,
+            dataset_name: str,
+        ) -> Dataset:
+            """Tokenize as TRL does, then measure the pair lengths.
+
+            Args:
+                dataset: Raw preference pairs.
+                processing_class: The tokenizer.
+                args: The trainer's ``DPOConfig``.
+                dataset_name: ``"train"``, ``"eval"`` or an eval key.
+
+            Returns:
+                The tokenized dataset, without the pairs TRL drops.
+            """
+            prepared = cast(
+                "Dataset",
+                super()._prepare_dataset(
+                    dataset, processing_class, args, dataset_name
+                ),
+            )
+            lengths = _pair_lengths(prepared)
+            if dataset_name == "train":
+                self.longest_train_pair = max(lengths, default=0)
+            if max_length is not None:
+                dropped = len(dataset) - len(prepared)
+                _warn_long_pairs(lengths, max_length, dataset_name, dropped)
+            return prepared
+
+    return LengthCheckedDPOTrainer
+
+
+def _print_training_oom_guidance(
+    config: PEDPOConfig, longest_pair: int
+) -> None:
+    """Print why training may have run out of GPU memory and what to try.
+
+    Args:
+        config: The run's configuration.
+        longest_pair: Tokens of the longest training pair (prompt plus
+            the longer completion), untruncated.
+
+    Returns:
+        None. Output only.
+    """
+    print(
+        "\nDPO training ran out of GPU memory.\n"
+        f"  Longest training pair: {longest_pair} tokens\n"
+        "  per_device_train_batch_size: "
+        f"{config.per_device_train_batch_size} pairs\n"
+        "  gradient_accumulation_steps: "
+        f"{config.gradient_accumulation_steps}\n"
+        f"  max_length: {config.max_length}\n"
+        "  use_gradient_checkpointing: "
+        f"{config.use_gradient_checkpointing}\n"
+        "Try these fixes, in order:\n"
+        "  1. Lower per_device_train_batch_size and raise "
+        "gradient_accumulation_steps by the same factor to keep the "
+        "effective batch size.\n"
+        "  2. Keep gradient checkpointing on "
+        '(use_gradient_checkpointing="true").\n'
+        "  3. Lower max_length. Longer pairs are then truncated (a warning "
+        "says how many).\n"
+        "  4. Load the model in 4-bit (load_in_4bit=True).\n"
+        "  5. Use a GPU with more memory.\n"
+    )
+
+
 @dataclass
 class PEDPOConfig:
     """Configuration for Parameter-Efficient Direct Preference Optimization.
@@ -173,9 +344,11 @@ class PEDPOConfig:
         model_name_or_path: HuggingFace model name or local path. DPO
             starts from an instruction-tuned (SFT) model with a chat
             template.
-        max_length: Maximum tokens of prompt plus completion; longer
-            sequences are truncated at the end. ``None`` disables
-            truncation.
+        max_length: Maximum tokens of prompt plus completion (chosen
+            and rejected each). Longer sequences are truncated at the
+            end, and pairs whose prompt alone fills it are dropped;
+            ``train`` prints a warning with how many pairs that affects.
+            ``None`` disables truncation.
         load_in_4bit: Load the base model in 4-bit (bitsandbytes NF4,
             QLoRA).
         load_in_8bit: Load the base model in 8-bit (bitsandbytes
@@ -418,8 +591,8 @@ class PEDPOConfig:
             type=int,
             default=defaults.max_length,
             help=(
-                "Maximum prompt + completion tokens (default: "
-                f"{defaults.max_length})"
+                "Maximum prompt + completion tokens; longer pairs are "
+                f"truncated, with a warning (default: {defaults.max_length})"
             ),
         )
         group.add_argument(
@@ -668,7 +841,9 @@ class PEDPO:
     ) -> None:
         """Run DPO training, then evaluate once if an eval set is given.
 
-        Calls ``load_model`` first if no model is set.
+        Calls ``load_model`` first if no model is set. With
+        ``max_length`` set, pairs longer than it are counted and reported
+        in a warning right after tokenization, then truncated by TRL.
 
         Args:
             train_dataset: Preference pairs: ``chosen`` and ``rejected``
@@ -683,9 +858,11 @@ class PEDPO:
 
         Returns:
             None. The model is updated in place.
-        """
-        from trl import DPOTrainer  # noqa: PLC0415
 
+        Raises:
+            torch.OutOfMemoryError: When training runs out of GPU memory,
+                after printing the batch settings and what to change.
+        """
         if self.model is None or self.tokenizer is None:
             model, tokenizer = self.load_model()
         else:
@@ -695,10 +872,11 @@ class PEDPO:
         if eval_dataset is not None:
             print(f"Eval dataset size: {len(eval_dataset)}")
 
+        trainer_class = _length_checked_dpo_trainer(self.config.max_length)
         # ref_model=None: TRL computes reference log-probs with a frozen
         # copy of the adapter. peft_config=None: the model is already a
         # PeftModel.
-        trainer = DPOTrainer(
+        trainer = trainer_class(
             model=model,
             ref_model=None,
             args=self._create_dpo_config(),
@@ -709,7 +887,13 @@ class PEDPO:
         self.trainer = trainer
 
         print("\nStarting DPO training...")
-        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        try:
+            trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        except torch.OutOfMemoryError:
+            _print_training_oom_guidance(
+                self.config, trainer.longest_train_pair
+            )
+            raise
         print("\nDPO training complete.")
 
         if eval_dataset is not None:

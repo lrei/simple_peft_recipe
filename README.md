@@ -29,13 +29,12 @@ In its simplest form it needs no frozen reference model or KL term, which
 suits PEFT.
 
 The defaults are sized for a 24 GB GPU and run unchanged on larger
-ones. The library and examples are tested on RTX 3090 (24 GB) and A100
-(40 GB), single and multi-GPU (data parallel and model splitting). The
-guide covers [what fits where](docs/guide.md#10-fitting-in-memory),
-[what a bigger GPU changes](docs/guide.md#bigger-or-newer-gpus) (the
-same settings, 2.2 to 2.5 times faster per step on the A100) and
-[several GPUs](docs/guide.md#11-multiple-gpus); each example records
-the hardware and settings of its measured runs.
+ones. The guide covers
+[what fits in memory](docs/guide.md#10-fitting-in-memory),
+[what a bigger GPU changes](docs/guide.md#bigger-or-newer-gpus) and
+[several GPUs](docs/guide.md#11-multiple-gpus) (data parallel and model
+splitting); each example records the hardware, settings and results of
+its own runs.
 
 ### Sources
 
@@ -68,9 +67,14 @@ recipe deviates slightly from any one source.
 - Gradient checkpointing enabled by default.
 - Train on responses only when training with assistant templates.
 - **SFT attention**: SDPA with padded, length-grouped batches. Unsloth's
-  own defaults (flex attention, padding-free batches) assume
-  FlashAttention-class kernels and are several times slower without
-  them.
+  own defaults (flex attention, padding-free batches) suit
+  FlashAttention-class kernels: flex attention recompiles for every new
+  sequence length, and without FlashAttention a padding-free batch can
+  get a full attention mask whose memory grows with the square of its
+  tokens.
+- **No silent truncation**: rows longer than `max_seq_length` (DPO:
+  `max_length`) are cut, with a warning that says how many and how to
+  fix it.
 
 For GRPO, we default to colocated vLLM with GPU memory utilization limited to
 0.5. The examples use vLLM sleep mode.
@@ -111,8 +115,8 @@ model not pretrained on them.
 
 ### Prerequisites
 
-- Linux with an NVIDIA GPU (24 GB or more; tested on RTX 3090 and A100)
-  and driver ≥ 580 (PyTorch is installed from the CUDA 13 index)
+- Linux with an NVIDIA GPU (the defaults are sized for 24 GB) and
+  driver ≥ 580 (PyTorch is installed from the CUDA 13 index)
 - Python 3.13 or 3.14
 - [uv](https://docs.astral.sh/uv/) package manager
 
@@ -124,6 +128,11 @@ uv sync --extra rl               # + vLLM for fast GRPO generation (PERL)
 uv sync --extra gym              # + reasoning-gym (RL example; includes rl)
 uv sync --all-extras --group dev # everything, plus the quality tooling
 ```
+
+`flash-linear-attention` is installed too: fast kernels for
+linear-attention models such as Qwen 3.5. The optional `causal-conv1d`
+kernel must be built from source; see
+[Optional kernels](docs/guide.md#optional-kernels).
 
 The versions are pinned in `uv.lock`. The project runs newer transformers/TRL
 than the released unsloth declares; Gemma 4 and Qwen 3.5/3.8 need them.
@@ -148,12 +157,14 @@ datasets; it is not part of the library.
 The `PESFT`, `PERL` and `PEDPO` classes are thin wrappers around Hugging
 Face's TRL. Their configuration classes expose the parameters a typical
 user changes, with defaults from the "Recipe" above. `PESFT` uses
-Unsloth, which is faster here. `PERL` (GRPO) uses plain transformers and
-peft: Unsloth's GRPO path shows no clear benefit and has more issues.
-`PEDPO` (DPO) also uses plain transformers and peft.
+Unsloth for its fused kernels and chunked loss. `PERL` (GRPO) uses plain
+transformers and peft: Unsloth's GRPO path shows no clear benefit and has
+more issues. `PEDPO` (DPO) also uses plain transformers and peft.
 
 [docs/guide.md](docs/guide.md) is the user guide: data formats,
-formatting and reward functions, configuration, SFT then RL, loading and
+formatting and reward functions, configuration,
+[batching](docs/guide.md#batching) and
+[long context](docs/guide.md#long-context), SFT then RL, loading and
 serving the result, validated models and troubleshooting. To run without
 Hub access, see [docs/running_offline_models.md](docs/running_offline_models.md).
 

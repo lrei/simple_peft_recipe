@@ -53,6 +53,8 @@ DATASET_NAME = "trl-lib/tldr"
 DEFAULT_MODEL_PATH = "./models/qwen3.5-4b-lora-tldr"
 # Posts run up to about 500 tokens plus the instruction and the summary.
 MAX_SEQ_LENGTH = 1024
+# Padded tokens (prompt plus --max_new_tokens per row) per generation batch.
+TOKEN_BUDGET = 16_384
 INSTRUCTION = (
     "Write a TL;DR of the Reddit post below in one or two sentences. "
     "Answer with the TL;DR only."
@@ -152,8 +154,81 @@ def compute_metrics(
     return metrics
 
 
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
+
+    Args:
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
+
+    Returns:
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def truncate_prompts(
+    prompts: list[list[int]], max_seq_length: int, max_new_tokens: int
+) -> tuple[list[list[int]], int]:
+    """Cut prompts so that each fits ``max_seq_length`` with its reply.
+
+    Chat templates put the question and the assistant header at the end
+    of a prompt, so the start is what goes. A warning is printed when a
+    prompt is cut.
+
+    Args:
+        prompts: Token ids of each prompt, chat template applied.
+        max_seq_length: The limit passed to ``from_pretrained``.
+        max_new_tokens: Tokens each reply may add.
+
+    Returns:
+        The prompts, each at most ``max_seq_length - max_new_tokens``
+        tokens long (the last ones kept), and how many were cut.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = max_seq_length - max_new_tokens
+    if limit < 1:
+        message = (
+            f"--max_new_tokens {max_new_tokens} leaves no room for a "
+            f"prompt in --max_seq_length {max_seq_length}; lower "
+            "--max_new_tokens or raise --max_seq_length."
+        )
+        raise ValueError(message)
+    too_long = [len(prompt) for prompt in prompts if len(prompt) > limit]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(prompts)} prompts are "
+            f"longer than {limit} tokens (context {max_seq_length} minus "
+            f"max_new_tokens {max_new_tokens}; longest: {max(too_long)}). "
+            "Their beginning is cut off, so the model never sees it.\n"
+            "  Fix: raise --max_seq_length (more memory), lower "
+            "--max_new_tokens, or shorten those inputs."
+        )
+    return [prompt[-limit:] for prompt in prompts], len(too_long)
+
+
 def load_for_generation(
-    model_path: str, *, load_in_4bit: bool
+    model_path: str, *, load_in_4bit: bool, max_seq_length: int
 ) -> tuple[GenerationMixin, PreTrainedTokenizerBase]:
     """Load a base model or saved LoRA adapters for generation.
 
@@ -163,6 +238,7 @@ def load_for_generation(
     Args:
         model_path: Hub id, merged checkpoint or adapter directory.
         load_in_4bit: Quantize the base weights to 4 bits.
+        max_seq_length: Longest prompt plus reply the model must handle.
 
     Returns:
         The model switched to inference mode and its tokenizer, set to pad
@@ -170,7 +246,7 @@ def load_for_generation(
     """
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
-        max_seq_length=MAX_SEQ_LENGTH,
+        max_seq_length=max_seq_length,
         load_in_4bit=load_in_4bit,
         attn_implementation="sdpa",
     )
@@ -206,37 +282,59 @@ def stop_token_ids(
     return sorted(i for i in ids if i is not None)
 
 
-def generate_replies(
-    model: GenerationMixin,
-    tokenizer: PreTrainedTokenizerBase,
-    chats: Sequence[list[Message]],
-    *,
-    max_new_tokens: int,
-) -> list[str]:
-    """Greedily generate one reply per chat, as a single batch.
+def encode_prompts(
+    tokenizer: PreTrainedTokenizerBase, chats: Sequence[list[Message]]
+) -> list[list[int]]:
+    """Render and tokenize generation prompts, without padding.
 
     Thinking is off (``enable_thinking=False``): Qwen 3.5 then renders
     the empty think block its training texts carry; templates without
     the switch ignore it.
 
     Args:
-        model: Model from ``load_for_generation``.
-        tokenizer: Its tokenizer; must have a chat template.
+        tokenizer: Tokenizer with a chat template.
         chats: Conversations ending with a user turn.
+
+    Returns:
+        The token ids of each prompt, ending with the assistant header.
+    """
+    encoded = tokenizer.apply_chat_template(
+        list(chats),
+        add_generation_prompt=True,
+        return_dict=True,
+        enable_thinking=False,
+    )
+    input_ids = cast("BatchEncoding", encoded)["input_ids"]
+    return cast("list[list[int]]", input_ids)
+
+
+def generate_replies(
+    model: GenerationMixin,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: Sequence[list[int]],
+    *,
+    max_new_tokens: int,
+) -> list[str]:
+    """Greedily generate one reply per prompt, as a single batch.
+
+    Args:
+        model: Model from ``load_for_generation``.
+        tokenizer: Its tokenizer.
+        prompts: Token ids from ``encode_prompts``.
         max_new_tokens: Generation budget per reply.
 
     Returns:
         The decoded replies without the prompt or special tokens.
     """
-    encoded = tokenizer.apply_chat_template(
-        list(chats),
-        add_generation_prompt=True,
+    # Left padding with the attention mask, so every prompt ends where
+    # generation starts and the padding is not attended to.
+    padded = tokenizer.pad(
+        {"input_ids": list(prompts)},
         padding=True,
-        return_dict=True,
+        padding_side="left",
         return_tensors="pt",
-        enable_thinking=False,
     )
-    inputs = cast("BatchEncoding", encoded).to(model.device)
+    inputs = padded.to(model.device)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -252,36 +350,51 @@ def generate_replies(
 
 def predict_summaries(
     model_path: str, test_split: Dataset, args: argparse.Namespace
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], int]:
     """Summarize every post of ``test_split``.
+
+    Posts are generated in batches of similar length that fit
+    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row). A
+    prompt longer than ``--max_seq_length`` minus ``--max_new_tokens``
+    loses its beginning (``truncate_prompts``).
 
     Args:
         model_path: Model to evaluate (see ``load_for_generation``).
         test_split: Rows with ``post`` and ``summary``.
-        args: Parsed CLI arguments (``batch_size``, ``max_new_tokens``,
-            ``load_in_4bit``).
+        args: Parsed CLI arguments (``token_budget``, ``max_new_tokens``,
+            ``max_seq_length``, ``load_in_4bit``).
 
     Returns:
-        The authors' TL;DRs and the generated replies.
+        The authors' TL;DRs and the generated replies, in row order, and
+        the number of prompts that were cut.
     """
     model, tokenizer = load_for_generation(
-        model_path, load_in_4bit=args.load_in_4bit
+        model_path,
+        load_in_4bit=args.load_in_4bit,
+        max_seq_length=args.max_seq_length,
     )
     posts: list[str] = test_split["post"]
     references: list[str] = test_split["summary"]
-    predictions: list[str] = []
-    for start in range(0, len(posts), args.batch_size):
-        chats = [
-            build_messages(post)
-            for post in posts[start : start + args.batch_size]
-        ]
-        predictions.extend(
-            generate_replies(
-                model, tokenizer, chats, max_new_tokens=args.max_new_tokens
-            )
+    prompts, truncated = truncate_prompts(
+        encode_prompts(tokenizer, [build_messages(p) for p in posts]),
+        args.max_seq_length,
+        args.max_new_tokens,
+    )
+    lengths = [len(prompt) + args.max_new_tokens for prompt in prompts]
+    predictions = [""] * len(prompts)
+    done = 0
+    for batch in length_batches(lengths, args.token_budget):
+        replies = generate_replies(
+            model,
+            tokenizer,
+            [prompts[index] for index in batch],
+            max_new_tokens=args.max_new_tokens,
         )
-        print(f"Summarized {len(predictions)}/{len(posts)} posts")
-    return references, predictions
+        for index, reply in zip(batch, replies, strict=True):
+            predictions[index] = reply
+        done += len(batch)
+        print(f"Summarized {done}/{len(posts)} posts")
+    return references, predictions, truncated
 
 
 def parse_args() -> argparse.Namespace:
@@ -309,10 +422,24 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate only the first N test rows (-1: all 6,553)",
     )
     parser.add_argument(
-        "--batch_size",
+        "--token_budget",
         type=int,
-        default=32,
-        help="Posts generated per batch (default: 32)",
+        default=TOKEN_BUDGET,
+        help=(
+            "Padded tokens (prompt plus --max_new_tokens per post) per "
+            "generation batch; a longer post runs alone "
+            f"(default: {TOKEN_BUDGET})"
+        ),
+    )
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=MAX_SEQ_LENGTH,
+        help=(
+            "Longest prompt plus reply the model is loaded for; a longer "
+            "prompt loses its beginning, with a warning "
+            f"(default: {MAX_SEQ_LENGTH})"
+        ),
     )
     parser.add_argument(
         "--load_in_4bit",
@@ -341,14 +468,15 @@ def main() -> None:
     """Evaluate ``--model_path`` on the TL;DR test split and print metrics.
 
     Returns:
-        None. Example replies, metrics and peak GPU memory are printed.
+        None. Example replies, metrics, the number of cut prompts and
+        peak GPU memory are printed.
     """
     args = parse_args()
     test_split = load_tldr()["test"]
     if args.max_samples > 0:
         test_split = test_split.select(range(args.max_samples))
 
-    references, predictions = predict_summaries(
+    references, predictions, truncated = predict_summaries(
         args.model_path, test_split, args
     )
 
@@ -362,6 +490,8 @@ def main() -> None:
     print(f"\nModel: {args.model_path} ({len(references)} test posts)")
     for name, value in compute_metrics(references, predictions).items():
         print(f"{name}: {value:.4f}")
+    # Scores of cut prompts are not comparable with uncut ones.
+    print(f"truncated_prompts: {truncated}")
     peak_gb = torch.cuda.max_memory_allocated() / 1024**3
     print(f"peak_gpu_memory_gb: {peak_gb:.2f}")
 

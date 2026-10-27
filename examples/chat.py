@@ -28,6 +28,7 @@ from typing import Final, Protocol, runtime_checkable
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 # unsloth must be imported before transformers so its patches apply.
+import torch
 import unsloth
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
@@ -132,7 +133,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_SEQ_LENGTH,
         help=(
-            "Maximum sequence length to allocate for the model "
+            "Longest conversation plus reply the model is loaded for; "
+            "beyond it the oldest exchanges are dropped, with a warning "
             f"(default: {DEFAULT_MAX_SEQ_LENGTH})."
         ),
     )
@@ -191,6 +193,110 @@ def _stop_token_ids(model: object, tokenizer: object) -> list[int]:
     return sorted(i for i in ids if isinstance(i, int))
 
 
+class ChatTokenizer(Protocol):
+    """What the chat loop needs from a tokenizer: rendering to token ids."""
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        *,
+        add_generation_prompt: bool,
+        tokenize: bool,
+        return_dict: bool,
+    ) -> list[int]:
+        """Render a conversation with the chat template and tokenize it.
+
+        Args:
+            conversation: Messages with ``role`` and ``content``.
+            add_generation_prompt: End with the assistant header.
+            tokenize: ``True`` returns token ids, not text.
+            return_dict: ``False`` returns the token ids alone.
+
+        Returns:
+            The token ids of the rendered conversation.
+        """
+        ...
+
+
+def _prompt_token_limit(max_new_tokens: int, max_seq_length: int) -> int:
+    """Return the most prompt tokens that leave room for a reply.
+
+    Args:
+        max_new_tokens: Tokens a reply may add.
+        max_seq_length: The limit passed to ``from_pretrained``.
+
+    Returns:
+        ``max_seq_length`` minus ``max_new_tokens``.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = max_seq_length - max_new_tokens
+    if limit < 1:
+        message = (
+            f"--max_new_tokens {max_new_tokens} leaves no room for a "
+            f"prompt in --max_seq_length {max_seq_length}; lower "
+            "--max_new_tokens or raise --max_seq_length."
+        )
+        raise ValueError(message)
+    return limit
+
+
+def _fit_conversation(
+    tokenizer: ChatTokenizer,
+    conversation: list[dict[str, str]],
+    max_new_tokens: int,
+    max_seq_length: int,
+) -> tuple[list[dict[str, str]], list[int]]:
+    """Shorten a conversation until it fits the context with a reply.
+
+    The oldest user and assistant turn pairs are dropped first; the
+    system message and the last user turn stay. If those alone are still
+    too long, the start of the rendered prompt is cut (the system
+    message first), keeping the end with the last question. A warning
+    says what was dropped or cut.
+
+    Args:
+        tokenizer: Tokenizer with the chat template.
+        conversation: Optional system message, then alternating user and
+            assistant turns, ending with a user turn.
+        max_new_tokens: Tokens the reply may add.
+        max_seq_length: The limit passed to ``from_pretrained``.
+
+    Returns:
+        The kept conversation and its prompt token ids, at most
+        ``max_seq_length - max_new_tokens`` long.
+    """
+    limit = _prompt_token_limit(max_new_tokens, max_seq_length)
+    kept = list(conversation)
+    first_turn = 1 if kept and kept[0]["role"] == "system" else 0
+    prompt = tokenizer.apply_chat_template(
+        kept, add_generation_prompt=True, tokenize=True, return_dict=False
+    )
+    while len(prompt) > limit and len(kept) - first_turn > 1:
+        del kept[first_turn : first_turn + 2]
+        prompt = tokenizer.apply_chat_template(
+            kept, add_generation_prompt=True, tokenize=True, return_dict=False
+        )
+    dropped = (len(conversation) - len(kept)) // 2
+    cut = max(len(prompt) - limit, 0)
+    if dropped or cut:
+        losses = []
+        if dropped:
+            losses.append(f"the oldest {dropped} exchange(s) are dropped")
+        if cut:
+            losses.append(f"the first {cut} prompt tokens are cut off")
+        print(
+            f"\nWARNING: the conversation plus --max_new_tokens "
+            f"{max_new_tokens} is longer than --max_seq_length "
+            f"{max_seq_length} tokens; {' and '.join(losses)}, so the "
+            "model no longer sees them.\n"
+            "  Fix: restart with a larger --max_seq_length (more memory) "
+            "or a smaller --max_new_tokens, or send shorter messages."
+        )
+    return kept, prompt[-limit:]
+
+
 def main() -> None:
     """Load the model and run the interactive chat loop until exit.
 
@@ -198,6 +304,7 @@ def main() -> None:
         None. Exits on ``exit``/``quit``, EOF or keyboard interrupt.
     """
     args = parse_args()
+    _prompt_token_limit(args.max_new_tokens, args.max_seq_length)
     system_prompt = args.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT
 
     print(f"Loading model from {args.model_name_or_path}...")
@@ -257,24 +364,17 @@ def main() -> None:
                 {"role": "user", "content": user_input}
             )
 
-            prompt_text = tokenizer.apply_chat_template(
+            conversation_history, prompt = _fit_conversation(
+                tokenizer,
                 conversation_history,
-                tokenize=False,
-                add_generation_prompt=True,
+                args.max_new_tokens,
+                args.max_seq_length,
             )
-            encoded = tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                padding=False,
-            )
-            input_ids = encoded["input_ids"].to(model.device)
-            attention_mask = encoded.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(model.device)
+            input_ids = torch.tensor([prompt], device=model.device)
 
             outputs = model.generate(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
+                attention_mask=torch.ones_like(input_ids),
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,

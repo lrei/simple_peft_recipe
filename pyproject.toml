@@ -24,6 +24,7 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "bitsandbytes>=0.50.2",
     "rouge-score>=0.1.2",
+    "flash-linear-attention>=0.6.0",
 ]
 
 [project.optional-dependencies]

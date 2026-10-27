@@ -21,8 +21,8 @@ Usage (``py3langid`` comes with the ``gptoss`` extra):
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval
     uv run --extra gptoss python -m examples.gptoss.gptoss_eval \\
         --adapter_dir ./models/speftr-gptoss-120b \\
-        --device_map unsloth_balanced --batch_size 4 --max_new_tokens 128 \\
-        --num_rows 40
+        --device_map unsloth_balanced --token_budget 1312 \\
+        --max_new_tokens 128 --num_rows 40
 
 Results and hardware: ``examples/gptoss/README.md``.
 """
@@ -57,13 +57,25 @@ type LabelMask = Callable[
     [Mapping[str, list[list[int]]]], dict[str, list[list[int]]]
 ]
 
+# Label of tokens the loss skips (padding, prompt), as in transformers.
+IGNORE_INDEX = -100
 DATASET_NAME = "HuggingFaceH4/Multilingual-Thinking"
 DEFAULT_ADAPTER_DIR = "./models/speftr-gptoss-20b"
 # The dataset has only a train split; these rows are held out for the
 # eval loss during training and for this script.
 EVAL_SIZE = 100
 SPLIT_SEED = 0
+# Training length (gptoss.py); longer rows are cut in training.
 MAX_SEQ_LENGTH = 2048
+# This script's limit: the longest held-out row has about 2,500 tokens.
+EVAL_MAX_SEQ_LENGTH = 4096
+# Padded tokens (prompt plus --max_new_tokens per row) per generation
+# batch.
+TOKEN_BUDGET = 16_384
+# Padded tokens per eval-loss batch. The forward pass keeps the logits of
+# every token over the 201,088-token vocabulary; 6144 is the trainer's
+# eval batch in gptoss.py (3 rows of up to 2048 tokens).
+LOSS_TOKEN_BUDGET = 6144
 # Harmony markers: tokens after "<|start|>assistant" up to the next
 # message are trained, i.e. both the analysis and the final channel.
 INSTRUCTION_PART = "<|start|>user<|message|>"
@@ -225,8 +237,111 @@ def experts_in_training_mode(model: torch.nn.Module) -> Iterator[None]:
             module.training = False
 
 
+def length_batches(
+    lengths: Sequence[int], token_budget: int
+) -> list[list[int]]:
+    """Group sequences into batches of similar length.
+
+    Sequences are taken longest first and a batch grows while its padded
+    size (rows times the longest row) fits ``token_budget``; a sequence
+    longer than the budget gets a batch of its own.
+
+    Args:
+        lengths: Token count of each sequence.
+        token_budget: Maximum padded tokens per batch.
+
+    Returns:
+        Batches of indices into ``lengths``; every index appears once.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+    batches: list[list[int]] = []
+    for index in order:
+        # The first row of each batch is its longest.
+        if (
+            batches
+            and (len(batches[-1]) + 1) * lengths[batches[-1][0]]
+            <= token_budget
+        ):
+            batches[-1].append(index)
+        else:
+            batches.append([index])
+    return batches
+
+
+def truncate_prompts(
+    prompts: list[list[int]], max_seq_length: int, max_new_tokens: int
+) -> tuple[list[list[int]], int]:
+    """Cut prompts so that each fits ``max_seq_length`` with its reply.
+
+    Chat templates put the question and the assistant header at the end
+    of a prompt, so the start is what goes. A warning is printed when a
+    prompt is cut.
+
+    Args:
+        prompts: Token ids of each prompt, chat template applied.
+        max_seq_length: The limit passed to ``from_pretrained``.
+        max_new_tokens: Tokens each reply may add.
+
+    Returns:
+        The prompts, each at most ``max_seq_length - max_new_tokens``
+        tokens long (the last ones kept), and how many were cut.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` leaves no room for a prompt.
+    """
+    limit = max_seq_length - max_new_tokens
+    if limit < 1:
+        message = (
+            f"--max_new_tokens {max_new_tokens} leaves no room for a "
+            f"prompt in --max_seq_length {max_seq_length}; lower "
+            "--max_new_tokens or raise --max_seq_length."
+        )
+        raise ValueError(message)
+    too_long = [len(prompt) for prompt in prompts if len(prompt) > limit]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(prompts)} prompts are "
+            f"longer than {limit} tokens (context {max_seq_length} minus "
+            f"max_new_tokens {max_new_tokens}; longest: {max(too_long)}). "
+            "Their beginning is cut off, so the model never sees it.\n"
+            "  Fix: raise --max_seq_length (more memory), lower "
+            "--max_new_tokens, or shorten those inputs."
+        )
+    return [prompt[-limit:] for prompt in prompts], len(too_long)
+
+
+def truncate_rows(
+    sequences: list[list[int]], max_seq_length: int
+) -> tuple[list[list[int]], int]:
+    """Cut whole conversations to ``max_seq_length``, keeping their start.
+
+    Training also keeps the start of a long row: the loss covers a whole
+    conversation, and its later tokens depend on the earlier ones. A
+    warning is printed when a row is cut.
+
+    Args:
+        sequences: Token ids of each conversation.
+        max_seq_length: The limit passed to ``from_pretrained``.
+
+    Returns:
+        The sequences, each at most ``max_seq_length`` tokens long (the
+        first ones kept), and how many were cut.
+    """
+    too_long = [len(ids) for ids in sequences if len(ids) > max_seq_length]
+    if too_long:
+        print(
+            f"\nWARNING: {len(too_long)} of {len(sequences)} rows are "
+            f"longer than --max_seq_length={max_seq_length} tokens "
+            f"(longest: {max(too_long)}). Their end is cut off, so it is "
+            "not scored.\n"
+            "  Fix: raise --max_seq_length (more memory), or shorten those "
+            "rows."
+        )
+    return [ids[:max_seq_length] for ids in sequences], len(too_long)
+
+
 def load_adapter(
-    adapter_dir: str, device_map: str | None
+    adapter_dir: str, device_map: str | None, max_seq_length: int
 ) -> tuple[PeftModel, PreTrainedTokenizerBase]:
     """Load the adapter on the 4-bit base recorded with it.
 
@@ -240,6 +355,7 @@ def load_adapter(
         adapter_dir: Directory written by ``PESFT.save_model("lora")``.
         device_map: ``None`` for one GPU, or e.g. ``"unsloth_balanced"``
             to split a model that does not fit one GPU.
+        max_seq_length: Longest sequence the model must handle.
 
     Returns:
         The adapted model in inference mode and its tokenizer (harmony
@@ -251,7 +367,7 @@ def load_adapter(
     options = {} if device_map is None else {"device_map": device_map}
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=adapter_dir,
-        max_seq_length=MAX_SEQ_LENGTH,
+        max_seq_length=max_seq_length,
         load_in_4bit=True,
         **options,
     )
@@ -260,31 +376,53 @@ def load_adapter(
     return cast("PeftModel", model), tokenizer
 
 
+def encode_prompts(
+    tokenizer: PreTrainedTokenizerBase, rows: Dataset
+) -> list[list[int]]:
+    """Render and tokenize the rows' prompts, without padding.
+
+    Args:
+        tokenizer: Tokenizer with the harmony template.
+        rows: Rows with ``messages``.
+
+    Returns:
+        The token ids of each row's system and user turns, ending with
+        the assistant header.
+    """
+    chats = [prompt_messages(messages) for messages in rows["messages"]]
+    encoded = tokenizer.apply_chat_template(
+        chats, add_generation_prompt=True, return_dict=True
+    )
+    input_ids = cast("BatchEncoding", encoded)["input_ids"]
+    return cast("list[list[int]]", input_ids)
+
+
 def generate_completions(
     model: PeftModel,
     tokenizer: PreTrainedTokenizerBase,
-    chats: Sequence[list[Message]],
+    prompts: Sequence[list[int]],
     max_new_tokens: int,
 ) -> list[str]:
-    """Greedily complete a batch of chats, keeping special tokens.
+    """Greedily complete a batch of prompts, keeping special tokens.
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
         tokenizer: Its tokenizer.
-        chats: Conversations ending with a user turn.
+        prompts: Token ids from ``encode_prompts``.
         max_new_tokens: Generation budget per completion.
 
     Returns:
         Decoded completions with harmony tokens, for ``parse_channels``.
     """
-    encoded = tokenizer.apply_chat_template(
-        list(chats),
-        add_generation_prompt=True,
+    # Left padding with the attention mask, so every prompt ends where
+    # generation starts and the padding is not attended to.
+    padded = tokenizer.pad(
+        {"input_ids": list(prompts)},
         padding=True,
-        return_dict=True,
+        padding_side="left",
         return_tensors="pt",
     )
-    inputs = cast("BatchEncoding", encoded).to(model.device)
+    inputs = padded.to(model.device)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -302,33 +440,47 @@ def score_compliance(
     tokenizer: PreTrainedTokenizerBase,
     rows: Dataset,
     args: argparse.Namespace,
-) -> list[bool]:
+) -> tuple[list[bool], int]:
     """Generate the start of every row's reasoning and check its language.
+
+    Rows are generated in batches of similar length that fit
+    ``--token_budget`` (prompt plus ``--max_new_tokens`` per row). A
+    prompt longer than ``--max_seq_length`` minus ``--max_new_tokens``
+    loses its beginning (``truncate_prompts``).
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
         tokenizer: Its tokenizer.
         rows: Held-out rows with ``messages`` and ``reasoning_language``.
-        args: Parsed CLI arguments (``batch_size``, ``max_new_tokens``).
+        args: Parsed CLI arguments (``token_budget``, ``max_new_tokens``,
+            ``max_seq_length``).
 
     Returns:
-        Per row, whether the analysis channel was in the requested
-        language.
+        Per row, in row order, whether the analysis channel was in the
+        requested language, and the number of prompts that were cut.
     """
-    compliant: list[bool] = []
-    for start in range(0, len(rows), args.batch_size):
-        batch = rows[start : start + args.batch_size]
-        chats = [prompt_messages(messages) for messages in batch["messages"]]
+    prompts, truncated = truncate_prompts(
+        encode_prompts(tokenizer, rows),
+        args.max_seq_length,
+        args.max_new_tokens,
+    )
+    lengths = [len(prompt) + args.max_new_tokens for prompt in prompts]
+    languages: list[str] = rows["reasoning_language"]
+    compliant = [False] * len(prompts)
+    done = 0
+    for batch in length_batches(lengths, args.token_budget):
         completions = generate_completions(
-            model, tokenizer, chats, args.max_new_tokens
+            model,
+            tokenizer,
+            [prompts[index] for index in batch],
+            args.max_new_tokens,
         )
-        for language, completion in zip(
-            batch["reasoning_language"], completions, strict=True
-        ):
+        for index, completion in zip(batch, completions, strict=True):
             analysis = parse_channels(completion).get("analysis")
-            compliant.append(is_compliant(language, analysis))
-        print(f"Generated {len(compliant)}/{len(rows)}")
-    return compliant
+            compliant[index] = is_compliant(languages[index], analysis)
+        done += len(batch)
+        print(f"Generated {done}/{len(rows)}")
+    return compliant, truncated
 
 
 def build_label_mask(
@@ -355,45 +507,114 @@ def build_label_mask(
     )
 
 
-def eval_loss(
-    model: PeftModel, tokenizer: PreTrainedTokenizerBase, rows: Dataset
-) -> float:
-    """Mean assistant-turn loss over the rows, one row at a time.
+def encode_rows(
+    tokenizer: PreTrainedTokenizerBase, rows: Dataset
+) -> list[list[int]]:
+    """Render and tokenize whole conversations, as in training.
 
-    Rows are rendered and truncated to ``MAX_SEQ_LENGTH`` tokens and run
-    under autocast in the model dtype as in training, so the value is
-    comparable to the trainer's ``eval_loss``.
+    Args:
+        tokenizer: Tokenizer with the harmony template.
+        rows: Rows with ``messages``.
+
+    Returns:
+        The token ids of each conversation, assistant turn included.
+    """
+    sequences = []
+    for messages in rows["messages"]:
+        text = cast(
+            "str", tokenizer.apply_chat_template(messages, tokenize=False)
+        )
+        sequences.append(tokenizer(text, add_special_tokens=False).input_ids)
+    return sequences
+
+
+def batch_loss(
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizerBase,
+    sequences: Sequence[list[int]],
+    labels: Sequence[list[int]],
+) -> tuple[float, int]:
+    """Mean token loss of one batch and the number of tokens it covers.
+
+    Runs under autocast in the model dtype with the experts in training
+    mode, as in training.
+
+    Args:
+        model: Model from ``load_adapter`` (adapter enabled or not).
+        tokenizer: Its tokenizer; pads the batch on the right.
+        sequences: Token ids of each row.
+        labels: Each row's labels, ``IGNORE_INDEX`` where no loss is taken.
+
+    Returns:
+        The mean loss over the predicted label tokens and their count.
+    """
+    padded = tokenizer.pad(
+        {"input_ids": list(sequences)},
+        padding=True,
+        padding_side="right",
+        return_tensors="pt",
+    )
+    inputs = padded.to(model.device)
+    width = inputs["input_ids"].shape[1]
+    padded_labels = [
+        row + [IGNORE_INDEX] * (width - len(row)) for row in labels
+    ]
+    # The loss predicts token t + 1 from token t: the first label of a row
+    # is never a target.
+    targets = sum(label != IGNORE_INDEX for row in labels for label in row[1:])
+    # Training-mode experts return float32; autocast runs the layers after
+    # them in the model dtype, as in training.
+    with (
+        torch.inference_mode(),
+        torch.autocast(model.device.type, dtype=model.dtype),
+        experts_in_training_mode(model),
+    ):
+        output = model(
+            **inputs,
+            labels=torch.tensor(padded_labels, device=model.device),
+        )
+    return float(output.loss), targets
+
+
+def eval_loss(
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizerBase,
+    rows: Dataset,
+    args: argparse.Namespace,
+) -> tuple[float, int]:
+    """Mean assistant-turn token loss over the rows.
+
+    Rows are rendered in full, cut to ``--max_seq_length`` tokens
+    (``truncate_rows``), masked as in training and run in batches of
+    similar length that fit ``--loss_token_budget``. The mean is taken
+    over all assistant tokens of all rows, so it does not depend on the
+    batching.
 
     Args:
         model: Model from ``load_adapter`` (adapter enabled or not).
         tokenizer: Its tokenizer.
         rows: Held-out rows with ``messages``.
+        args: Parsed CLI arguments (``loss_token_budget``,
+            ``max_seq_length``).
 
     Returns:
-        The average over rows of each row's mean token loss.
+        The token-weighted mean loss and the number of rows that were
+        cut.
     """
     label_mask = build_label_mask(tokenizer)
-    losses: list[float] = []
-    for messages in rows["messages"]:
-        text = cast(
-            "str", tokenizer.apply_chat_template(messages, tokenize=False)
-        )
-        input_ids = tokenizer(text, add_special_tokens=False).input_ids
-        input_ids = input_ids[:MAX_SEQ_LENGTH]
-        labels = label_mask({"input_ids": [input_ids]})["labels"][0]
-        # Training-mode experts return float32; autocast runs the layers
-        # after them in the model dtype, as in training.
-        with (
-            torch.inference_mode(),
-            torch.autocast(model.device.type, dtype=model.dtype),
-            experts_in_training_mode(model),
-        ):
-            output = model(
-                input_ids=torch.tensor([input_ids], device=model.device),
-                labels=torch.tensor([labels], device=model.device),
-            )
-        losses.append(float(output.loss))
-    return sum(losses) / len(losses)
+    sequences, truncated = truncate_rows(
+        encode_rows(tokenizer, rows), args.max_seq_length
+    )
+    lengths = [len(sequence) for sequence in sequences]
+    loss_sum = 0.0
+    token_count = 0
+    for batch in length_batches(lengths, args.loss_token_budget):
+        batch_ids = [sequences[index] for index in batch]
+        labels = label_mask({"input_ids": batch_ids})["labels"]
+        loss, targets = batch_loss(model, tokenizer, batch_ids, labels)
+        loss_sum += loss * targets
+        token_count += targets
+    return loss_sum / token_count, truncated
 
 
 def parse_args() -> argparse.Namespace:
@@ -421,12 +642,28 @@ def parse_args() -> argparse.Namespace:
         "GPUs (default: one GPU)",
     )
     parser.add_argument(
-        "--batch_size",
+        "--token_budget",
         type=int,
-        default=32,
-        help="Prompts generated per batch; decoding is bound by per-step "
-        "overhead, so larger batches are faster until memory runs out "
-        "(default: 32, ~21.6 GiB peak with gpt-oss-20b)",
+        default=TOKEN_BUDGET,
+        help="Padded tokens (prompt plus --max_new_tokens per row) per "
+        "generation batch; a longer row runs alone "
+        f"(default: {TOKEN_BUDGET})",
+    )
+    parser.add_argument(
+        "--loss_token_budget",
+        type=int,
+        default=LOSS_TOKEN_BUDGET,
+        help="Padded tokens per eval-loss batch; a longer row runs alone "
+        f"(default: {LOSS_TOKEN_BUDGET})",
+    )
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=EVAL_MAX_SEQ_LENGTH,
+        help="Longest row (eval loss) or prompt plus generated tokens the "
+        "model is loaded for; a longer row loses its end and a longer "
+        "prompt its beginning, with a warning "
+        f"(default: {EVAL_MAX_SEQ_LENGTH})",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -450,25 +687,29 @@ def main() -> None:
     """Score the base model and the adapter and print a comparison.
 
     Returns:
-        None. Eval losses, compliance per language and peak GPU memory are
-        printed to stdout.
+        None. Eval losses, compliance per language, the number of cut rows
+        and prompts and peak GPU memory are printed to stdout.
     """
     args = parse_args()
     _, eval_rows = load_splits()
     if args.num_rows is not None:
         eval_rows = eval_rows.select(range(args.num_rows))
-    model, tokenizer = load_adapter(args.adapter_dir, args.device_map)
+    model, tokenizer = load_adapter(
+        args.adapter_dir, args.device_map, args.max_seq_length
+    )
 
     with model.disable_adapter():
-        base_loss = eval_loss(model, tokenizer, eval_rows)
-        base_compliant = score_compliance(model, tokenizer, eval_rows, args)
+        base_loss, cut_rows = eval_loss(model, tokenizer, eval_rows, args)
+        base_compliant, cut_prompts = score_compliance(
+            model, tokenizer, eval_rows, args
+        )
     # Printed before the adapter pass so a run cut short keeps the base
     # numbers.
     requested = eval_rows["reasoning_language"]
     print(f"\nbase eval_loss {base_loss:.4f}")
     print(f"base compliance {compliance_rates(requested, base_compliant)}")
-    adapter_loss = eval_loss(model, tokenizer, eval_rows)
-    adapter_compliant = score_compliance(model, tokenizer, eval_rows, args)
+    adapter_loss, _ = eval_loss(model, tokenizer, eval_rows, args)
+    adapter_compliant, _ = score_compliance(model, tokenizer, eval_rows, args)
 
     base_rates = compliance_rates(requested, base_compliant)
     adapter_rates = compliance_rates(requested, adapter_compliant)
@@ -484,8 +725,11 @@ def main() -> None:
             f"{language:<10} {counts[language]:>4} {base_rate:>6.0%} "
             f"{adapter_rates[language]:>8.0%}"
         )
+    # Scores of cut inputs are not comparable with uncut ones.
+    print(f"\ntruncated_rows (eval loss): {cut_rows}")
+    print(f"truncated_prompts (compliance): {cut_prompts}")
     peak_gb = torch.cuda.max_memory_allocated() / 1024**3
-    print(f"\npeak_gpu_memory_gb: {peak_gb:.2f}")
+    print(f"peak_gpu_memory_gb: {peak_gb:.2f}")
 
 
 if __name__ == "__main__":
